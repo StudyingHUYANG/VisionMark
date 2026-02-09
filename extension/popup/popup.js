@@ -37,7 +37,7 @@ async function checkAuth() {
     showLoginForm();
     return false;
   }
-  
+
   try {
     // 简单检查token是否过期（可选）
     const user = JSON.parse(localStorage.getItem('adskipper_user') || '{}');
@@ -62,10 +62,25 @@ function showUserPanel(user) {
   document.getElementById('auth-form').style.display = 'none';
   document.getElementById('user-panel').style.display = 'block';
   document.getElementById('user-panel').classList.add('user-panel-active');
-  
+
   document.getElementById('display-username').textContent = user.username;
   document.getElementById('display-points').textContent = user.points || 0;
   document.getElementById('display-tier').textContent = (user.tier || 'Bronze').toUpperCase();
+}
+
+// 刷新用户积分
+async function refreshUserInfo() {
+  try {
+    const user = await apiRequest('/auth/me');
+    // 更新localStorage
+    localStorage.setItem('adskipper_user', JSON.stringify(user));
+    // 更新显示
+    document.getElementById('display-points').textContent = user.points || 0;
+    document.getElementById('display-tier').textContent = (user.tier || 'Bronze').toUpperCase();
+    console.log('[Popup] 积分已刷新:', user.points);
+  } catch(err) {
+    console.error('[Popup] 刷新积分失败:', err);
+  }
 }
 
 function showError(msg) {
@@ -100,6 +115,10 @@ async function handleAuth() {
     if (isLogin) {
       localStorage.setItem('adskipper_token', data.token);
       localStorage.setItem('adskipper_user', JSON.stringify(data));
+      // 同步到 chrome.storage.local 供 content script 使用
+      chrome.storage.local.set({ adskipper_token: data.token }, () => {
+        console.log('[Popup] Token已同步到chrome.storage.local');
+      });
       showUserPanel(data);
     } else {
       showError('✓ 注册成功，请登录');
@@ -130,21 +149,28 @@ function toggleMode() {
 function logout() {
   localStorage.removeItem('adskipper_token');
   localStorage.removeItem('adskipper_user');
+  // 同时清理 chrome.storage.local
+  chrome.storage.local.remove(['adskipper_token']);
   showLoginForm();
 }
 
 // 初始化
-document.addEventListener('DOMContentLoaded', () => {
-  checkAuth();
-  
+document.addEventListener('DOMContentLoaded', async () => {
+  const isLoggedIn = await checkAuth();
+
+  // 如果已登录，刷新最新积分
+  if (isLoggedIn) {
+    refreshUserInfo();
+  }
+
   document.getElementById('submit-btn').onclick = handleAuth;
   document.getElementById('switch-text').onclick = toggleMode;
   document.getElementById('logout-btn').onclick = logout;
-  
+
   document.getElementById('password').onkeypress = (e) => {
     if (e.key === 'Enter') handleAuth();
   };
-  
+
   // 检查后端健康状态
   apiRequest('/health')
     .then(() => console.log('后端连接正常'))
