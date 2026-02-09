@@ -15,10 +15,15 @@
       console.log("[AdSkipper] 初始化...");
       const ok = await this.player.init();
       if (!ok) return;
-      
+
+      // 检查登录状态
+      const storage = await new Promise(r => chrome.storage.local.get(['adskipper_token'], r));
+      const token = storage.adskipper_token;
+      console.log("[AdSkipper] 登录状态:", token ? "已登录" : "未登录");
+
       this.player.onTimeUpdate = (t) => this.checkSkip(t);
       this.injectControlPanel();
-      
+
       const bvid = this.player.currentBvid;
       if (bvid) {
         await this.loadSegments(bvid);
@@ -169,7 +174,14 @@
         // 按钮4：提交
         const btnSubmit = createIconBtn('adskipper-btn-submit', '☁️', '提交', '提交标注', async () => {
           if (!self.pendingStart || !self.pendingEnd) return;
-          
+
+          // 检查是否已登录
+          const storage = await new Promise(r => chrome.storage.local.get(['adskipper_token'], r));
+          if (!storage.adskipper_token) {
+            self.showToast("✗ 请先登录插件", "error");
+            return;
+          }
+
           btnSubmit.innerHTML = '<span style="font-size:1.2em;">⏳</span><span style="font-size:0.75em;">...</span>';
           try {
             await self.submitAnnotation(self.pendingStart, self.pendingEnd, self.pendingType);
@@ -263,15 +275,43 @@
         end_time: parseFloat(end.toFixed(3)),
         ad_type: type
       };
-      
+
+      console.log("[AdSkipper] 准备提交:", body);
+
+      // Get token
+      const storage = await new Promise(r => chrome.storage.local.get(['adskipper_token'], r));
+      const token = storage.adskipper_token;
+
+      console.log("[AdSkipper] Token状态:", token ? "存在" : "不存在");
+
+      const headers = {"Content-Type": "application/json"};
+      if (token) {
+        headers['Authorization'] = 'Bearer ' + token;
+        console.log("[AdSkipper] Authorization Header:", 'Bearer ' + token.substring(0, 20) + '...');
+      } else {
+        console.warn("[AdSkipper] 警告: Token不存在，请求可能会失败");
+      }
+
+      console.log("[AdSkipper] 请求头:", headers);
+
       const res = await fetch(API_BASE + "/segments", {
         method: "POST",
-        headers: {"Content-Type": "application/json"},
+        headers: headers,
         body: JSON.stringify(body)
       });
-      
-      if (!res.ok) throw new Error("提交失败");
-      
+
+      if (!res.ok) {
+        let errorMsg = "提交失败";
+        try {
+          const data = await res.json();
+          errorMsg = data.error || errorMsg;
+          console.error("[AdSkipper] 服务器错误:", data);
+        } catch(e) {
+          console.error("[AdSkipper] 响应解析失败:", res.status, res.statusText);
+        }
+        throw new Error(errorMsg);
+      }
+
       await this.loadSegments(state.bvid);
       return await res.json();
     }

@@ -1,5 +1,5 @@
 // 配置文件 - 本地开发环境
-const API_BASE = 'http://10.129.79.124:3000/api/v1';
+const API_BASE = 'http://localhost:3000/api/v1';
 const CONFIG = {
   CHECK_INTERVAL: 200,
   CONFIDENCE_THRESHOLD: 0.7,
