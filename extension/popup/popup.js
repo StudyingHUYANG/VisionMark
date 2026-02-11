@@ -1,4 +1,4 @@
-const API_BASE = 'http://localhost:3000/api/v1';
+const API_BASE = 'https://apitest.visionmark.com.cn:8443/api/v1';
 
 // 统一的API请求函数
 async function apiRequest(endpoint, options = {}) {
@@ -66,6 +66,9 @@ function showUserPanel(user) {
   document.getElementById('display-username').textContent = user.username;
   document.getElementById('display-points').textContent = user.points || 0;
   document.getElementById('display-tier').textContent = (user.tier || 'Bronze').toUpperCase();
+
+  // 加载跳过模式设置
+  loadSkipModeSetting();
 }
 
 // 刷新用户积分
@@ -125,7 +128,7 @@ async function handleAuth() {
       toggleMode();
     }
   } catch(err) {
-    showError(err.message || '网络错误，请检查后端是否启动 (localhost:3000)');
+    showError(err.message || '网络错误，请检查后端是否启动 (apitest.visionmark.com.cn:8443)');
   } finally {
     btn.disabled = false;
     btn.textContent = originalText;
@@ -154,6 +157,34 @@ function logout() {
   showLoginForm();
 }
 
+// 加载跳过模式设置
+async function loadSkipModeSetting() {
+  const storage = await new Promise(r => chrome.storage.local.get(['skip_mode'], r));
+  const mode = storage.skip_mode || 'auto';
+  updateSkipModeUI(mode);
+}
+
+// 更新跳过模式UI
+function updateSkipModeUI(mode) {
+  const autoBtn = document.getElementById('mode-auto');
+  const manualBtn = document.getElementById('mode-manual');
+
+  if (mode === 'auto') {
+    autoBtn.classList.add('active');
+    manualBtn.classList.remove('active');
+  } else {
+    autoBtn.classList.remove('active');
+    manualBtn.classList.add('active');
+  }
+}
+
+// 设置跳过模式
+async function setSkipMode(mode) {
+  await chrome.storage.local.set({ skip_mode: mode });
+  updateSkipModeUI(mode);
+  console.log('[Popup] 跳过模式已设置为:', mode);
+}
+
 // 初始化
 document.addEventListener('DOMContentLoaded', async () => {
   const isLoggedIn = await checkAuth();
@@ -167,6 +198,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('switch-text').onclick = toggleMode;
   document.getElementById('logout-btn').onclick = logout;
 
+  // 跳过模式按钮事件
+  document.getElementById('mode-auto').onclick = () => setSkipMode('auto');
+  document.getElementById('mode-manual').onclick = () => setSkipMode('manual');
+
   document.getElementById('password').onkeypress = (e) => {
     if (e.key === 'Enter') handleAuth();
   };
@@ -174,5 +209,5 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 检查后端健康状态
   apiRequest('/health')
     .then(() => console.log('后端连接正常'))
-    .catch(() => showError('警告：无法连接后端，请确保localhost:3000运行中'));
+    .catch(() => showError('警告：无法连接后端，请确保 apitest.visionmark.com.cn:8443 运行中'));
 });
