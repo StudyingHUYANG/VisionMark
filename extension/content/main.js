@@ -111,35 +111,59 @@
       const self = this;
       console.log("[AdSkipper] 注入控制面板到:", target.className);
 
-      // Wrapper
+      // 1. Inject Styles for Responsiveness
+      if (!document.getElementById('adskipper-css')) {
+        const style = document.createElement('style');
+        style.id = 'adskipper-css';
+        style.textContent = `
+          .adskipper-toggle-text { display: block; font-size: 13px; font-weight: 500; }
+          .is-compact #adskipper-toggle { padding: 0 6px !important; justify-content: center; }
+          #adskipper-toggle:hover { filter: brightness(1.1); }
+        `;
+        document.head.appendChild(style);
+      }
+
+      // 2. Wrapper
       const wrapper = document.createElement('div');
       wrapper.id = 'adskipper-wrapper';
-      wrapper.style.cssText = 'position:relative;display:inline-flex;vertical-align:middle;height:100%;align-items:center;margin-left:10px;z-index:100;';
+      wrapper.style.cssText = 'position:relative;display:inline-flex;vertical-align:middle;height:100%;align-items:center;margin-right:12px;z-index:100;';
 
-      // Toggle Button
+      // 3. Toggle Button
       const toggleBtn = document.createElement('div');
       toggleBtn.id = 'adskipper-toggle';
-      toggleBtn.innerHTML = '🛡️';
       toggleBtn.title = '广告标注控制';
       toggleBtn.setAttribute('aria-label', '广告标注控制');
-      toggleBtn.style.cssText = 'cursor:pointer;font-size:1.5em;opacity:0.8;transition:all 0.2s;user-select:none;display:flex;align-items:center;justify-content:center;width:30px;height:100%;';
-      toggleBtn.onmouseenter = () => { toggleBtn.style.opacity = '1'; toggleBtn.style.transform = 'scale(1.1)'; };
-      toggleBtn.onmouseleave = () => { toggleBtn.style.opacity = '0.8'; toggleBtn.style.transform = 'scale(1)'; };
+      toggleBtn.style.cssText = `
+        cursor: pointer;
+        background-color: #FB7299;
+        color: #FFFFFF;
+        border-radius: 6px;
+        padding: 4px 10px;
+        transition: all 0.2s;
+        user-select: none;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 4px;
+        height: auto;
+        min-height: 24px;
+      `;
+      toggleBtn.innerHTML = `<span class="adskipper-toggle-text">广告控制</span>`;
+
       toggleBtn.onclick = (e) => {
         e.stopPropagation();
         self.togglePopover();
       };
 
-      // Popover Panel
+      // 4. Popover Panel
       const popover = document.createElement('div');
       popover.id = 'adskipper-popover';
-      // High z-index, positioned above the wrapper
       popover.style.cssText = `
         display: none;
         position: absolute;
-        bottom: 100%;
-        right: -10px;
-        margin-bottom: 15px;
+        bottom: 140%;
+        left: 0;
+        margin-bottom: 0px;
         z-index: 2147483647;
         background: rgba(20, 20, 20, 0.95);
         backdrop-filter: blur(10px);
@@ -150,12 +174,12 @@
         width: max-content;
         flex-direction: column;
         gap: 8px;
-        transform-origin: bottom right;
+        transform-origin: bottom left;
         transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
       `;
-      popover.onclick = (e) => e.stopPropagation(); // Prevent closing when clicking inside
+      popover.onclick = (e) => e.stopPropagation();
 
-      // --- Button Logic (Refactored from original) ---
+      // --- Button Logic ---
 
       // Helper: Create Row
       const createRow = () => {
@@ -317,12 +341,25 @@
       wrapper.appendChild(popover);
 
       // Inject
-      // For .bpx-player-control-bottom-right, we want it at the beginning or end?
-      // Usually prepending avoids messing with the fullscreen/web-fullscreen buttons which are often last.
       if (target.firstChild) {
         target.insertBefore(wrapper, target.firstChild);
       } else {
         target.appendChild(wrapper);
+      }
+
+      // ResizeObserver
+      const playerContainer = document.querySelector('.bpx-player-container') || document.querySelector('#bilibili-player');
+      if (playerContainer) {
+        const ro = new ResizeObserver(entries => {
+          for (let entry of entries) {
+            if (entry.contentRect.width < 600) {
+              wrapper.classList.add('is-compact');
+            } else {
+              wrapper.classList.remove('is-compact');
+            }
+          }
+        });
+        ro.observe(playerContainer);
       }
 
       // Preview update loop
