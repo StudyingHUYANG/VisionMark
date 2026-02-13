@@ -1,6 +1,6 @@
 // 配置文件 - 本地开发环境
-const API_BASE = 'http://localhost:3000/api/v1';
-const CONFIG = {
+window.API_BASE = 'http://localhost:3000/api/v1';
+window.CONFIG = {
   CHECK_INTERVAL: 200,
   CONFIDENCE_THRESHOLD: 0.7,
   MIN_VOTES: 3,

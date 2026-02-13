@@ -11,24 +11,40 @@
       this.pendingType = 'hard_ad';
     }
 
-    async init() {
+    init() {
       console.log("[AdSkipper] 初始化...");
-      const ok = await this.player.init();
-      if (!ok) return;
+      this.player.init().then(ok => {
+        if (!ok) return;
 
-      // 检查登录状态
-      const storage = await new Promise(r => chrome.storage.local.get(['adskipper_token'], r));
-      const token = storage.adskipper_token;
-      console.log("[AdSkipper] 登录状态:", token ? "已登录" : "未登录");
+        // 检查登录状态
+        chrome.storage.local.get(['adskipper_token'], (storage) => {
+          const token = storage.adskipper_token;
+          console.log("[AdSkipper] 登录状态:", token ? "已登录" : "未登录");
+        });
 
-      this.player.onTimeUpdate = (t) => this.checkSkip(t);
-      this.injectControlPanel();
+        this.player.onTimeUpdate = (t) => this.checkSkip(t);
+        this.startInjectionObserver();
 
-      const bvid = this.player.currentBvid;
-      if (bvid) {
-        await this.loadSegments(bvid);
-        window.adSkipper = this;
-      }
+        const bvid = this.player.currentBvid;
+        if (bvid) {
+          this.loadSegments(bvid).then(() => {
+            window.adSkipper = this;
+          });
+        }
+      });
+
+      // Global click listener for closing popover
+      document.addEventListener('click', (e) => {
+        const wrapper = document.getElementById('adskipper-wrapper');
+        if (wrapper && !wrapper.contains(e.target)) {
+          this.togglePopover(false);
+        }
+      });
+
+      // ESC key listener
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') this.togglePopover(false);
+      });
     }
 
     getPage() {
@@ -50,11 +66,11 @@
 
     checkSkip(currentTime) {
       if (!this.segments.length || Date.now() - this.lastSkipTime < 500) return;
-      
-      const ad = this.segments.find(s => 
+
+      const ad = this.segments.find(s =>
         currentTime >= s.start_time && currentTime < s.end_time - 0.5
       );
-      
+
       if (ad) {
         this.player.skipTo(ad.end_time);
         this.lastSkipTime = Date.now();
@@ -62,190 +78,285 @@
       }
     }
 
-    injectControlPanel() {
+    startInjectionObserver() {
+      const observer = new MutationObserver(() => {
+        // Idempotency check
+        if (document.getElementById('adskipper-wrapper')) return;
+
+        // Try to find target
+        const target = document.querySelector('.bpx-player-control-bottom-right') ||
+                       document.querySelector('.bpx-player-control-bottom') ||
+                       document.querySelector('.bilibili-player-video-control');
+
+        if (target) {
+          this.injectControlPanel(target);
+        }
+      });
+
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true
+      });
+
+      // Initial check
+      const target = document.querySelector('.bpx-player-control-bottom-right') ||
+                     document.querySelector('.bpx-player-control-bottom') ||
+                     document.querySelector('.bilibili-player-video-control');
+      if (target && !document.getElementById('adskipper-wrapper')) {
+        this.injectControlPanel(target);
+      }
+    }
+
+    injectControlPanel(target) {
       const self = this;
-      
-      const tryInject = () => {
-        // 找到控制栏底部区域
-        let target = document.querySelector('.bpx-player-control-bottom');
-        if (!target) target = document.querySelector('.bilibili-player-video-control');
-        
-        if (!target) {
-          setTimeout(tryInject, 1000);
+      console.log("[AdSkipper] 注入控制面板到:", target.className);
+
+      // Wrapper
+      const wrapper = document.createElement('div');
+      wrapper.id = 'adskipper-wrapper';
+      wrapper.style.cssText = 'position:relative;display:inline-flex;vertical-align:middle;height:100%;align-items:center;margin-left:10px;z-index:100;';
+
+      // Toggle Button
+      const toggleBtn = document.createElement('div');
+      toggleBtn.id = 'adskipper-toggle';
+      toggleBtn.innerHTML = '🛡️';
+      toggleBtn.title = '广告标注控制';
+      toggleBtn.setAttribute('aria-label', '广告标注控制');
+      toggleBtn.style.cssText = 'cursor:pointer;font-size:1.5em;opacity:0.8;transition:all 0.2s;user-select:none;display:flex;align-items:center;justify-content:center;width:30px;height:100%;';
+      toggleBtn.onmouseenter = () => { toggleBtn.style.opacity = '1'; toggleBtn.style.transform = 'scale(1.1)'; };
+      toggleBtn.onmouseleave = () => { toggleBtn.style.opacity = '0.8'; toggleBtn.style.transform = 'scale(1)'; };
+      toggleBtn.onclick = (e) => {
+        e.stopPropagation();
+        self.togglePopover();
+      };
+
+      // Popover Panel
+      const popover = document.createElement('div');
+      popover.id = 'adskipper-popover';
+      // High z-index, positioned above the wrapper
+      popover.style.cssText = `
+        display: none;
+        position: absolute;
+        bottom: 100%;
+        right: -10px;
+        margin-bottom: 15px;
+        z-index: 2147483647;
+        background: rgba(20, 20, 20, 0.95);
+        backdrop-filter: blur(10px);
+        padding: 10px;
+        border-radius: 8px;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+        border: 1px solid rgba(255,255,255,0.1);
+        width: max-content;
+        flex-direction: column;
+        gap: 8px;
+        transform-origin: bottom right;
+        transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      `;
+      popover.onclick = (e) => e.stopPropagation(); // Prevent closing when clicking inside
+
+      // --- Button Logic (Refactored from original) ---
+
+      // Helper: Create Row
+      const createRow = () => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;gap:8px;align-items:center;justify-content:space-between;';
+        return row;
+      };
+
+      // Helper: Create Button
+      function createBtn(id, icon, label, title, onClick) {
+        const btn = document.createElement('button');
+        btn.id = id;
+        btn.innerHTML = `<span style="font-size:1.2em;">${icon}</span> <span style="font-size:0.9em;">${label}</span>`;
+        btn.title = title;
+        btn.style.cssText = `
+          flex: 1;
+          height: 32px;
+          background: #333;
+          border: 1px solid #555;
+          color: #fff;
+          border-radius: 4px;
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 6px;
+          transition: all 0.2s;
+          padding: 0 8px;
+          white-space: nowrap;
+        `;
+        btn.onmouseenter = () => { if(!btn.disabled) { btn.style.background = '#444'; } };
+        btn.onmouseleave = () => {
+          if (btn.dataset.active === 'true') {
+            btn.style.background = '#FB7299';
+            btn.style.borderColor = '#FB7299';
+          } else {
+            btn.style.background = '#333';
+          }
+        };
+        btn.onclick = onClick;
+        return btn;
+      }
+
+      // Row 1: Start / End
+      const row1 = createRow();
+
+      const btnStart = createBtn('adskipper-btn-start', '⛳', '开始', '标记广告开始', () => {
+        const current = self.player.getState().currentTime;
+        self.pendingStart = current;
+        btnStart.dataset.active = 'true';
+        btnStart.style.background = '#FB7299';
+        btnStart.style.borderColor = '#FB7299';
+        self.updateButtonStates();
+        self.showToast("开始: " + current.toFixed(1) + "s", "info");
+        btnStart.animate([{opacity:1},{opacity:0.5},{opacity:1}], {duration:300});
+      });
+
+      const btnEnd = createBtn('adskipper-btn-end', '🏁', '结束', '标记广告结束', () => {
+        const current = self.player.getState().currentTime;
+        if (self.pendingStart && current <= self.pendingStart) {
+          self.showToast("结束必须大于开始", "error");
           return;
         }
-        
-        // 检查是否已注入
-        if (document.getElementById('adskipper-container')) return;
-        
-        // 创建外层容器（独立区域，避免挤兑原有按钮）
-        const container = document.createElement('div');
-        container.id = 'adskipper-container';
-        // 关键样式：flex布局，最小宽度限制，横向滚动
-        container.style.cssText = 'display:flex;align-items:center;justify-content:center;width:100%;padding:0.3em 0;background:rgba(0,0,0,0.8);border-top:1px solid rgba(255,255,255,0.1);font-size:clamp(12px,1.5vh,16px);gap:0.5em;overflow-x:auto;white-space:nowrap;';
-        
-        // 内层面板
-        const panel = document.createElement('div');
-        panel.id = 'adskipper-panel';
-        panel.style.cssText = 'display:flex;align-items:center;gap:0.5em;';
-        
-        // 辅助函数：创建图标按钮（节省空间）
-        function createIconBtn(id, icon, label, title, onClick) {
-          const btn = document.createElement('button');
-          btn.id = id;
-          // 图标+短文字，垂直排列节省宽度
-          btn.innerHTML = '<span style="font-size:1.2em;line-height:1;">' + icon + '</span><span style="font-size:0.75em;opacity:0.9;">' + label + '</span>';
-          btn.title = title;
-          // 固定最小宽度，防止挤压
-          btn.style.cssText = 'min-width:3.5em;height:2.8em;background:#333;border:1px solid #555;color:#fff;border-radius:0.4em;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0.2em;line-height:1;transition:all 0.2s;flex-shrink:0;';
-          
-          btn.onmouseenter = () => { if(!btn.disabled) { btn.style.background = '#444'; btn.style.transform = 'scale(1.05)'; } };
-          btn.onmouseleave = () => { 
-            if (btn.dataset.active === 'true') {
-              btn.style.background = '#FB7299';
-              btn.style.borderColor = '#FB7299';
-            } else {
-              btn.style.background = '#333';
-              btn.style.transform = 'scale(1)';
-            }
-          };
-          btn.onclick = onClick;
-          return btn;
+        self.pendingEnd = current;
+        btnEnd.dataset.active = 'true';
+        btnEnd.style.background = '#FB7299';
+        self.updateButtonStates();
+        self.showToast("结束: " + current.toFixed(1) + "s", "info");
+        btnEnd.animate([{opacity:1},{opacity:0.5},{opacity:1}], {duration:300});
+      });
+      btnEnd.disabled = true;
+      btnEnd.style.opacity = '0.5';
+      btnEnd.style.cursor = 'not-allowed';
+
+      row1.appendChild(btnStart);
+      row1.appendChild(btnEnd);
+
+      // Row 2: Type Selector
+      const row2 = createRow();
+      const selectType = document.createElement('select');
+      selectType.id = 'adskipper-type';
+      selectType.style.cssText = 'width:100%;height:32px;background:#333;color:#fff;border:1px solid #555;border-radius:4px;padding:0 6px;font-size:0.9em;outline:none;cursor:pointer;';
+      const types = [
+        {val: 'hard_ad', text: '硬广 (Hard Ad)'},
+        {val: 'soft_ad', text: '软广 (Soft Ad)'},
+        {val: 'product_placement', text: '植入 (Placement)'},
+        {val: 'intro_ad', text: '片头 (Intro)'},
+        {val: 'mid_ad', text: '中段 (Mid)'}
+      ];
+      types.forEach((t) => {
+        const opt = document.createElement('option');
+        opt.value = t.val;
+        opt.textContent = t.text;
+        selectType.appendChild(opt);
+      });
+      selectType.onchange = (e) => { self.pendingType = e.target.value; };
+      row2.appendChild(selectType);
+
+      // Row 3: Submit
+      const row3 = createRow();
+      const btnSubmit = createBtn('adskipper-btn-submit', '☁️', '提交标注', '提交到服务器', async () => {
+        if (!self.pendingStart || !self.pendingEnd) return;
+
+        const storage = await new Promise(r => chrome.storage.local.get(['adskipper_token'], r));
+        if (!storage.adskipper_token) {
+          self.showToast("✗ 请先登录插件", "error");
+          return;
         }
-        
-        // 按钮1：开始
-        const btnStart = createIconBtn('adskipper-btn-start', '⛳', '开始', '标记广告开始', () => {
-          const current = self.player.getState().currentTime;
-          self.pendingStart = current;
-          btnStart.dataset.active = 'true';
-          btnStart.style.background = '#FB7299';
-          btnStart.style.borderColor = '#FB7299';
-          self.updateButtonStates();
-          self.showToast("开始: " + current.toFixed(1) + "s", "info");
-          // 视觉反馈：闪烁
-          btnStart.animate([{opacity:1},{opacity:0.5},{opacity:1}], {duration:300});
-        });
-        
-        // 按钮2：结束
-        const btnEnd = createIconBtn('adskipper-btn-end', '🏁', '结束', '标记广告结束', () => {
-          const current = self.player.getState().currentTime;
-          if (self.pendingStart && current <= self.pendingStart) {
-            self.showToast("结束必须大于开始", "error");
-            return;
-          }
-          self.pendingEnd = current;
-          btnEnd.dataset.active = 'true';
-          btnEnd.style.background = '#FB7299';
-          self.updateButtonStates();
-          self.showToast("结束: " + current.toFixed(1) + "s", "info");
-          btnEnd.animate([{opacity:1},{opacity:0.5},{opacity:1}], {duration:300});
-        });
-        btnEnd.disabled = true;
-        btnEnd.style.opacity = '0.4';
-        btnEnd.style.cursor = 'not-allowed';
-        
-        // 按钮3：类型（下拉菜单，紧凑版）
-        const typeWrapper = document.createElement('div');
-        typeWrapper.style.cssText = 'position:relative;flex-shrink:0;';
-        
-        const selectType = document.createElement('select');
-        selectType.id = 'adskipper-type';
-        selectType.title = '选择广告类型';
-        // 使用padding而不是固定宽度，自适应
-        selectType.style.cssText = 'height:2.8em;background:#333;color:#fff;border:1px solid #555;border-radius:0.4em;padding:0 0.5em;font-size:0.9em;cursor:pointer;outline:none;min-width:4em;';
-        const types = [
-          {val: 'hard_ad', text: '硬广'},
-          {val: 'soft_ad', text: '软广'},
-          {val: 'product_placement', text: '植入'},
-          {val: 'intro_ad', text: '片头'},
-          {val: 'mid_ad', text: '中段'}
-        ];
-        types.forEach((t, i) => {
-          const opt = document.createElement('option');
-          opt.value = t.val;
-          // 如果是第一个，添加Emoji前缀提示
-          opt.textContent = (i === 0 ? '⚠️ ' : '') + t.text;
-          selectType.appendChild(opt);
-        });
-        selectType.onchange = (e) => { self.pendingType = e.target.value; };
-        
-        typeWrapper.appendChild(selectType);
-        
-        // 按钮4：提交
-        const btnSubmit = createIconBtn('adskipper-btn-submit', '☁️', '提交', '提交标注', async () => {
-          if (!self.pendingStart || !self.pendingEnd) return;
 
-          // 检查是否已登录
-          const storage = await new Promise(r => chrome.storage.local.get(['adskipper_token'], r));
-          if (!storage.adskipper_token) {
-            self.showToast("✗ 请先登录插件", "error");
-            return;
-          }
+        btnSubmit.innerHTML = '⏳ 提交中...';
+        try {
+          await self.submitAnnotation(self.pendingStart, self.pendingEnd, self.pendingType);
+          self.showToast("✓ 成功 +10分", "success");
 
-          btnSubmit.innerHTML = '<span style="font-size:1.2em;">⏳</span><span style="font-size:0.75em;">...</span>';
-          try {
-            await self.submitAnnotation(self.pendingStart, self.pendingEnd, self.pendingType);
-            self.showToast("✓ 成功 +10分", "success");
-            // 重置
-            self.pendingStart = null;
-            self.pendingEnd = null;
-            self.updateButtonStates();
-            btnStart.dataset.active = 'false';
-            btnEnd.dataset.active = 'false';
-            [btnStart, btnEnd, btnSubmit].forEach(btn => {
-              btn.style.background = '#333';
-              btn.style.borderColor = '#555';
-            });
-            btnSubmit.innerHTML = '<span style="font-size:1.2em;">☁️</span><span style="font-size:0.75em;">提交</span>';
-            btnEnd.disabled = true;
-            btnEnd.style.opacity = '0.4';
-            btnEnd.style.cursor = 'not-allowed';
-            btnSubmit.disabled = true;
-            btnSubmit.style.opacity = '0.4';
-            btnSubmit.style.cursor = 'not-allowed';
-          } catch(err) {
-            self.showToast("✗ " + err.message, "error");
-            btnSubmit.innerHTML = '<span style="font-size:1.2em;">☁️</span><span style="font-size:0.75em;">提交</span>';
-          }
-        });
-        btnSubmit.disabled = true;
-        btnSubmit.style.opacity = '0.4';
-        btnSubmit.style.cursor = 'not-allowed';
-        
-        // 添加可选的预览文本（显示已选时间段）
-        const preview = document.createElement('span');
-        preview.id = 'adskipper-preview';
-        preview.style.cssText = 'color:#FB7299;font-size:0.85em;margin-left:0.5em;min-width:8em;display:inline-block;flex-shrink:0;';
-        preview.textContent = '';
-        
-        panel.appendChild(btnStart);
-        panel.appendChild(btnEnd);
-        panel.appendChild(typeWrapper);
-        panel.appendChild(btnSubmit);
-        panel.appendChild(preview);
-        
-        container.appendChild(panel);
-        
-        // 插入到控制栏底部（新的一行，不挤压原有按钮）
-        target.appendChild(container);
-        console.log("[AdSkipper] 独立控制栏UI已注入");
-        
-        // 监听状态变化，更新预览
-        setInterval(() => {
-          const p = document.getElementById('adskipper-preview');
-          if (!p) return;
-          if (self.pendingStart && self.pendingEnd) {
-            const dur = (self.pendingEnd - self.pendingStart).toFixed(1);
-            p.textContent = '⏱️ ' + dur + '秒';
-          } else if (self.pendingStart) {
-            p.textContent = '从 ' + self.pendingStart.toFixed(1) + 's...';
-          } else {
-            p.textContent = '';
-          }
-        }, 200);
-      };
-      
-      tryInject();
+          // Reset
+          self.pendingStart = null;
+          self.pendingEnd = null;
+          self.updateButtonStates();
+
+          btnStart.dataset.active = 'false';
+          btnEnd.dataset.active = 'false';
+          [btnStart, btnEnd].forEach(btn => {
+            btn.style.background = '#333';
+            btn.style.borderColor = '#555';
+          });
+
+          btnSubmit.innerHTML = '<span style="font-size:1.2em;">☁️</span> <span style="font-size:0.9em;">提交标注</span>';
+
+          // Close popover on success
+          self.togglePopover(false);
+
+        } catch(err) {
+          self.showToast("✗ " + err.message, "error");
+          btnSubmit.innerHTML = '<span style="font-size:1.2em;">☁️</span> <span style="font-size:0.9em;">提交标注</span>';
+        }
+      });
+      btnSubmit.disabled = true;
+      btnSubmit.style.opacity = '0.5';
+      btnSubmit.style.cursor = 'not-allowed';
+      btnSubmit.style.width = '100%';
+      row3.appendChild(btnSubmit);
+
+      // Preview Text
+      const previewRow = createRow();
+      previewRow.style.justifyContent = 'center';
+      const preview = document.createElement('span');
+      preview.id = 'adskipper-preview';
+      preview.style.cssText = 'color:#FB7299;font-size:0.85em;min-height:1.2em;';
+      previewRow.appendChild(preview);
+
+      // Assemble Popover
+      popover.appendChild(row1);
+      popover.appendChild(row2);
+      popover.appendChild(row3);
+      popover.appendChild(previewRow);
+
+      // Assemble Wrapper
+      wrapper.appendChild(toggleBtn);
+      wrapper.appendChild(popover);
+
+      // Inject
+      // For .bpx-player-control-bottom-right, we want it at the beginning or end?
+      // Usually prepending avoids messing with the fullscreen/web-fullscreen buttons which are often last.
+      if (target.firstChild) {
+        target.insertBefore(wrapper, target.firstChild);
+      } else {
+        target.appendChild(wrapper);
+      }
+
+      // Preview update loop
+      if (this.previewInterval) clearInterval(this.previewInterval);
+      this.previewInterval = setInterval(() => {
+        const p = document.getElementById('adskipper-preview');
+        if (!p) return;
+        if (self.pendingStart && self.pendingEnd) {
+          const dur = (self.pendingEnd - self.pendingStart).toFixed(1);
+          p.textContent = '⏱️ 已选 ' + dur + '秒';
+        } else if (self.pendingStart) {
+          p.textContent = '从 ' + self.pendingStart.toFixed(1) + 's...';
+        } else {
+          p.textContent = '';
+        }
+      }, 200);
+    }
+
+    togglePopover(forceState) {
+      const popover = document.getElementById('adskipper-popover');
+      if (!popover) return;
+
+      const newState = forceState !== undefined ? forceState : (popover.style.display === 'none');
+
+      if (newState) {
+        popover.style.display = 'flex';
+        // Simple animation
+        popover.animate([
+          { opacity: 0, transform: 'scale(0.9) translateY(10px)' },
+          { opacity: 1, transform: 'scale(1) translateY(0)' }
+        ], { duration: 200, easing: 'cubic-bezier(0.4, 0, 0.2, 1)' });
+      } else {
+        popover.style.display = 'none';
+      }
     }
 
     updateButtonStates() {
