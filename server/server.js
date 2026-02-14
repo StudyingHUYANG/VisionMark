@@ -5,9 +5,10 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const path = require('path');
+const config = require('./config.js');
 
 const app = express();
-const JWT_SECRET = 'secret-key-v1';
+const JWT_SECRET = config.JWT_SECRET;
 
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
@@ -139,9 +140,9 @@ const segmentsRouter = require('./routes/segments.js');
 app.use('/api/v1/stats', statsRouter);
 app.use('/api/v1/segments', segmentsRouter); // 补充批量/删除接口，和原有segments接口合并
 
-// 原有app.listen保持不变
-app.listen(8080, '0.0.0.0', () => {
-  console.log('[Server] http://localhost:8080');
+// 使用配置文件的端口
+app.listen(config.PORT, '0.0.0.0', () => {
+  console.log('[Server] http://localhost:' + config.PORT);
   console.log('[Auth] admin/admin 登录');
 });
 

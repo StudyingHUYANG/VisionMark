@@ -1,4 +1,7 @@
-const API_BASE = 'http://localhost:3000/api/v1';
+// 使用配置文件中的 API 地址（如果配置文件存在）
+const API_BASE = window.LOCAL_CONFIG
+  ? window.LOCAL_CONFIG.API_BASE + '/' + window.LOCAL_CONFIG.API_VERSION
+  : 'http://localhost:8080/api/v1';
 
 // 统一的API请求函数
 async function apiRequest(endpoint, options = {}) {
