@@ -23,6 +23,4 @@ node_modules/
 *.log
 .DS_Store
 
-# 忽略本地开发配置（每个人有自己的端口设置）
-extension/content/config.local.js
-server/config.js
+
