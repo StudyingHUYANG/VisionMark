@@ -14,6 +14,8 @@
       this.coolDownLogPrinted = false;
       this.matchProcessLogPrinted = false;
       this.noAdMatchLogPrinted = false;
+      // 存储当前视频的标注ID（用于删除）
+      this.currentSegmentIds = [];
     }
 
     init() {
@@ -63,7 +65,9 @@
         const res = await fetch(url);
         const data = await res.json();
         this.segments = data.segments || [];
-        console.log("[AdSkipper] 加载", this.segments.length, "个广告段");
+        // 保存标注ID用于删除
+        this.currentSegmentIds = this.segments.map(seg => seg.id).filter(id => id);
+        console.log("[AdSkipper] 加载", this.segments.length, "个广告段，ID列表:", this.currentSegmentIds);
       } catch(e) {
         console.error("加载失败:", e);
       }
@@ -71,7 +75,6 @@
 
     // 替换后的 checkSkip 方法
     checkSkip(currentTime) {
-
       // 单条播放时间日志（不刷屏，页面右上角显示）
       const logElementId = 'ad-skipper-play-time';
       let logElement = document.getElementById(logElementId);
@@ -105,9 +108,6 @@
         });
         this.matchProcessLogPrinted = true;
       }
-
-      if (!this.segments.length || Date.now() - this.lastSkipTime < 500) return;
-
 
       const ad = this.segments.find(s =>
         currentTime >= s.start_time && currentTime < s.end_time - 0.5
@@ -167,6 +167,48 @@
           .adskipper-toggle-text { display: block; font-size: 13px; font-weight: 500; }
           .is-compact #adskipper-toggle { padding: 0 6px !important; justify-content: center; }
           #adskipper-toggle:hover { filter: brightness(1.1); }
+          /* 确认对话框样式 */
+          #adskipper-confirm-dialog {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(20, 20, 20, 0.98);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 8px;
+            padding: 20px;
+            z-index: 999999;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+            color: #fff;
+            min-width: 300px;
+          }
+          #adskipper-confirm-dialog h3 {
+            margin: 0 0 15px 0;
+            font-size: 16px;
+            color: #FB7299;
+          }
+          #adskipper-confirm-dialog .btn-group {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            margin-top: 20px;
+          }
+          #adskipper-confirm-dialog button {
+            padding: 6px 16px;
+            border-radius: 4px;
+            border: none;
+            cursor: pointer;
+            font-size: 14px;
+          }
+          #adskipper-confirm-ok {
+            background: #FB7299;
+            color: white;
+          }
+          #adskipper-confirm-cancel {
+            background: #555;
+            color: white;
+          }
         `;
         document.head.appendChild(style);
       }
@@ -326,7 +368,7 @@
       selectType.onchange = (e) => { self.pendingType = e.target.value; };
       row2.appendChild(selectType);
 
-      // Row 3: Submit
+      // Row 3: Submit + Delete
       const row3 = createRow();
       const btnSubmit = createBtn('adskipper-btn-submit', '☁️', '提交标注', '提交到服务器', async () => {
         if (!self.pendingStart || !self.pendingEnd) return;
@@ -367,8 +409,60 @@
       btnSubmit.disabled = true;
       btnSubmit.style.opacity = '0.5';
       btnSubmit.style.cursor = 'not-allowed';
-      btnSubmit.style.width = '100%';
+
+      // 添加删除按钮
+      const btnDelete = createBtn('adskipper-btn-delete', '🗑️', '删除最近', '删除最近添加的标注', async () => {
+        // 检查是否有可删除的标注
+        if (!self.currentSegmentIds.length) {
+          self.showToast("✗ 暂无可删除的标注", "error");
+          return;
+        }
+
+        // 显示确认对话框
+        const confirmResult = await self.showConfirmDialog(
+          "确认删除",
+          `是否确定删除最近添加的标注？\n（ID: ${self.currentSegmentIds[self.currentSegmentIds.length - 1]}）`
+        );
+        
+        if (!confirmResult) return;
+
+        btnDelete.innerHTML = '⏳ 删除中...';
+        btnDelete.disabled = true;
+        btnDelete.style.opacity = '0.5';
+
+        try {
+          // 删除最后一个标注
+          const lastSegmentId = self.currentSegmentIds[self.currentSegmentIds.length - 1];
+          await self.deleteAnnotation(lastSegmentId);
+          self.showToast("✓ 删除成功", "success");
+          
+          // 刷新标注数据
+          await self.loadSegments(self.player.currentBvid);
+          
+          // 重置按钮状态
+          btnDelete.innerHTML = '<span style="font-size:1.2em;">🗑️</span> <span style="font-size:0.9em;">删除最近</span>';
+          btnDelete.disabled = false;
+          btnDelete.style.opacity = '1';
+          
+          // 关闭弹窗
+          self.togglePopover(false);
+        } catch (err) {
+          self.showToast("✗ " + err.message, "error");
+          btnDelete.innerHTML = '<span style="font-size:1.2em;">🗑️</span> <span style="font-size:0.9em;">删除最近</span>';
+          btnDelete.disabled = false;
+          btnDelete.style.opacity = '1';
+        }
+      });
+
+      // 禁用删除按钮（如果没有标注）
+      if (!self.currentSegmentIds.length) {
+        btnDelete.disabled = true;
+        btnDelete.style.opacity = '0.5';
+        btnDelete.style.cursor = 'not-allowed';
+      }
+
       row3.appendChild(btnSubmit);
+      row3.appendChild(btnDelete);
 
       // Preview Text
       const previewRow = createRow();
@@ -426,6 +520,85 @@
       }, 200);
     }
 
+    // 显示确认对话框
+    showConfirmDialog(title, message) {
+      return new Promise((resolve) => {
+        // 移除已存在的对话框
+        const oldDialog = document.getElementById('adskipper-confirm-dialog');
+        if (oldDialog) oldDialog.remove();
+
+        // 创建对话框
+        const dialog = document.createElement('div');
+        dialog.id = 'adskipper-confirm-dialog';
+        dialog.innerHTML = `
+          <h3>${title}</h3>
+          <p>${message}</p>
+          <div class="btn-group">
+            <button id="adskipper-confirm-cancel">取消</button>
+            <button id="adskipper-confirm-ok">确认</button>
+          </div>
+        `;
+        document.body.appendChild(dialog);
+
+        // 绑定事件
+        document.getElementById('adskipper-confirm-ok').onclick = () => {
+          dialog.remove();
+          resolve(true);
+        };
+        document.getElementById('adskipper-confirm-cancel').onclick = () => {
+          dialog.remove();
+          resolve(false);
+        };
+
+        // 点击外部关闭
+        const clickOutsideHandler = (e) => {
+          if (!dialog.contains(e.target)) {
+            dialog.remove();
+            resolve(false);
+            document.removeEventListener('click', clickOutsideHandler);
+          }
+        };
+        setTimeout(() => {
+          document.addEventListener('click', clickOutsideHandler);
+        }, 0);
+      });
+    }
+
+    // 调用删除API
+    async deleteAnnotation(segmentId) {
+      const storage = await new Promise(r => chrome.storage.local.get(['adskipper_token'], r));
+      const token = storage.adskipper_token;
+
+      if (!token) {
+        throw new Error("请先登录插件");
+      }
+
+      const headers = {
+        "Content-Type": "application/json",
+        "Authorization": 'Bearer ' + token
+      };
+
+      console.log("[AdSkipper] 准备删除标注 ID:", segmentId);
+
+      const res = await fetch(`${API_BASE}/segments/${segmentId}`, {
+        method: "DELETE",
+        headers: headers
+      });
+
+      if (!res.ok) {
+        let errorMsg = "删除失败";
+        try {
+          const data = await res.json();
+          errorMsg = data.error || errorMsg;
+        } catch (e) {
+          console.error("[AdSkipper] 删除响应解析失败:", res.status, res.statusText);
+        }
+        throw new Error(errorMsg);
+      }
+
+      return await res.json();
+    }
+
     togglePopover(forceState) {
       const popover = document.getElementById('adskipper-popover');
       if (!popover) return;
@@ -448,6 +621,7 @@
       const btnEnd = document.getElementById('adskipper-btn-end');
       const btnSubmit = document.getElementById('adskipper-btn-submit');
       const preview = document.getElementById('adskipper-preview');
+      const btnDelete = document.getElementById('adskipper-btn-delete');
       
       if (btnEnd && this.pendingStart) {
         btnEnd.disabled = false;
@@ -458,6 +632,18 @@
         btnSubmit.disabled = false;
         btnSubmit.style.opacity = '1';
         btnSubmit.style.cursor = 'pointer';
+      }
+      // 更新删除按钮状态
+      if (btnDelete) {
+        if (this.currentSegmentIds.length) {
+          btnDelete.disabled = false;
+          btnDelete.style.opacity = '1';
+          btnDelete.style.cursor = 'pointer';
+        } else {
+          btnDelete.disabled = true;
+          btnDelete.style.opacity = '0.5';
+          btnDelete.style.cursor = 'not-allowed';
+        }
       }
     }
 
