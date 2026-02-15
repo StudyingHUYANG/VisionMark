@@ -68,3 +68,6 @@ class BilibiliPlayerController {
     };
   }
 }
+
+// 显式导出到全局，防止 main.js 找不到
+window.BilibiliPlayerController = BilibiliPlayerController;

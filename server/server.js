@@ -1,12 +1,14 @@
+const { authenticateToken } = require('./middlewares/auth.js');
 const express = require('express');
 const Database = require('better-sqlite3');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const path = require('path');
+const config = require('./config.js');
 
 const app = express();
-const JWT_SECRET = 'secret-key-v1';
+const JWT_SECRET = config.JWT_SECRET;
 
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
@@ -56,31 +58,6 @@ if (!admin) {
   console.log('[Auth] 测试账号: admin/admin');
 }
 
-// Auth Middleware
-function authenticateToken(req, res, next) {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) {
-    console.log('[Auth] 拒绝请求: 缺少token');
-    return res.status(401).json({ error: '未登录，请先在插件中登录' });
-  }
-
-  console.log('[Auth] 收到token:', token.substring(0, 20) + '...');
-
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      console.log('[Auth] Token验证失败:', err.name, err.message);
-      if (err.name === 'TokenExpiredError') {
-        return res.status(403).json({ error: '登录已过期，请重新登录' });
-      }
-      return res.status(403).json({ error: 'Token无效，请重新登录' });
-    }
-    console.log('[Auth] Token验证成功, 用户:', user.username);
-    req.user = user;
-    next();
-  });
-}
 
 // 登录API
 app.post('/api/v1/auth/login', (req, res) => {
@@ -155,7 +132,18 @@ app.post('/api/v1/segments', authenticateToken, (req, res) => {
 
 app.get('/api/v1/health', (req, res) => res.json({ ok: true }));
 
-app.listen(3000, '0.0.0.0', () => {
-  console.log('[Server] http://localhost:3000');
+// 引入路由文件
+const statsRouter = require('./routes/stats.js');
+const segmentsRouter = require('./routes/segments.js');
+
+// 注册路由
+app.use('/api/v1/stats', statsRouter);
+app.use('/api/v1/segments', segmentsRouter); // 补充批量/删除接口，和原有segments接口合并
+
+// 使用配置文件的端口
+app.listen(config.PORT, '0.0.0.0', () => {
+  console.log('[Server] http://localhost:' + config.PORT);
   console.log('[Auth] admin/admin 登录');
 });
+
+

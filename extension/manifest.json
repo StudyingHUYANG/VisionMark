@@ -9,7 +9,10 @@
   ],
   "host_permissions": [
     "https://www.bilibili.com/*",
-    "http://localhost:3000/*"
+    "http://localhost:8080/*",
+    "http://localhost:3000/*",
+    "http://127.0.0.1:8080/*",
+    "http://127.0.0.1:3000/*"
   ],
   "action": {
     "default_popup": "popup/popup.html",
@@ -27,6 +30,7 @@
         "https://live.bilibili.com/*"
       ],
       "js": [
+        "content/config.local.js",
         "content/constants.js",
         "content/player.js",
         "content/main.js"
