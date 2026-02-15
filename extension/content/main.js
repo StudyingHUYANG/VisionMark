@@ -14,8 +14,11 @@
       this.coolDownLogPrinted = false;
       this.matchProcessLogPrinted = false;
       this.noAdMatchLogPrinted = false;
+
       // 存储当前视频的标注ID（用于删除）
       this.currentSegmentIds = [];
+
+
     }
 
     init() {
@@ -75,6 +78,10 @@
 
     // 替换后的 checkSkip 方法
     checkSkip(currentTime) {
+
+
+
+
       // 单条播放时间日志（不刷屏，页面右上角显示）
       const logElementId = 'ad-skipper-play-time';
       let logElement = document.getElementById(logElementId);
@@ -108,6 +115,12 @@
         });
         this.matchProcessLogPrinted = true;
       }
+
+
+
+      if (!this.segments.length || Date.now() - this.lastSkipTime < 500) return;
+
+
 
       const ad = this.segments.find(s =>
         currentTime >= s.start_time && currentTime < s.end_time - 0.5
