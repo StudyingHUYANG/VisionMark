@@ -9,6 +9,11 @@
       this.pendingStart = null;
       this.pendingEnd = null;
       this.pendingType = 'hard_ad';
+      // 新增日志控制变量
+      this.noSegmentLogPrinted = false;
+      this.coolDownLogPrinted = false;
+      this.matchProcessLogPrinted = false;
+      this.noAdMatchLogPrinted = false;
     }
 
     init() {
@@ -64,17 +69,60 @@
       }
     }
 
+    // 替换后的 checkSkip 方法
     checkSkip(currentTime) {
+
+      // 单条播放时间日志（不刷屏，页面右上角显示）
+      const logElementId = 'ad-skipper-play-time';
+      let logElement = document.getElementById(logElementId);
+
+      if (!logElement) {
+        logElement = document.createElement('div');
+        logElement.id = logElementId;
+        logElement.style.cssText = 'position:fixed;top:10px;right:10px;background:rgba(0,0,0,0.8);color:#fff;padding:8px 12px;border-radius:4px;font-size:14px;z-index:999999;';
+        document.body.appendChild(logElement);
+      }
+      logElement.textContent = `[AdSkipper] 当前播放时间: ${currentTime.toFixed(2)}s`;
+
+      if (!this.segments.length || Date.now() - this.lastSkipTime < 500) {
+        if (!this.segments.length && !this.noSegmentLogPrinted) {
+          console.log("[AdSkipper] 跳过判断：无广告段数据（后续不再重复提示）");
+          this.noSegmentLogPrinted = true;
+        } else if (Date.now() - this.lastSkipTime < 500 && !this.coolDownLogPrinted) {
+          console.log(`[AdSkipper] 跳过判断：500ms冷却期内（上次跳过：${this.lastSkipTime}，当前：${Date.now()}）`);
+          this.coolDownLogPrinted = true;
+        }
+        return;
+      }
+
+      this.noSegmentLogPrinted = false;
+      this.coolDownLogPrinted = false;
+
+      if (!this.matchProcessLogPrinted) {
+        console.log(`[AdSkipper] 正在匹配广告段（共${this.segments.length}个）...`);
+        this.segments.forEach((ad, idx) => {
+          console.log(`[AdSkipper] 广告段${idx + 1}：${ad.start_time.toFixed(2)}s - ${ad.end_time.toFixed(2)}s（类型：${ad.ad_type || 'hard_ad'}）`);
+        });
+        this.matchProcessLogPrinted = true;
+      }
+
       if (!this.segments.length || Date.now() - this.lastSkipTime < 500) return;
+
 
       const ad = this.segments.find(s =>
         currentTime >= s.start_time && currentTime < s.end_time - 0.5
       );
 
       if (ad) {
+        console.log(`[AdSkipper] 匹配到广告段：${ad.start_time.toFixed(2)}s - ${ad.end_time.toFixed(2)}s，执行跳过`);
         this.player.skipTo(ad.end_time);
         this.lastSkipTime = Date.now();
         this.showToast("已跳过 " + (ad.end_time - ad.start_time).toFixed(1) + " 秒广告", "success");
+        this.matchProcessLogPrinted = false;
+        this.noAdMatchLogPrinted = false;
+      } else if (!this.noAdMatchLogPrinted) {
+        console.log("[AdSkipper] 未匹配到需要跳过的广告段（后续不再重复提示）");
+        this.noAdMatchLogPrinted = true;
       }
     }
 
