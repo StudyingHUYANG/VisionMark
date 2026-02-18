@@ -5,7 +5,7 @@ window.LOCAL_CONFIG = {
   // 后端服务器地址
   // 本地开发示例: 'http://localhost:8080'
   // 远程服务器: 'https://apitest.visionmark.com.cn:8443'
-  API_BASE: 'http://localhost:8080',
+  API_BASE: 'https://apitest.visionmark.com.cn:8443',
 
   // API 版本
   API_VERSION: 'api/v1'
