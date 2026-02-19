@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 
 # ========== 配置区域 ==========
-PROJECT_DIR = Path(r"E:\BiliVideoEvaluation\ChromeExtention")
+PROJECT_DIR = Path(__file__).parent.absolute()
 # ==============================
 
 class Colors:

@@ -2,7 +2,7 @@
 import os
 import shutil
 
-base = r"E:\BiliVideoEvaluation\ChromeExtention"
+base = r"D:\BiliVideoEvaluation\VisionMark"
 db_path = os.path.join(base, "server", "database", "app.db")
 
 # 删除旧数据库

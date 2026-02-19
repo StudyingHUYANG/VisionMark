@@ -3,168 +3,27 @@
 <head>
   <meta charset="UTF-8">
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { 
-      width: 320px; 
-      padding: 20px; 
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #1e1e2e;
-      color: #fff;
-    }
-    .header {
-      text-align: center;
-      margin-bottom: 20px;
-      padding-bottom: 15px;
-      border-bottom: 1px solid rgba(255,255,255,0.1);
-    }
-    .logo { font-size: 24px; margin-bottom: 5px; }
-    .title { color: #FB7299; font-size: 16px; font-weight: bold; }
-    .subtitle { color: #888; font-size: 12px; margin-top: 5px; }
-    
-    .form-group { margin-bottom: 15px; }
-    label { display: block; color: #aaa; font-size: 12px; margin-bottom: 5px; }
-    input {
-      width: 100%;
-      padding: 10px;
-      background: #333;
-      border: 1px solid #555;
-      border-radius: 6px;
-      color: #fff;
-      font-size: 14px;
-      outline: none;
-    }
-    input:focus { border-color: #FB7299; }
-    
-    button {
-      width: 100%;
-      padding: 12px;
-      background: #FB7299;
-      border: none;
-      border-radius: 6px;
-      color: #fff;
-      font-size: 14px;
-      font-weight: bold;
-      cursor: pointer;
-      transition: opacity 0.2s;
-    }
-    button:hover { opacity: 0.9; }
-    button:disabled { background: #555; cursor: not-allowed; }
-    
-    .switch-mode {
-      text-align: center;
-      margin-top: 15px;
-      color: #888;
-      font-size: 12px;
-      cursor: pointer;
-    }
-    .switch-mode span { color: #FB7299; text-decoration: underline; }
-    
-    .error {
-      color: #ff6b6b;
-      font-size: 12px;
-      margin-top: 10px;
-      text-align: center;
-      display: none;
-    }
-    
-    /* 用户信息面板（登录后显示） */
-    .user-panel { display: none; }
-    .user-header {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin-bottom: 20px;
-    }
-    .avatar {
-      width: 50px; height: 50px;
-      background: #FB7299;
-      border-radius: 50%;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 20px;
-    }
-    .user-info h3 { margin: 0; font-size: 16px; }
-    .user-info p { margin: 5px 0 0; color: #888; font-size: 12px; }
-    
-    .stats {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-      margin-bottom: 20px;
-    }
-    .stat-box {
-      background: rgba(255,255,255,0.05);
-      padding: 15px;
-      border-radius: 8px;
-      text-align: center;
-    }
-    .stat-value { font-size: 20px; font-weight: bold; color: #FB7299; }
-    .stat-label { font-size: 11px; color: #888; margin-top: 5px; }
-    
-    .logout-btn {
-      background: transparent;
-      border: 1px solid #555;
-      color: #888;
-    }
-    .logout-btn:hover { border-color: #ff6b6b; color: #ff6b6b; }
+    body { width: 300px; padding: 15px; font-family: sans-serif; background: #1e1e2e; color: #fff; }
+    h1 { font-size: 16px; color: #FB7299; margin: 0 0 10px 0; }
+    .stat { display: flex; justify-content: space-between; margin: 8px 0; font-size: 14px; }
+    .btn { width: 100%; background: #FB7299; color: #fff; border: none; padding: 10px; border-radius: 4px; cursor: pointer; margin-top: 10px; }
   </style>
 </head>
 <body>
-  <!-- 登录/注册表单 -->
-  <div id="auth-form">
-    <div class="header">
-      <div class="logo">🚫</div>
-      <div class="title">B站广告跳过</div>
-      <div class="subtitle">社区驱动 · 智能标注</div>
-    </div>
-    
-    <div id="error-msg" class="error"></div>
-    
-    <div class="form-group">
-      <label>用户名</label>
-      <input type="text" id="username" placeholder="请输入用户名">
-    </div>
-    
-    <div class="form-group">
-      <label>密码</label>
-      <input type="password" id="password" placeholder="至少6位字符">
-    </div>
-    
-    <button id="submit-btn">登录</button>
-    
-    <div class="switch-mode">
-      还没有账号？<span id="switch-text">立即注册</span>
-    </div>
-    
-    <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid rgba(255,255,255,0.1); text-align: center; font-size: 11px; color: #666;">
-      测试账号：admin / admin
-    </div>
-  </div>
-  
-  <!-- 用户信息面板（登录后） -->
-  <div id="user-panel" class="user-panel">
-    <div class="user-header">
-      <div class="avatar">👤</div>
-      <div class="user-info">
-        <h3 id="display-username">User</h3>
-        <p id="display-tier">Bronze Member</p>
-      </div>
-    </div>
-    
-    <div class="stats">
-      <div class="stat-box">
-        <div class="stat-value" id="display-points">0</div>
-        <div class="stat-label">积分</div>
-      </div>
-      <div class="stat-box">
-        <div class="stat-value" id="display-count">0</div>
-        <div class="stat-label">已标注</div>
-      </div>
-    </div>
-    
-    <button class="logout-btn" id="logout-btn">退出登录</button>
-  </div>
-  
-  <script src="../content/config.local.js"></script>
-  <script src="popup.js"></script>
+  <h1>🚫 B站广告跳过</h1>
+  <div class="stat"><span>用户等级:</span> <span id="tier" style="color:#ffd700">Gold</span></div>
+  <div class="stat"><span>今日剩余:</span> <span id="limit">∞</span></div>
+  <div class="stat"><span>我的积分:</span> <span id="points">1,250</span></div>
+  <button class="btn" onclick="alert('在视频页面按 Alt+A 标注广告')">如何标注?</button>
+  <script>
+    // 简单演示数据，实际应从API获取
+    fetch('http://localhost:3000/api/v1/user/stats')
+      .then(r => r.json())
+      .then(d => {
+        document.getElementById('tier').textContent = d.tier || 'Bronze';
+        document.getElementById('points').textContent = d.points || 0;
+      })
+      .catch(() => {});
+  </script>
 </body>
 </html>

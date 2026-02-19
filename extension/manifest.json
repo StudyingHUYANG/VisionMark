@@ -3,17 +3,8 @@
   "name": "B站广告跳过 - 众测版",
   "version": "1.0.0",
   "description": "社区驱动的B站广告自动跳过插件",
-  "permissions": [
-    "storage",
-    "activeTab"
-  ],
-  "host_permissions": [
-    "https://www.bilibili.com/*",
-    "http://localhost:8080/*",
-    "http://localhost:3000/*",
-    "http://127.0.0.1:8080/*",
-    "http://127.0.0.1:3000/*"
-  ],
+  "permissions": ["storage", "activeTab"],
+  "host_permissions": ["https://www.bilibili.com/*", "http://localhost:3000/*"],
   "action": {
     "default_popup": "popup/popup.html",
     "default_icon": {
@@ -23,18 +14,9 @@
   },
   "content_scripts": [
     {
-      "matches": [
-        "https://www.bilibili.com/video/*"
-      ],
-      "exclude_matches": [
-        "https://live.bilibili.com/*"
-      ],
-      "js": [
-        "content/config.local.js",
-        "content/constants.js",
-        "content/player.js",
-        "content/main.js"
-      ],
+      "matches": ["https://www.bilibili.com/video/*"],
+      "exclude_matches": ["https://live.bilibili.com/*"],
+      "js": ["content/constants.js", "content/player.js", "content/annotator.js", "content/main.js"],
       "run_at": "document_idle"
     }
   ]

@@ -4,70 +4,88 @@ class BilibiliPlayerController {
     this.currentBvid = null;
     this.currentCid = null;
     this.onTimeUpdate = null;
+    this.onCidChange = null;
   }
 
   async init() {
-    console.log("[AdSkipper] 查找视频...");
-    return new Promise((resolve) => this.tryFindVideo(resolve, 0));
+    return new Promise((resolve) => {
+      this.tryFindVideo(resolve);
+    });
   }
 
-  tryFindVideo(callback, attempts) {
-    const selectors = [
-      'video[src*="bilivideo"]', 'video[class*="bilateral-player"]',
-      'bpx-player-video-wrap video', '.bilibili-player-video video', 'video'
-    ];
-    
-    for (let sel of selectors) {
-      const v = document.querySelector(sel);
-      if (v && v.readyState >= 1) { 
-        this.video = v; 
-        console.log("[AdSkipper] 找到视频");
-        break; 
-      }
+  tryFindVideo(callback, attempts = 0) {
+    for (let selector of CONFIG.SELECTORS.video) {
+      this.video = document.querySelector(selector);
+      if (this.video) break;
     }
 
     if (this.video) {
+      console.log('[AdSkipper] 找到视频元素');
       this.extractVideoId();
       this.setupListeners();
       callback(true);
-    } else if (attempts < 30) {
+    } else if (attempts < 20) {
       setTimeout(() => this.tryFindVideo(callback, attempts + 1), 500);
     } else {
+      console.error('[AdSkipper] 未找到视频');
       callback(false);
     }
   }
 
   extractVideoId() {
-    const m = window.location.pathname.match(/BV[a-zA-Z0-9]+/);
-    this.currentBvid = m ? m[0] : null;
-    console.log("[AdSkipper] BVID:", this.currentBvid);
+    const bvidMatch = window.location.pathname.match(/BV\w+/);
+    this.currentBvid = bvidMatch ? bvidMatch[0] : null;
+    
+    try {
+      if (window.__INITIAL_STATE__?.videoData?.cid) {
+        this.currentCid = window.__INITIAL_STATE__.videoData.cid;
+      } else {
+        // 从弹幕接口推断
+        const scripts = document.querySelectorAll('script');
+        for (let s of scripts) {
+          const m = s.textContent.match(/"cid":(\d+)/);
+          if (m) { this.currentCid = parseInt(m[1]); break; }
+        }
+      }
+      
+      if (this.currentCid && this.onCidChange) {
+        this.onCidChange(this.currentBvid, this.currentCid);
+      }
+    } catch(e) {}
   }
 
   setupListeners() {
     if (!this.video) return;
+    
     setInterval(() => {
-      if (this.onTimeUpdate) this.onTimeUpdate(this.video.currentTime);
-    }, 200);
+      if (this.onTimeUpdate) {
+        this.onTimeUpdate(this.video.currentTime);
+      }
+    }, CONFIG.CHECK_INTERVAL);
+
+    // 监听URL变化(B站是单页应用)
+    let lastUrl = location.href;
+    new MutationObserver(() => {
+      if (location.href !== lastUrl) {
+        lastUrl = location.href;
+        setTimeout(() => this.extractVideoId(), 1000);
+      }
+    }).observe(document, {subtree: true, childList: true});
   }
 
   skipTo(time) {
     if (!this.video) return false;
-    try { 
-      this.video.currentTime = time; 
-      return true; 
-    } catch(e) { 
-      return false; 
-    }
+    try {
+      this.video.currentTime = time;
+      return true;
+    } catch(e) { return false; }
   }
 
   getState() {
     return {
-      currentTime: this.video ? this.video.currentTime : 0,
+      currentTime: this.video?.currentTime,
       bvid: this.currentBvid,
       cid: this.currentCid
     };
   }
 }
-
-// 显式导出到全局，防止 main.js 找不到
-window.BilibiliPlayerController = BilibiliPlayerController;

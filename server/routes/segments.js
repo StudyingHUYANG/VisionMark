@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const path = require('path');
 const Database = require('better-sqlite3');
+const jwt = require('jsonwebtoken'); 
+const JWT_SECRET = 'secret-key-v1';  
 
 // 连接数据库（和server.js保持一致）
 const db = new Database(path.join(__dirname, '../database', 'app.db'));
@@ -64,6 +66,104 @@ router.post('/batch', (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ code: 500, msg: '批量查询失败', error: err.message });
+  }
+});
+
+// 【新增】投票 API (POST /api/v1/segments/:id/vote)
+router.post('/:id/vote', authenticateToken, (req, res) => {
+  const segmentId = req.params.id;
+  const userId = req.user.userId; // 从 token 拿到的用户ID
+  const { type } = req.body; // 前端会传 { "type": "up" } 或 "down"
+
+  // 1. 简单的参数校验
+  if (!['up', 'down'].includes(type)) {
+    return res.status(400).json({ code: 400, msg: '参数错误：type 必须是 up 或 down' });
+  }
+
+  // 2. 开启一个“事务”（Transaction）
+  // 事务能保证：要么“投票+加分”都成功，要么都失败。不会出现“投了票却没加分”的情况。
+  const doVote = db.transaction(() => {
+    // 查一下这个人之前有没有投过票
+    const existing = db.prepare('SELECT vote_type FROM segment_votes WHERE user_id = ? AND segment_id = ?').get(userId, segmentId);
+
+    if (existing) {
+      // --- 情况 A：他以前投过 ---
+      if (existing.vote_type === type) {
+        throw new Error('DUPLICATE'); // 如果重复投一样的（比如本来是赞，又点赞），报错
+      }
+      
+      // 如果改票（比如从赞变成踩）：只更新记录，不加积分
+      db.prepare('UPDATE segment_votes SET vote_type = ? WHERE user_id = ? AND segment_id = ?').run(type, userId, segmentId);
+      
+      return { msg: '投票已更新', points: 0 }; // 改票不给分
+
+    } else {
+      // --- 情况 B：这是他第一次投这个标注 ---
+      // 1. 插入投票记录
+      db.prepare('INSERT INTO segment_votes (segment_id, user_id, vote_type) VALUES (?, ?, ?)').run(segmentId, userId, type);
+
+      // 2. 【核心功能】奖励积分！给 user_points 表加 2 分
+      db.prepare('UPDATE user_points SET total_points = total_points + 2 WHERE user_id = ?').run(userId);
+      
+      return { msg: '投票成功', points: 2 }; // 首次投票给2分
+    }
+  });
+
+  try {
+    // 执行上面的事务
+    const result = doVote();
+    res.json({ code: 200, msg: result.msg, points_earned: result.points });
+  } catch (err) {
+    if (err.message === 'DUPLICATE') {
+      return res.status(409).json({ code: 409, msg: '您已经投过这一票了' });
+    }
+    console.error(err);
+    // 如果报错通常是因为数据库表不存在（外键错误）
+    res.status(500).json({ code: 500, msg: '投票失败', error: err.message });
+  }
+});
+
+// 【新增】获取投票统计 API (GET /api/v1/segments/:id/votes)
+router.get('/:id/votes', (req, res) => {
+  const segmentId = req.params.id;
+  let myVote = null; // 默认没投过
+
+  // 1. 如果用户登录了，查查他投了什么 (高亮显示用)
+  const authHeader = req.headers['authorization'];
+  if (authHeader) {
+    try {
+      const token = authHeader.split(' ')[1];
+      const decoded = jwt.verify(token, JWT_SECRET); 
+      const row = db.prepare('SELECT vote_type FROM segment_votes WHERE user_id = ? AND segment_id = ?').get(decoded.userId, segmentId);
+      if (row) myVote = row.vote_type; // 'up' 或 'down'
+    } catch (e) {
+      // Token无效也没关系，只是不显示“我的投票”而已
+    }
+  }
+
+  // 2. 统计总数 (直接数 segment_votes 表)
+  try {
+    const stats = db.prepare(`
+      SELECT 
+        (SELECT COUNT(*) FROM segment_votes WHERE segment_id = ? AND vote_type = 'up') as upvotes,
+        (SELECT COUNT(*) FROM segment_votes WHERE segment_id = ? AND vote_type = 'down') as downvotes
+    `).get(segmentId, segmentId);
+
+    res.json({
+      code: 200,
+      data: {
+        upvotes: stats.upvotes,
+        downvotes: stats.downvotes,
+        total: stats.upvotes + stats.downvotes,
+        user_vote: myVote 
+      }
+    });
+  } catch (err) {
+    // 表还没建好的话，返回全0
+    res.json({
+      code: 200, 
+      data: { upvotes: 0, downvotes: 0, total: 0, user_vote: null } 
+    });
   }
 });
 
