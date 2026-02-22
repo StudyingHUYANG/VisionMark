@@ -140,6 +140,24 @@ const segmentsRouter = require('./routes/segments.js');
 app.use('/api/v1/stats', statsRouter);
 app.use('/api/v1/segments', segmentsRouter); // 补充批量/删除接口，和原有segments接口合并
 
+// Get user's all segments
+app.get('/api/v1/segments/user', authenticateToken, (req, res) => {
+  const userId = req.user.userId;
+
+  const rows = db.prepare(`
+    SELECT
+      s.id, s.start_time, s.end_time, s.ad_type,
+      v.bvid, v.page,
+      datetime(s.created_at, 'localtime') as created_at
+    FROM ad_segments s
+    JOIN videos v ON s.video_id = v.id
+    WHERE s.contributor_id = ?
+    ORDER BY s.created_at DESC
+  `).all(userId);
+
+  res.json({ segments: rows });
+});
+
 // 使用配置文件的端口
 app.listen(config.PORT, '0.0.0.0', () => {
   console.log('[Server] http://localhost:' + config.PORT);
