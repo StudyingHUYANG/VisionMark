@@ -106,6 +106,46 @@
       color: #888;
     }
     .logout-btn:hover { border-color: #ff6b6b; color: #ff6b6b; }
+
+    /* 跳过模式 Toggle */
+    .skip-mode-section {
+      margin-top: 15px;
+      padding-top: 15px;
+      border-top: 1px solid rgba(255,255,255,0.1);
+    }
+    .settings-label {
+      color: #aaa;
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+    .toggle-group {
+      display: flex;
+      gap: 8px;
+    }
+    .toggle-btn {
+      flex: 1;
+      padding: 8px;
+      background: #333;
+      border: 1px solid #555;
+      border-radius: 4px;
+      color: #fff;
+      font-size: 13px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .toggle-btn:hover {
+      background: #444;
+    }
+    .toggle-btn.active {
+      background: #FB7299;
+      border-color: #FB7299;
+    }
+    .settings-hint {
+      color: #666;
+      font-size: 11px;
+      margin-top: 8px;
+      text-align: center;
+    }
   </style>
 </head>
 <body>
@@ -138,6 +178,16 @@
     <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid rgba(255,255,255,0.1); text-align: center; font-size: 11px; color: #666;">
       测试账号：admin / admin
     </div>
+
+    <!-- 跳过模式设置（登录前显示） -->
+    <div class="skip-mode-section">
+      <div class="settings-label">跳过模式</div>
+      <div class="toggle-group">
+        <button id="mode-auto" class="toggle-btn active">自动跳过</button>
+        <button id="mode-manual" class="toggle-btn">手动跳过</button>
+      </div>
+      <div class="settings-hint">手动模式下会显示"跳过广告"按钮</div>
+    </div>
   </div>
   
   <!-- 用户信息面板（登录后） -->
@@ -149,7 +199,7 @@
         <p id="display-tier">Bronze Member</p>
       </div>
     </div>
-    
+
     <div class="stats">
       <div class="stat-box">
         <div class="stat-value" id="display-points">0</div>
@@ -160,7 +210,17 @@
         <div class="stat-label">已标注</div>
       </div>
     </div>
-    
+
+    <!-- 跳过模式设置（登录后显示） -->
+    <div class="skip-mode-section">
+      <div class="settings-label">跳过模式</div>
+      <div class="toggle-group">
+        <button id="mode-auto" class="toggle-btn active">自动跳过</button>
+        <button id="mode-manual" class="toggle-btn">手动跳过</button>
+      </div>
+      <div class="settings-hint">手动模式下会显示"跳过广告"按钮</div>
+    </div>
+
     <button class="logout-btn" id="logout-btn">退出登录</button>
   </div>
   

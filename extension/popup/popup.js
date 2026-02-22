@@ -157,6 +157,45 @@ function logout() {
   showLoginForm();
 }
 
+// 加载跳过模式设置
+function loadSkipModeSetting() {
+  chrome.storage.local.get(['skip_mode'], (storage) => {
+    const mode = storage.skip_mode || 'auto';
+    updateSkipModeUI(mode);
+  });
+}
+
+// 更新跳过模式 UI
+function updateSkipModeUI(mode) {
+  // 更新所有具有相应 class 的按钮（登录前和登录后各有一组）
+  const autoBtns = document.querySelectorAll('.toggle-btn:first-child');
+  const manualBtns = document.querySelectorAll('.toggle-btn:last-child');
+
+  autoBtns.forEach(btn => {
+    if (mode === 'auto') {
+      btn.classList.add('active');
+    } else {
+      btn.classList.remove('active');
+    }
+  });
+
+  manualBtns.forEach(btn => {
+    if (mode === 'manual') {
+      btn.classList.add('active');
+    } else {
+      btn.classList.remove('active');
+    }
+  });
+}
+
+// 设置跳过模式
+function setSkipMode(mode) {
+  chrome.storage.local.set({ skip_mode: mode }, () => {
+    console.log('[Popup] 跳过模式已设置为:', mode);
+    updateSkipModeUI(mode);
+  });
+}
+
 // 初始化
 document.addEventListener('DOMContentLoaded', async () => {
   const isLoggedIn = await checkAuth();
@@ -166,9 +205,23 @@ document.addEventListener('DOMContentLoaded', async () => {
     refreshUserInfo();
   }
 
+  // 加载跳过模式设置
+  loadSkipModeSetting();
+
   document.getElementById('submit-btn').onclick = handleAuth;
   document.getElementById('switch-text').onclick = toggleMode;
   document.getElementById('logout-btn').onclick = logout;
+
+  // 绑定跳过模式切换按钮（使用 class 选择器，同时绑定登录前和登录后的按钮）
+  document.querySelectorAll('.toggle-btn').forEach(btn => {
+    btn.onclick = () => {
+      if (btn.textContent.includes('自动')) {
+        setSkipMode('auto');
+      } else {
+        setSkipMode('manual');
+      }
+    };
+  });
 
   document.getElementById('password').onkeypress = (e) => {
     if (e.key === 'Enter') handleAuth();
