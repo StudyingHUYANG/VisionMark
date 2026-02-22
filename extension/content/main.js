@@ -9,6 +9,9 @@
       this.pendingStart = null;
       this.pendingEnd = null;
       this.pendingType = 'hard_ad';
+      // 手动跳过功能
+      this.skipMode = 'auto';
+      this.skipButton = null;
       // 新增日志控制变量
       this.noSegmentLogPrinted = false;
       this.coolDownLogPrinted = false;
@@ -25,6 +28,24 @@
         chrome.storage.local.get(['adskipper_token'], (storage) => {
           const token = storage.adskipper_token;
           console.log("[AdSkipper] 登录状态:", token ? "已登录" : "未登录");
+        });
+
+        // 加载跳过模式设置
+        chrome.storage.local.get(['skip_mode'], (storage) => {
+          this.skipMode = storage.skip_mode || 'auto';
+          console.log("[AdSkipper] 跳过模式:", this.skipMode);
+        });
+
+        // 监听跳过模式变化
+        chrome.storage.onChanged.addListener((changes, area) => {
+          if (area === 'local' && changes.skip_mode) {
+            this.skipMode = changes.skip_mode.newValue || 'auto';
+            console.log("[AdSkipper] 跳过模式已更新:", this.skipMode);
+            // 如果切换到自动模式，立即隐藏按钮
+            if (this.skipMode === 'auto') {
+              this.hideSkipButton();
+            }
+          }
         });
 
         this.player.onTimeUpdate = (t) => this.checkSkip(t);
@@ -82,7 +103,8 @@
         logElement.style.cssText = 'position:fixed;top:10px;right:10px;background:rgba(0,0,0,0.8);color:#fff;padding:8px 12px;border-radius:4px;font-size:14px;z-index:999999;';
         document.body.appendChild(logElement);
       }
-      logElement.textContent = `[AdSkipper] 当前播放时间: ${currentTime.toFixed(2)}s`;
+      const modeText = this.skipMode === 'auto' ? '[自动]' : '[手动]';
+      logElement.textContent = `${modeText} 时间: ${currentTime.toFixed(2)}s | 广告段: ${this.segments.length}`;
 
       if (!this.segments.length || Date.now() - this.lastSkipTime < 500) {
         if (!this.segments.length && !this.noSegmentLogPrinted) {
@@ -115,14 +137,26 @@
 
       if (ad) {
         console.log(`[AdSkipper] 匹配到广告段：${ad.start_time.toFixed(2)}s - ${ad.end_time.toFixed(2)}s，执行跳过`);
-        this.player.skipTo(ad.end_time);
-        this.lastSkipTime = Date.now();
-        this.showToast("已跳过 " + (ad.end_time - ad.start_time).toFixed(1) + " 秒广告", "success");
+        if (this.skipMode === 'auto') {
+          // 自动跳过模式
+          this.player.skipTo(ad.end_time);
+          this.lastSkipTime = Date.now();
+          this.showToast("已跳过 " + (ad.end_time - ad.start_time).toFixed(1) + " 秒广告", "success");
+        } else {
+          // 手动模式：显示跳过按钮
+          if (!this.skipButton) {
+            this.showSkipButton(ad);
+          }
+        }
         this.matchProcessLogPrinted = false;
         this.noAdMatchLogPrinted = false;
-      } else if (!this.noAdMatchLogPrinted) {
-        console.log("[AdSkipper] 未匹配到需要跳过的广告段（后续不再重复提示）");
-        this.noAdMatchLogPrinted = true;
+      } else {
+        // 离开广告段，隐藏按钮
+        this.hideSkipButton();
+        if (!this.noAdMatchLogPrinted) {
+          console.log("[AdSkipper] 未匹配到需要跳过的广告段（后续不再重复提示）");
+          this.noAdMatchLogPrinted = true;
+        }
       }
     }
 
@@ -515,15 +549,132 @@
     showToast(msg, type) {
       const old = document.getElementById('adskipper-toast');
       if (old) old.remove();
-      
+
       const t = document.createElement("div");
       t.id = 'adskipper-toast';
       t.textContent = msg;
       const color = type === 'success' ? '#67c23a' : (type === 'error' ? '#ff6b6b' : '#333');
-      t.style.cssText = "position:fixed;top:15%;left:50%;transform:translateX(-50%);background:" + 
+      t.style.cssText = "position:fixed;top:15%;left:50%;transform:translateX(-50%);background:" +
         color + ";color:#fff;padding:0.8em 1.5em;border-radius:0.5em;z-index:999999;font-size:clamp(14px, 2vw, 18px);box-shadow:0 4px 12px rgba(0,0,0,0.4);";
       document.body.appendChild(t);
       setTimeout(() => t.remove(), 3000);
+    }
+
+    showSkipButton(ad) {
+      // 1. 双重重复防护：实例级别检查
+      if (this.skipButton) return;
+      // 2. 双重重复防护：DOM 级别检查
+      if (document.getElementById('adskipper-skip-btn')) return;
+
+      const self = this;
+
+      // 3. 精准挂载容器选择 - 优先使用视频画面容器，避免控制栏
+      // 优先级：.bpx-player-video-wrap > .bpx-player-video-area > fallback
+      let playerContainer = document.querySelector('.bpx-player-video-wrap') ||
+                            document.querySelector('.bpx-player-video-area') ||
+                            document.querySelector('.bpx-player-container') ||
+                            document.querySelector('#bilibili-player');
+
+      if (!playerContainer) {
+        console.log("[AdSkipper] 未找到播放窗口容器");
+        return;
+      }
+
+      // 4. 确保父容器有相对定位（子绝父相）
+      if (getComputedStyle(playerContainer).position === 'static') {
+        playerContainer.style.position = 'relative';
+      }
+
+      const btn = document.createElement('div');
+      btn.id = 'adskipper-skip-btn';
+      btn.textContent = '跳过广告';
+      // 5. 响应式 CSS 定位：使用像素值 + !important 确保严格定位在视频画面右下角
+      // 默认 bottom: 60px，在全屏模式下通过 CSS 覆盖为 100px
+      btn.style.cssText = `
+        position: absolute !important;
+        right: 20px !important;
+        bottom: 60px !important;
+        background: #FB7299;
+        color: #fff;
+        padding: 10px 20px;
+        border-radius: 6px;
+        font-size: 14px;
+        font-weight: bold;
+        cursor: pointer;
+        z-index: 99999 !important;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+        transition: all 0.2s;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        animation: skipBtnPop 0.3s ease-out;
+        pointer-events: auto;
+      `;
+
+      // 6. 添加动画样式
+      if (!document.getElementById('adskipper-skip-anim')) {
+        const style = document.createElement('style');
+        style.id = 'adskipper-skip-anim';
+        style.textContent = `
+          @keyframes skipBtnPop {
+            0% { transform: scale(0.5); opacity: 0; }
+            100% { transform: scale(1); opacity: 1; }
+          }
+        `;
+        document.head.appendChild(style);
+      }
+
+      // 7. 监听全屏状态变化，动态调整按钮位置
+      this._fullscreenObserver = new MutationObserver(() => {
+        const btn = this.skipButton;
+        if (!btn) return;
+
+        // 检测全屏状态
+        const isFullscreen = document.querySelector('.bpx-state-fullscreen, .mode-fullscreen, [data-screen="full"], .bilibili-player-fullscreen');
+        const isWebFullscreen = document.querySelector('.bpx-state-web-fullscreen, .mode-web-fullscreen, [data-screen="web-full"]');
+
+        if (isFullscreen) {
+          btn.style.bottom = '120px';
+          btn.style.right = '30px';
+        } else if (isWebFullscreen) {
+          btn.style.bottom = '120px';
+          btn.style.right = '25px';
+        } else {
+          // 正常模式
+          btn.style.bottom = '60px';
+          btn.style.right = '20px';
+        }
+      });
+
+      // 监听播放器容器的 class 变化（全屏状态通过 class 改变）
+      const playerContainerForObserver = document.querySelector('.bpx-player-container') ||
+                                         document.querySelector('#bilibili-player') ||
+                                         playerContainer;
+      if (playerContainerForObserver) {
+        this._fullscreenObserver.observe(playerContainerForObserver, {
+          attributes: true,
+          attributeFilter: ['class', 'data-screen']
+        });
+      }
+
+      btn.onmouseenter = () => { btn.style.transform = 'scale(1.05)'; };
+      btn.onmouseleave = () => { btn.style.transform = 'scale(1)'; };
+      btn.onclick = () => {
+        self.player.skipTo(ad.end_time);
+        self.lastSkipTime = Date.now();
+        self.showToast("已跳过 " + (ad.end_time - ad.start_time).toFixed(1) + " 秒广告", "success");
+        self.hideSkipButton();
+      };
+
+      playerContainer.appendChild(btn);
+      this.skipButton = btn;
+      console.log("[AdSkipper] 显示手动跳过按钮 - 挂载到:", playerContainer.className || playerContainer.id);
+    }
+
+    hideSkipButton() {
+      if (this.skipButton) {
+        this.skipButton.remove();
+        this.skipButton = null;
+        console.log("[AdSkipper] 隐藏手动跳过按钮");
+      }
     }
   }
 
