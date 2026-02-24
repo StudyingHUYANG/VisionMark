@@ -157,6 +157,45 @@ function logout() {
   showLoginForm();
 }
 
+// 加载跳过模式设置
+function loadSkipModeSetting() {
+  chrome.storage.local.get(['skip_mode'], (storage) => {
+    const mode = storage.skip_mode || 'auto';
+    updateSkipModeUI(mode);
+  });
+}
+
+// 更新跳过模式 UI
+function updateSkipModeUI(mode) {
+  // 更新所有具有相应 class 的按钮（登录前和登录后各有一组）
+  const autoBtns = document.querySelectorAll('.toggle-btn:first-child');
+  const manualBtns = document.querySelectorAll('.toggle-btn:last-child');
+
+  autoBtns.forEach(btn => {
+    if (mode === 'auto') {
+      btn.classList.add('active');
+    } else {
+      btn.classList.remove('active');
+    }
+  });
+
+  manualBtns.forEach(btn => {
+    if (mode === 'manual') {
+      btn.classList.add('active');
+    } else {
+      btn.classList.remove('active');
+    }
+  });
+}
+
+// 设置跳过模式
+function setSkipMode(mode) {
+  chrome.storage.local.set({ skip_mode: mode }, () => {
+    console.log('[Popup] 跳过模式已设置为:', mode);
+    updateSkipModeUI(mode);
+  });
+}
+
 // 初始化
 document.addEventListener('DOMContentLoaded', async () => {
   const isLoggedIn = await checkAuth();
@@ -166,9 +205,24 @@ document.addEventListener('DOMContentLoaded', async () => {
     refreshUserInfo();
   }
 
+  // 加载跳过模式设置
+  loadSkipModeSetting();
+
   document.getElementById('submit-btn').onclick = handleAuth;
   document.getElementById('switch-text').onclick = toggleMode;
   document.getElementById('logout-btn').onclick = logout;
+  document.getElementById('history-btn').onclick = openHistoryPage;
+
+  // 绑定跳过模式切换按钮（使用 class 选择器，同时绑定登录前和登录后的按钮）
+  document.querySelectorAll('.toggle-btn').forEach(btn => {
+    btn.onclick = () => {
+      if (btn.textContent.includes('自动')) {
+        setSkipMode('auto');
+      } else {
+        setSkipMode('manual');
+      }
+    };
+  });
 
   document.getElementById('password').onkeypress = (e) => {
     if (e.key === 'Enter') handleAuth();
@@ -179,3 +233,23 @@ document.addEventListener('DOMContentLoaded', async () => {
     .then(() => console.log('后端连接正常'))
     .catch(() => showError('警告：无法连接后端，请确保localhost:3000运行中'));
 });
+
+// 打开标注历史页面
+function openHistoryPage() {
+  // 向当前活动的标签页发送消息，显示标注标记
+  chrome.tabs.query({active: true, currentWindow: true}, (tabs) => {
+    if (tabs[0]) {
+      chrome.tabs.sendMessage(tabs[0].id, {action: 'showSegmentMarkers'}, (response) => {
+        if (chrome.runtime.lastError) {
+          console.error('[Popup] 发送消息失败:', chrome.runtime.lastError);
+          showError('请在B站视频页面使用此功能');
+        } else {
+          // 显示成功提示
+          const btn = document.getElementById('history-btn');
+          btn.textContent = '✓ 标记已显示';
+          setTimeout(() => btn.textContent = '📊 查看标注历史', 2000);
+        }
+      });
+    }
+  });
+}
