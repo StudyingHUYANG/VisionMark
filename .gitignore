@@ -12,3 +12,14 @@ node_modules/
 # System files
 .DS_Store
 Thumbs.db
+
+# 忽略SQLite数据库文件（规范要求）
+server/database/app.db
+
+# 忽略node_modules（不用提交依赖）
+node_modules/
+
+# 忽略日志/临时文件
+*.log
+.DS_Store
+
