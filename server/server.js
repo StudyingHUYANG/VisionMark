@@ -4,6 +4,7 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const path = require('path');
+const Database = require('better-sqlite3');
 const config = require('./config.js');
 
 const app = express();
@@ -20,30 +21,29 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL
-  );
-  
-  CREATE TABLE IF NOT EXISTS user_points (
-    user_id INTEGER PRIMARY KEY,
-    total_points INTEGER DEFAULT 0,
-    tier TEXT DEFAULT 'bronze'
+    password_hash TEXT NOT NULL,
+    points INTEGER DEFAULT 0  -- 补充 points 字段
   );
   
   CREATE TABLE IF NOT EXISTS videos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    bvid TEXT NOT NULL,
+    bvid TEXT UNIQUE NOT NULL, -- 加上 UNIQUE
     cid INTEGER,
-    page INTEGER DEFAULT 1
+    page INTEGER DEFAULT 1,
+    processed_status INTEGER DEFAULT 0 -- 补充 AI 状态字段
   );
   
-  CREATE TABLE IF NOT EXISTS ad_segments (
+  CREATE TABLE IF NOT EXISTS segments ( -- 建议统一用 segments 这个名字
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     video_id INTEGER,
     start_time REAL,
     end_time REAL,
-    ad_type TEXT,
+    type TEXT,       -- 对应 ad_type
+    content TEXT,    -- 补充内容描述字段
+    action TEXT,     -- 补充跳转/标记行为字段
     contributor_id INTEGER,
-    is_active BOOLEAN DEFAULT 1
+    is_active BOOLEAN DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP -- 补充统计用的时间戳
   );
 `);
 
