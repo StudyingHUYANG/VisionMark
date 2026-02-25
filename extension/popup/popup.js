@@ -288,6 +288,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     refreshUserInfo();
   }
 
+  // 加载跳过模式设置
+  loadSkipModeSetting();
+
   document.getElementById('submit-btn').onclick = handleAuth;
   document.getElementById('switch-text').onclick = toggleMode;
   document.getElementById('logout-btn').onclick = logout;

@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>标注历史</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      padding: 20px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #1e1e2e;
+      color: #fff;
+      min-width: 600px;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 25px;
+      padding-bottom: 15px;
+      border-bottom: 1px solid rgba(255,255,255,0.1);
+    }
+    .title { color: #FB7299; font-size: 24px; font-weight: bold; }
+    .stats { color: #888; font-size: 14px; }
+
+    .search-bar {
+      margin-bottom: 20px;
+      display: flex;
+      gap: 10px;
+    }
+    .search-input {
+      flex: 1;
+      padding: 10px 15px;
+      background: #333;
+      border: 1px solid #555;
+      border-radius: 6px;
+      color: #fff;
+      font-size: 14px;
+      outline: none;
+    }
+    .search-input:focus { border-color: #FB7299; }
+
+    .table-container {
+      background: rgba(255,255,255,0.05);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th {
+      background: rgba(0,0,0,0.3);
+      padding: 12px;
+      text-align: left;
+      font-size: 13px;
+      color: #aaa;
+      font-weight: 500;
+    }
+    td {
+      padding: 12px;
+      border-top: 1px solid rgba(255,255,255,0.05);
+      font-size: 14px;
+    }
+    tr:hover { background: rgba(255,255,255,0.05); }
+
+    .type-badge {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .type-hard { background: #ff6b6b; }
+    .type-soft { background: #4ecdc4; }
+    .type-placement { background: #ffe66d; color: #333; }
+    .type-intro { background: #95e1d3; color: #333; }
+    .type-mid { background: #a8e6cf; color: #333; }
+
+    .btn-delete {
+      padding: 6px 12px;
+      background: #ff6b6b;
+      border: none;
+      border-radius: 4px;
+      color: #fff;
+      font-size: 12px;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+    .btn-delete:hover { opacity: 0.8; }
+
+    .btn-jump {
+      padding: 6px 12px;
+      background: #FB7299;
+      border: none;
+      border-radius: 4px;
+      color: #fff;
+      font-size: 12px;
+      cursor: pointer;
+      transition: opacity 0.2s;
+      margin-right: 5px;
+    }
+    .btn-jump:hover { opacity: 0.8; }
+
+    .pagination {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 15px;
+      margin-top: 20px;
+    }
+    .page-btn {
+      padding: 8px 16px;
+      background: #333;
+      border: 1px solid #555;
+      border-radius: 4px;
+      color: #fff;
+      cursor: pointer;
+    }
+    .page-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .page-info { color: #aaa; font-size: 14px; }
+
+    .loading, .empty {
+      text-align: center;
+      padding: 40px;
+      color: #888;
+    }
+
+    .bilibili-link {
+      color: #FB7299;
+      text-decoration: none;
+    }
+    .bilibili-link:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">标注历史</div>
+    <div class="stats" id="stats">加载中...</div>
+  </div>
+
+  <div class="search-bar">
+    <input type="text" id="search-input" class="search-input" placeholder="搜索 BV 号...">
+  </div>
+
+  <div class="table-container">
+    <table id="segments-table">
+      <thead>
+        <tr>
+          <th>BV号</th>
+          <th>时间</th>
+          <th>类型</th>
+          <th>创建时间</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="segments-body">
+        <tr><td colspan="6" class="loading">加载中...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="pagination">
+    <button id="prev-btn" class="page-btn">上一页</button>
+    <span class="page-info" id="page-info">第 1 页</span>
+    <button id="next-btn" class="page-btn">下一页</button>
+  </div>
+
+  <script src="../content/config.local.js"></script>
+  <script src="history.js"></script>
+</body>
+</html>

@@ -5,8 +5,10 @@
   "description": "社区驱动的B站广告自动跳过插件",
   "permissions": [
     "storage",
-    "activeTab"
+    "activeTab",
+    "tabs"
   ],
+  "options_page": "options/options.html",
   "host_permissions": [
     "https://www.bilibili.com/*",
     "http://localhost:8080/*",
