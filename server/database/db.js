@@ -14,35 +14,40 @@ const db = new Database(dbPath);
 db.pragma('journal_mode = WAL'); // 启用 WAL 模式提高并发性能
 
 // --- 自动化建表逻辑 ---
+// 初始化表（统一字段与业务逻辑）
 db.exec(`
-  -- 1. 视频主表
-  CREATE TABLE IF NOT EXISTS videos (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    bvid TEXT UNIQUE NOT NULL,
-    title TEXT,
-    processed_status INTEGER DEFAULT 0 -- 0:待处理, 1:分析中, 2:完成
-  );
-
-  -- 2. 增强片段表 (核心：存储跳过点、知识弹窗、梗百科)
-  CREATE TABLE IF NOT EXISTS segments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    video_id INTEGER,
-    start_time REAL NOT NULL,
-    end_time REAL NOT NULL,
-    type TEXT CHECK(type IN ('ad', 'knowledge', 'meme', 'boring')), 
-    content TEXT,        -- 弹窗显示的文字
-    action TEXT,         -- 'skip', 'popup', 'accelerate'
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (video_id) REFERENCES videos(id)
-  );
-
-  -- 3. 用户与积分
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
-    points INTEGER DEFAULT 0,
+    points INTEGER DEFAULT 0
+  );
+  
+  CREATE TABLE IF NOT EXISTS user_points (
+    user_id INTEGER PRIMARY KEY,
+    total_points INTEGER DEFAULT 0,
     tier TEXT DEFAULT 'bronze'
+  );
+  
+  CREATE TABLE IF NOT EXISTS videos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bvid TEXT UNIQUE NOT NULL,
+    cid INTEGER,
+    page INTEGER DEFAULT 1,
+    processed_status INTEGER DEFAULT 0
+  );
+  
+  CREATE TABLE IF NOT EXISTS segments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id INTEGER,
+    start_time REAL,
+    end_time REAL,
+    type TEXT,          -- 统一 ad_type 为 type
+    content TEXT,       -- 标注内容
+    action TEXT,        -- 跳过/标记等行为
+    contributor_id INTEGER,
+    is_active BOOLEAN DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 `);
 
