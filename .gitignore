@@ -23,3 +23,9 @@ node_modules/
 *.log
 .DS_Store
 
+.agent
+.claude
+CLAUDE.md
+
+package-lock.json
+package.json
