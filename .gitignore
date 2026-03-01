@@ -27,5 +27,6 @@ node_modules/
 .claude
 CLAUDE.md
 
-package-lock.json
-package.json
+build_output.txt
+dist
+build_test.js
