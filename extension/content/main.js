@@ -122,6 +122,11 @@
         const res = await fetch(url);
         const data = await res.json();
 
+        this.segments = data.segments || [];
+        // 保存标注ID用于删除
+        this.currentSegmentIds = this.segments.map(seg => seg.id).filter(id => id);
+        console.log("[AdSkipper] 加载", this.segments.length, "个广告段，ID列表:", this.currentSegmentIds);
+
         // Filter by user preferences
         this.segments = (data.segments || []).filter(seg =>
           skipTypes.includes(seg.ad_type || 'hard_ad')
@@ -133,6 +138,7 @@
 
         // 在进度条上添加标注标记
         this.addSegmentMarkers();
+
       } catch(e) {
         console.error("加载失败:", e);
       }

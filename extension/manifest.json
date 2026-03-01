@@ -39,5 +39,15 @@
       ],
       "run_at": "document_idle"
     }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "history/history.html",
+        "history/history.js",
+        "content/config.local.js"
+      ],
+      "matches": ["<all_urls>"]
+    }
   ]
 }

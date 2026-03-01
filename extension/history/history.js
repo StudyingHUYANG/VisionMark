@@ -21,6 +21,7 @@ const typeLabels = {
 async function getToken() {
   return new Promise((resolve) => {
     chrome.storage.local.get(['adskipper_token'], (storage) => {
+      console.log('历史页面获取token:', storage.adskipper_token ? '成功' : '失败');
       resolve(storage.adskipper_token);
     });
   });
@@ -28,7 +29,9 @@ async function getToken() {
 
 // Load all segments
 async function loadSegments() {
+  console.log('正在加载标注记录...');
   const token = await getToken();
+  console.log('获取到的token:', token ? '存在' : '不存在');
   if (!token) {
     document.getElementById('segments-body').innerHTML =
       '<tr><td colspan="5" class="empty">请先登录插件</td></tr>';
@@ -36,7 +39,8 @@ async function loadSegments() {
   }
 
   try {
-    const response = await fetch(`${API_BASE}/segments/user`, {
+    // 使用正确的API端点，并添加分页参数
+    const response = await fetch(`${API_BASE}/stats/user/contributions`, {
       headers: {
         'Authorization': `Bearer ${token}`
       }

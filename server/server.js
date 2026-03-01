@@ -99,6 +99,7 @@ app.get('/api/v1/auth/me', authenticateToken, (req, res) => {
   const points = db.prepare("SELECT * FROM user_points WHERE user_id = ?").get(req.user.userId);
   res.json({
     username: req.user.username,
+    userId: req.user.userId,
     points: points ? points.total_points : 0,
     tier: points ? points.tier : 'bronze'
   });
