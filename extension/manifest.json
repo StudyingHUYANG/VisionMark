@@ -5,11 +5,16 @@
   "description": "社区驱动的B站广告自动跳过插件",
   "permissions": [
     "storage",
-    "activeTab"
+    "activeTab",
+    "tabs"
   ],
+  "options_page": "options/options.html",
   "host_permissions": [
     "https://www.bilibili.com/*",
-    "http://localhost:3000/*"
+    "http://localhost:8080/*",
+    "http://localhost:3000/*",
+    "http://127.0.0.1:8080/*",
+    "http://127.0.0.1:3000/*"
   ],
   "action": {
     "default_popup": "popup/popup.html",
@@ -27,11 +32,26 @@
         "https://live.bilibili.com/*"
       ],
       "js": [
+        "content/config.local.js",
         "content/constants.js",
         "content/player.js",
-        "content/main.js"
+        "dist/main.js"
+      ],
+      "css": [
+        "dist/visionmark.css",
+        "content/content.css"
       ],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "history/history.html",
+        "history/history.js",
+        "content/config.local.js"
+      ],
+      "matches": ["<all_urls>"]
     }
   ]
 }

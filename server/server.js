@@ -5,9 +5,10 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const path = require('path');
+const config = require('./config.js');
 
 const app = express();
-const JWT_SECRET = 'secret-key-v1';
+const JWT_SECRET = config.JWT_SECRET;
 
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
@@ -98,6 +99,7 @@ app.get('/api/v1/auth/me', authenticateToken, (req, res) => {
   const points = db.prepare("SELECT * FROM user_points WHERE user_id = ?").get(req.user.userId);
   res.json({
     username: req.user.username,
+    userId: req.user.userId,
     points: points ? points.total_points : 0,
     tier: points ? points.tier : 'bronze'
   });
@@ -142,6 +144,27 @@ app.use('/api/v1/segments', segmentsRouter); // 补充批量/删除接口，和�
 // 原有app.listen保持不变
 app.listen(8080, '0.0.0.0', () => {
   console.log('[Server] http://localhost:8080');
+// Get user's all segments
+app.get('/api/v1/segments/user', authenticateToken, (req, res) => {
+  const userId = req.user.userId;
+
+  const rows = db.prepare(`
+    SELECT
+      s.id, s.start_time, s.end_time, s.ad_type,
+      v.bvid, v.page,
+      datetime(s.created_at, 'localtime') as created_at
+    FROM ad_segments s
+    JOIN videos v ON s.video_id = v.id
+    WHERE s.contributor_id = ?
+    ORDER BY s.created_at DESC
+  `).all(userId);
+
+  res.json({ segments: rows });
+});
+
+// 使用配置文件的端口
+app.listen(config.PORT, '0.0.0.0', () => {
+  console.log('[Server] http://localhost:' + config.PORT);
   console.log('[Auth] admin/admin 登录');
 });
 

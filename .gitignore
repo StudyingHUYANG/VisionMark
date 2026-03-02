@@ -22,3 +22,11 @@ node_modules/
 # 忽略日志/临时文件
 *.log
 .DS_Store
+
+.agent
+.claude
+CLAUDE.md
+
+build_output.txt
+dist
+build_test.js
