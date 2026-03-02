@@ -61,7 +61,8 @@ function showLoginForm() {
   document.getElementById('user-panel').style.display = 'none';
 }
 
-function showUserPanel(user) {
+// 显示用户面板并获取标注数量
+async function showUserPanel(user) {
   document.getElementById('auth-form').style.display = 'none';
   document.getElementById('user-panel').style.display = 'block';
   document.getElementById('user-panel').classList.add('user-panel-active');
@@ -69,9 +70,62 @@ function showUserPanel(user) {
   document.getElementById('display-username').textContent = user.username;
   document.getElementById('display-points').textContent = user.points || 0;
   document.getElementById('display-tier').textContent = (user.tier || 'Bronze').toUpperCase();
+  
+  // 获取并显示用户标注数量
+  await loadUserContributionCount();
 }
 
-// 刷新用户积分
+// 加载用户标注数量
+async function loadUserContributionCount() {
+  try {
+    // 首先获取当前用户的ID
+    const userInfo = await apiRequest('/auth/me');
+    const userId = await getUserIdByUsername(userInfo.username);
+    
+    if (userId) {
+      // 调用用户贡献API获取标注总数
+      const response = await fetch(`${API_BASE}/stats/user/contributions?user_id=${userId}&page_size=1`);
+      if (response.ok) {
+        const data = await response.json();
+        if (data.code === 200) {
+          document.getElementById('display-count').textContent = data.data.total || 0;
+          console.log('[Popup] 标注数量已更新:', data.data.total);
+        }
+      }
+    }
+  } catch(err) {
+    console.error('[Popup] 获取标注数量失败:', err);
+    document.getElementById('display-count').textContent = '0';
+  }
+}
+
+// 通过用户名获取用户ID（辅助函数）
+async function getUserIdByUsername(username) {
+  try {
+    // 这里需要一个获取用户ID的API，暂时通过查询用户表实现
+    // 或者可以在登录时将用户ID也存储到localStorage中
+    const token = localStorage.getItem('adskipper_token');
+    if (!token) return null;
+    
+    // 尝试从登录响应中获取用户ID（如果之前存储了的话）
+    const storedUser = JSON.parse(localStorage.getItem('adskipper_user') || '{}');
+    if (storedUser.userId) {
+      return storedUser.userId;
+    }
+    
+    // 如果没有存储userId，则需要通过API获取
+    // 这里假设登录API返回的用户信息包含userId
+    const loginData = await apiRequest('/auth/me');
+    // 注意：当前的/auth/me API不返回userId，我们需要修改它或者添加新的端点
+    
+    return null;
+  } catch(err) {
+    console.error('获取用户ID失败:', err);
+    return null;
+  }
+}
+
+// 刷新用户信息（包括积分和标注数量）
 async function refreshUserInfo() {
   try {
     const user = await apiRequest('/auth/me');
@@ -81,8 +135,11 @@ async function refreshUserInfo() {
     document.getElementById('display-points').textContent = user.points || 0;
     document.getElementById('display-tier').textContent = (user.tier || 'Bronze').toUpperCase();
     console.log('[Popup] 积分已刷新:', user.points);
+    
+    // 同时刷新标注数量
+    await loadUserContributionCount();
   } catch(err) {
-    console.error('[Popup] 刷新积分失败:', err);
+    console.error('[Popup] 刷新用户信息失败:', err);
   }
 }
 
@@ -117,7 +174,13 @@ async function handleAuth() {
     
     if (isLogin) {
       localStorage.setItem('adskipper_token', data.token);
-      localStorage.setItem('adskipper_user', JSON.stringify(data));
+      // 存储完整的用户信息，包括userId
+      localStorage.setItem('adskipper_user', JSON.stringify({
+        username: data.username,
+        points: data.points || 0,
+        tier: data.tier || 'bronze',
+        userId: data.userId || null // 如果登录API返回userId的话
+      }));
       // 同步到 chrome.storage.local 供 content script 使用
       chrome.storage.local.set({ adskipper_token: data.token }, () => {
         console.log('[Popup] Token已同步到chrome.storage.local');
@@ -196,11 +259,31 @@ function setSkipMode(mode) {
   });
 }
 
+// 刷新功能
+async function refreshAllData() {
+  const refreshBtn = document.getElementById('refresh-btn');
+  const originalText = refreshBtn.innerHTML;
+  refreshBtn.innerHTML = '🔄 刷新中...';
+  refreshBtn.disabled = true;
+  
+  try {
+    await refreshUserInfo();
+    showError('✓ 数据已刷新');
+  } catch(err) {
+    showError('刷新失败: ' + err.message);
+  } finally {
+    setTimeout(() => {
+      refreshBtn.innerHTML = originalText;
+      refreshBtn.disabled = false;
+    }, 1000);
+  }
+}
+
 // 初始化
 document.addEventListener('DOMContentLoaded', async () => {
   const isLoggedIn = await checkAuth();
 
-  // 如果已登录，刷新最新积分
+  // 如果已登录，刷新最新积分和标注数量
   if (isLoggedIn) {
     refreshUserInfo();
   }
@@ -212,6 +295,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('switch-text').onclick = toggleMode;
   document.getElementById('logout-btn').onclick = logout;
   document.getElementById('history-btn').onclick = openHistoryPage;
+  // 绑定刷新按钮
+  document.getElementById('refresh-btn').onclick = refreshAllData;
 
   // 绑定跳过模式切换按钮（使用 class 选择器，同时绑定登录前和登录后的按钮）
   document.querySelectorAll('.toggle-btn').forEach(btn => {
