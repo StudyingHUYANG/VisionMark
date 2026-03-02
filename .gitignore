@@ -26,6 +26,7 @@ node_modules/
 .agent
 .claude
 CLAUDE.md
+AGENTS.md
 
 build_output.txt
 dist

@@ -1,6 +1,4 @@
-import { createApp } from 'vue';
-import App from './App.vue';
-import { videoState } from './store.js';
+import { createSidebar, sidebarState } from '../sidebar/index.js';
 
 (function () {
   if (window.adSkipper) return;
@@ -72,9 +70,9 @@ import { videoState } from './store.js';
         });
 
         // ==========================
-        // Vue 3 挂载点初始化
+        // Vue 侧边栏初始化
         // ==========================
-        this.initVueApp();
+        this.initSidebar();
 
         this.player.onTimeUpdate = (t) => this.checkSkip(t);
         this.startInjectionObserver();
@@ -125,17 +123,15 @@ import { videoState } from './store.js';
       console.log('[AdSkipper] 调试模式已启用，使用: adSkipperDebug.addSegmentMarkers() 手动添加标记');
     }
 
-    initVueApp() {
-      // 检查是否已经存在
-      if (document.getElementById('ai-assistant-root')) return;
+    initSidebar() {
+      if (document.getElementById('vm-sidebar-root')) return;
 
-      const vueRoot = document.createElement('div');
-      vueRoot.id = 'ai-assistant-root';
-      document.body.appendChild(vueRoot);
+      const root = document.createElement('div');
+      root.id = 'vm-sidebar-root';
+      document.body.appendChild(root);
 
-      console.log("[AdSkipper Vue] 开始通过 createApp 挂载根组件 App.vue...");
-      const app = createApp(App);
-      app.mount('#ai-assistant-root');
+      console.log("[AdSkipper Sidebar] 初始化侧边栏...");
+      this.sidebarController = createSidebar(root);
     }
 
     getPage() {
@@ -154,8 +150,8 @@ import { videoState } from './store.js';
     async loadSegments(bvid) {
       if (!bvid || this.isLoadingSegments) return;
       this.isLoadingSegments = true;
-      videoState.isLoading = true;
-      videoState.loadError = '';
+      sidebarState.isLoading = true;
+      sidebarState.loadError = null;
 
       try {
         const storage = await new Promise(r => chrome.storage.local.get(['skip_types'], r));
@@ -181,9 +177,9 @@ import { videoState } from './store.js';
         this.aiSummary = typeof data.ai_summary === 'string' ? data.ai_summary.trim() : '';
         this.currentSegmentIds = this.segments.map(seg => seg.id).filter(id => id);
 
-        videoState.aiSummary = this.aiSummary || '暂无 AI 总结';
-        videoState.segments = this.segments;
-        videoState.activeSegmentKey = null;
+        sidebarState.aiSummary = this.aiSummary || '暂无 AI 总结';
+        sidebarState.segments = this.segments;
+        sidebarState.activeSegmentKey = null;
 
         this.addSegmentMarkers();
       } catch (error) {
@@ -191,12 +187,12 @@ import { videoState } from './store.js';
         this.segments = [];
         this.allSegments = [];
         this.currentSegmentIds = [];
-        videoState.segments = [];
-        videoState.aiSummary = videoState.aiSummary || 'AI 总结加载失败';
-        videoState.loadError = error.message || 'load failed';
+        sidebarState.segments = [];
+        sidebarState.aiSummary = sidebarState.aiSummary || 'AI 总结加载失败';
+        sidebarState.loadError = error.message || 'load failed';
       } finally {
         this.isLoadingSegments = false;
-        videoState.isLoading = false;
+        sidebarState.isLoading = false;
       }
     }
 
@@ -321,16 +317,16 @@ import { videoState } from './store.js';
 
     // 更新后的 checkSkip 方法
     checkSkip(currentTime) {
-      videoState.currentTime = currentTime;
+      sidebarState.currentTime = currentTime;
       if (this.player.currentBvid) {
-        videoState.bvid = this.player.currentBvid;
+        sidebarState.bvid = this.player.currentBvid;
       }
       if (this.player.currentCid) {
-        videoState.cid = this.player.currentCid;
+        sidebarState.cid = this.player.currentCid;
       }
 
       if (!this.segments.length) {
-        videoState.activeSegmentKey = null;
+        sidebarState.activeSegmentKey = null;
         this.hideSkipButton();
         if (Date.now() > this.popupLockUntil) {
           this.hideInsightPopup();
@@ -340,7 +336,7 @@ import { videoState } from './store.js';
 
       const activeSegment = this.getActiveSegment(currentTime);
       if (!activeSegment) {
-        videoState.activeSegmentKey = null;
+        sidebarState.activeSegmentKey = null;
         this.hideSkipButton();
         if (Date.now() > this.popupLockUntil) {
           this.hideInsightPopup();
@@ -348,7 +344,7 @@ import { videoState } from './store.js';
         return;
       }
 
-      videoState.activeSegmentKey = this.getSegmentKey(activeSegment);
+      sidebarState.activeSegmentKey = this.getSegmentKey(activeSegment);
 
       if (activeSegment.action === 'popup') {
         this.hideSkipButton();
@@ -1313,7 +1309,7 @@ import { videoState } from './store.js';
           try {
             await this.deleteAnnotation(deleteId);
             this.segments = this.segments.filter(item => Number(item.id) !== deleteId);
-            videoState.segments = this.segments;
+            sidebarState.segments = this.segments;
             this.currentSegmentIds = this.currentSegmentIds.filter(id => Number(id) !== deleteId);
             button.closest('div').parentElement.remove();
 

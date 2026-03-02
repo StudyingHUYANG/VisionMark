@@ -1,0 +1,17 @@
+:root {
+  --vm-sidebar-width: 380px;
+  --vm-top-offset: 64px;
+  --vm-bg-primary: rgba(255, 255, 255, 0.85);
+  --vm-bg-secondary: #f8f9fa;
+  --vm-bg-glass: rgba(255, 255, 255, 0.85);
+  --vm-blur-amount: 20px;
+  --vm-text-primary: #333333;
+  --vm-text-secondary: #666666;
+  --vm-color-primary: #FB7299;
+  --vm-color-highlight: #1976d2;
+  --vm-color-skip: #c2185b;
+  --vm-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+  --vm-transition-base: 0.3s ease-in-out;
+  --vm-shadow-left: -4px 0 20px rgba(0, 0, 0, 0.08);
+  --vm-border-subtle: 1px solid rgba(0, 0, 0, 0.08);
+}
