@@ -18,21 +18,26 @@ import { videoState } from './store.js';
     constructor() {
       this.player = new BilibiliPlayerController();
       this.segments = [];
+      this.allSegments = [];
+      this.aiSummary = '';
       this.lastSkipTime = 0;
+      this.lastPopupSegmentKey = null;
+      this.popupLockUntil = 0;
       this.pendingStart = null;
       this.pendingEnd = null;
       this.pendingType = 'hard_ad';
       // 手动跳过功能
       this.skipMode = 'auto';
       this.skipButton = null;
-      // 新增日志控制变量
+      // 日志控制变量
       this.noSegmentLogPrinted = false;
       this.coolDownLogPrinted = false;
       this.matchProcessLogPrinted = false;
       this.noAdMatchLogPrinted = false;
 
-      // 存储当前视频的标注ID（用于删除）
+      // 存储当前视频的标注 ID（用于删除）
       this.currentSegmentIds = [];
+      this.isLoadingSegments = false;
 
 
     }
@@ -45,7 +50,7 @@ import { videoState } from './store.js';
         // 检查登录状态
         chrome.storage.local.get(['adskipper_token'], (storage) => {
           const token = storage.adskipper_token;
-          console.log("[AdSkipper] 登录状态:", token ? "已登录" : "未登录");
+          console.log('[AdSkipper] Login status:', token ? 'logged in' : 'not logged in');
         });
 
         // 加载跳过模式设置
@@ -67,7 +72,7 @@ import { videoState } from './store.js';
         });
 
         // ==========================
-        // Vue 3 微前端挂载点初始化
+        // Vue 3 挂载点初始化
         // ==========================
         this.initVueApp();
 
@@ -103,7 +108,19 @@ import { videoState } from './store.js';
         }
       });
 
-      // 调试：将实例暴露到全局，方便控制台调试
+      window.addEventListener('visionmark:seek', (event) => {
+        const time = Number(event?.detail?.time);
+        if (!Number.isFinite(time)) return;
+        this.player.skipTo(Math.max(time, 0));
+      });
+
+      window.addEventListener('visionmark:refresh-ai', () => {
+        if (this.player.currentBvid) {
+          this.loadSegments(this.player.currentBvid);
+        }
+      });
+
+      // 调试：将实例暴露到全局，便于控制台调试
       window.adSkipperDebug = this;
       console.log('[AdSkipper] 调试模式已启用，使用: adSkipperDebug.addSegmentMarkers() 手动添加标记');
     }
@@ -135,42 +152,175 @@ import { videoState } from './store.js';
     }
 
     async loadSegments(bvid) {
+      if (!bvid || this.isLoadingSegments) return;
+      this.isLoadingSegments = true;
+      videoState.isLoading = true;
+      videoState.loadError = '';
+
       try {
-        // Get skip type preferences
         const storage = await new Promise(r => chrome.storage.local.get(['skip_types'], r));
         const skipTypes = storage.skip_types || ['hard_ad', 'soft_ad', 'product_placement'];
 
         const url = API_BASE + "/segments?bvid=" + bvid + "&page=" + this.getPage();
         const res = await fetch(url);
+        if (!res.ok) {
+          throw new Error("Failed to load segments: " + res.status);
+        }
+
         const data = await res.json();
+        const normalizedSegments = (data.segments || [])
+          .map((segment, index) => this.normalizeSegment(segment, index))
+          .filter(segment => Number.isFinite(segment.start_time) && Number.isFinite(segment.end_time) && segment.end_time > segment.start_time);
 
-        this.segments = data.segments || [];
-        // 保存标注ID用于删除
+        this.allSegments = normalizedSegments;
+        this.segments = normalizedSegments.filter(segment => {
+          if (segment.action === 'popup') return true;
+          if (segment.hasActionField) return true;
+          return skipTypes.includes(segment.ad_type || 'hard_ad');
+        });
+        this.aiSummary = typeof data.ai_summary === 'string' ? data.ai_summary.trim() : '';
         this.currentSegmentIds = this.segments.map(seg => seg.id).filter(id => id);
-        console.log("[AdSkipper] 加载", this.segments.length, "个广告段，ID列表:", this.currentSegmentIds);
 
-        // Filter by user preferences
-        this.segments = (data.segments || []).filter(seg =>
-          skipTypes.includes(seg.ad_type || 'hard_ad')
-        );
-
-        // 保存标注ID用于删除
-        this.currentSegmentIds = this.segments.map(seg => seg.id).filter(id => id);
-        console.log("[AdSkipper] 加载", this.segments.length, "个广告段（已过滤），ID列表:", this.currentSegmentIds);
-
-        // 同步给 Vue 状态管理
+        videoState.aiSummary = this.aiSummary || '暂无 AI 总结';
         videoState.segments = this.segments;
+        videoState.activeSegmentKey = null;
 
-        // 在进度条上添加标注标记
         this.addSegmentMarkers();
-      } catch (e) {
-        console.error("加载失败:", e);
+      } catch (error) {
+        console.error('[AdSkipper] Load segments failed:', error);
+        this.segments = [];
+        this.allSegments = [];
+        this.currentSegmentIds = [];
+        videoState.segments = [];
+        videoState.aiSummary = videoState.aiSummary || 'AI 总结加载失败';
+        videoState.loadError = error.message || 'load failed';
+      } finally {
+        this.isLoadingSegments = false;
+        videoState.isLoading = false;
       }
     }
 
-    // 替换后的 checkSkip 方法
+    normalizeSegment(segment, index) {
+      const start = Number(segment.start ?? segment.start_time ?? 0);
+      const end = Number(segment.end ?? segment.end_time ?? 0);
+      const candidateAction = typeof segment.action === 'string' ? segment.action.toLowerCase() : '';
+      const action = candidateAction === 'popup' || candidateAction === 'skip' ? candidateAction : 'skip';
+
+      const rawContent = typeof segment.content === 'string' ? segment.content.trim() : null;
+      const content = action === 'popup' ? (rawContent || null) : null;
+
+      return {
+        ...segment,
+        id: segment.id ?? `${start}-${end}-${index}`,
+        start,
+        end,
+        start_time: start,
+        end_time: end,
+        action,
+        content,
+        ad_type: segment.ad_type || (action === 'skip' ? 'hard_ad' : 'mid_ad'),
+        hasActionField: typeof segment.action === 'string'
+      };
+    }
+
+    getSegmentKey(segment, indexFallback = 0) {
+      return String(segment.id ?? `${segment.start_time}-${segment.end_time}-${indexFallback}`);
+    }
+
+    showInsightPopup(segment) {
+      const popupId = 'visionmark-insight-popup';
+      const oldPopup = document.getElementById(popupId);
+      if (oldPopup) oldPopup.remove();
+
+      const popup = document.createElement('div');
+      popup.id = popupId;
+      popup.style.cssText = `
+        position: fixed;
+        right: 24px;
+        bottom: 96px;
+        width: min(360px, 78vw);
+        max-height: 42vh;
+        overflow-y: auto;
+        background: rgba(16, 21, 34, 0.96);
+        border: 1px solid rgba(71, 167, 255, 0.55);
+        border-radius: 12px;
+        box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+        color: #eaf4ff;
+        z-index: 999999;
+        padding: 12px 14px;
+        line-height: 1.55;
+        font-size: 13px;
+      `;
+
+      const start = Number.isFinite(segment.start_time) ? segment.start_time.toFixed(1) : '-';
+      const end = Number.isFinite(segment.end_time) ? segment.end_time.toFixed(1) : '-';
+      const content = segment.content || '该片段暂无解读文案';
+
+      popup.innerHTML = `
+        <div style="font-size: 11px; letter-spacing: .4px; color: #74b7ff; margin-bottom: 6px;">
+          AI HIGHLIGHT ${start}s - ${end}s
+        </div>
+        <div style="white-space: pre-wrap;">${content}</div>
+      `;
+
+      document.body.appendChild(popup);
+      this.popupLockUntil = Date.now() + 3200;
+    }
+
+    hideInsightPopup() {
+      const popup = document.getElementById('visionmark-insight-popup');
+      if (popup) popup.remove();
+      this.lastPopupSegmentKey = null;
+      this.popupLockUntil = 0;
+    }
+
+    seekToSegmentStart(segment) {
+      if (!segment) return;
+      const targetTime = Number(segment.start_time);
+      if (!Number.isFinite(targetTime)) return;
+      this.player.skipTo(Math.max(0, targetTime));
+    }
+
+    seekToSegmentEnd(segment) {
+      if (!segment) return;
+      const targetTime = Number(segment.end_time);
+      if (!Number.isFinite(targetTime)) return;
+      this.player.skipTo(Math.max(0, targetTime));
+    }
+
+    getActiveSegment(currentTime) {
+      return this.segments.find(segment => currentTime >= segment.start_time && currentTime < segment.end_time - 0.2);
+    }
+
+    handlePopupSegment(segment) {
+      if (!segment || segment.action !== 'popup') return;
+
+      const key = this.getSegmentKey(segment);
+      if (this.lastPopupSegmentKey === key) return;
+      if (Date.now() < this.popupLockUntil) return;
+
+      this.lastPopupSegmentKey = key;
+      this.showInsightPopup(segment);
+      this.showToast('AI 知识点提醒', 'info');
+    }
+
+    handleSkipSegment(segment) {
+      if (!segment || segment.action !== 'skip') return;
+
+      if (this.skipMode === 'auto') {
+        this.seekToSegmentEnd(segment);
+        this.lastSkipTime = Date.now();
+        this.showSkipNotification(segment);
+        return;
+      }
+
+      if (!this.skipButton) {
+        this.showSkipButton(segment);
+      }
+    }
+
+    // 更新后的 checkSkip 方法
     checkSkip(currentTime) {
-      // 每当你获取到播放器的 currentTime，都会触发更新 Vue 所绑定的响应式大盘
       videoState.currentTime = currentTime;
       if (this.player.currentBvid) {
         videoState.bvid = this.player.currentBvid;
@@ -179,77 +329,42 @@ import { videoState } from './store.js';
         videoState.cid = this.player.currentCid;
       }
 
-
-
-
-      // 单条播放时间日志（不刷屏，页面右上角显示）
-      const logElementId = 'ad-skipper-play-time';
-      let logElement = document.getElementById(logElementId);
-
-      if (!logElement) {
-        logElement = document.createElement('div');
-        logElement.id = logElementId;
-        logElement.style.cssText = 'position:fixed;top:10px;right:10px;background:rgba(0,0,0,0.8);color:#fff;padding:8px 12px;border-radius:4px;font-size:14px;z-index:999999;';
-        document.body.appendChild(logElement);
-      }
-      const modeText = this.skipMode === 'auto' ? '[自动]' : '[手动]';
-      logElement.textContent = `${modeText} 时间: ${currentTime.toFixed(2)}s | 广告段: ${this.segments.length}`;
-
-      if (!this.segments.length || Date.now() - this.lastSkipTime < 500) {
-        if (!this.segments.length && !this.noSegmentLogPrinted) {
-          console.log("[AdSkipper] 跳过判断：无广告段数据（后续不再重复提示）");
-          this.noSegmentLogPrinted = true;
-        } else if (Date.now() - this.lastSkipTime < 500 && !this.coolDownLogPrinted) {
-          console.log(`[AdSkipper] 跳过判断：500ms冷却期内（上次跳过：${this.lastSkipTime}，当前：${Date.now()}）`);
-          this.coolDownLogPrinted = true;
+      if (!this.segments.length) {
+        videoState.activeSegmentKey = null;
+        this.hideSkipButton();
+        if (Date.now() > this.popupLockUntil) {
+          this.hideInsightPopup();
         }
         return;
       }
 
-      this.noSegmentLogPrinted = false;
-      this.coolDownLogPrinted = false;
-
-      if (!this.matchProcessLogPrinted) {
-        console.log(`[AdSkipper] 正在匹配广告段（共${this.segments.length}个）...`);
-        this.segments.forEach((ad, idx) => {
-          console.log(`[AdSkipper] 广告段${idx + 1}：${ad.start_time.toFixed(2)}s - ${ad.end_time.toFixed(2)}s（类型：${ad.ad_type || 'hard_ad'}）`);
-        });
-        this.matchProcessLogPrinted = true;
-      }
-
-
-
-      if (!this.segments.length || Date.now() - this.lastSkipTime < 500) return;
-
-
-
-      const ad = this.segments.find(s =>
-        currentTime >= s.start_time && currentTime < s.end_time - 0.5
-      );
-
-      if (ad) {
-        console.log(`[AdSkipper] 匹配到广告段：${ad.start_time.toFixed(2)}s - ${ad.end_time.toFixed(2)}s，执行跳过`);
-        if (this.skipMode === 'auto') {
-          // 自动跳过模式
-          this.player.skipTo(ad.end_time);
-          this.lastSkipTime = Date.now();
-          this.showSkipNotification(ad);
-        } else {
-          // 手动模式：显示跳过按钮
-          if (!this.skipButton) {
-            this.showSkipButton(ad);
-          }
-        }
-        this.matchProcessLogPrinted = false;
-        this.noAdMatchLogPrinted = false;
-      } else {
-        // 离开广告段，隐藏按钮
+      const activeSegment = this.getActiveSegment(currentTime);
+      if (!activeSegment) {
+        videoState.activeSegmentKey = null;
         this.hideSkipButton();
-        if (!this.noAdMatchLogPrinted) {
-          console.log("[AdSkipper] 未匹配到需要跳过的广告段（后续不再重复提示）");
-          this.noAdMatchLogPrinted = true;
+        if (Date.now() > this.popupLockUntil) {
+          this.hideInsightPopup();
         }
+        return;
       }
+
+      videoState.activeSegmentKey = this.getSegmentKey(activeSegment);
+
+      if (activeSegment.action === 'popup') {
+        this.hideSkipButton();
+        this.handlePopupSegment(activeSegment);
+        return;
+      }
+
+      if (Date.now() > this.popupLockUntil) {
+        this.hideInsightPopup();
+      }
+
+      if (Date.now() - this.lastSkipTime < 500) {
+        return;
+      }
+
+      this.handleSkipSegment(activeSegment);
     }
 
     startInjectionObserver() {
@@ -283,9 +398,7 @@ import { videoState } from './store.js';
 
     injectControlPanel(target) {
       const self = this;
-      console.log("[AdSkipper] 注入控制面板到:", target.className);
 
-      // 1. Inject Styles for Responsiveness
       if (!document.getElementById('adskipper-css')) {
         const style = document.createElement('style');
         style.id = 'adskipper-css';
@@ -293,7 +406,6 @@ import { videoState } from './store.js';
           .adskipper-toggle-text { display: block; font-size: 13px; font-weight: 500; }
           .is-compact #adskipper-toggle { padding: 0 6px !important; justify-content: center; }
           #adskipper-toggle:hover { filter: brightness(1.1); }
-          /* 确认对话框样式 */
           #adskipper-confirm-dialog {
             position: fixed;
             top: 50%;
@@ -339,16 +451,14 @@ import { videoState } from './store.js';
         document.head.appendChild(style);
       }
 
-      // 2. Wrapper
       const wrapper = document.createElement('div');
       wrapper.id = 'adskipper-wrapper';
       wrapper.style.cssText = 'position:relative;display:inline-flex;vertical-align:middle;height:100%;align-items:center;margin-right:12px;z-index:100;';
 
-      // 3. Toggle Button
       const toggleBtn = document.createElement('div');
       toggleBtn.id = 'adskipper-toggle';
-      toggleBtn.title = '广告标注控制';
-      toggleBtn.setAttribute('aria-label', '广告标注控制');
+      toggleBtn.title = '广告控制';
+      toggleBtn.setAttribute('aria-label', '广告控制');
       toggleBtn.style.cssText = `
         cursor: pointer;
         background-color: #FB7299;
@@ -364,14 +474,12 @@ import { videoState } from './store.js';
         height: auto;
         min-height: 24px;
       `;
-      toggleBtn.innerHTML = `<span class="adskipper-toggle-text">广告控制</span>`;
-
-      toggleBtn.onclick = (e) => {
-        e.stopPropagation();
+      toggleBtn.innerHTML = '<span class="adskipper-toggle-text">广告控制</span>';
+      toggleBtn.onclick = (event) => {
+        event.stopPropagation();
         self.togglePopover();
       };
 
-      // 4. Popover Panel
       const popover = document.createElement('div');
       popover.id = 'adskipper-popover';
       popover.style.cssText = `
@@ -379,7 +487,7 @@ import { videoState } from './store.js';
         position: absolute;
         bottom: 140%;
         left: 0;
-        margin-bottom: 0px;
+        margin-bottom: 0;
         z-index: 2147483647;
         background: rgba(20, 20, 20, 0.95);
         backdrop-filter: blur(10px);
@@ -393,24 +501,20 @@ import { videoState } from './store.js';
         transform-origin: bottom left;
         transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
       `;
-      popover.onclick = (e) => e.stopPropagation();
+      popover.onclick = (event) => event.stopPropagation();
 
-      // --- Button Logic ---
-
-      // Helper: Create Row
       const createRow = () => {
         const row = document.createElement('div');
         row.style.cssText = 'display:flex;gap:8px;align-items:center;justify-content:space-between;';
         return row;
       };
 
-      // Helper: Create Button
-      function createBtn(id, icon, label, title, onClick) {
-        const btn = document.createElement('button');
-        btn.id = id;
-        btn.innerHTML = `<span style="font-size:1.2em;">${icon}</span> <span style="font-size:0.9em;">${label}</span>`;
-        btn.title = title;
-        btn.style.cssText = `
+      function createBtn(id, label, title, onClick) {
+        const button = document.createElement('button');
+        button.id = id;
+        button.textContent = label;
+        button.title = title;
+        button.style.cssText = `
           flex: 1;
           height: 32px;
           background: #333;
@@ -426,161 +530,137 @@ import { videoState } from './store.js';
           padding: 0 8px;
           white-space: nowrap;
         `;
-        btn.onmouseenter = () => { if (!btn.disabled) { btn.style.background = '#444'; } };
-        btn.onmouseleave = () => {
-          if (btn.dataset.active === 'true') {
-            btn.style.background = '#FB7299';
-            btn.style.borderColor = '#FB7299';
-          } else {
-            btn.style.background = '#333';
+        button.onmouseenter = () => {
+          if (!button.disabled) {
+            button.style.background = '#444';
           }
         };
-        btn.onclick = onClick;
-        return btn;
+        button.onmouseleave = () => {
+          if (button.dataset.active === 'true') {
+            button.style.background = '#FB7299';
+            button.style.borderColor = '#FB7299';
+          } else {
+            button.style.background = '#333';
+          }
+        };
+        button.onclick = onClick;
+        return button;
       }
 
-      // Row 1: Start / End
       const row1 = createRow();
-
-      const btnStart = createBtn('adskipper-btn-start', '⛳', '开始', '标记广告开始', () => {
+      const btnStart = createBtn('adskipper-btn-start', '开始', '标记开始时间', () => {
         const current = self.player.getState().currentTime;
         self.pendingStart = current;
         btnStart.dataset.active = 'true';
         btnStart.style.background = '#FB7299';
         btnStart.style.borderColor = '#FB7299';
         self.updateButtonStates();
-        self.showToast("开始: " + current.toFixed(1) + "s", "info");
-        btnStart.animate([{ opacity: 1 }, { opacity: 0.5 }, { opacity: 1 }], { duration: 300 });
+        self.showToast('开始: ' + current.toFixed(1) + 's', 'info');
       });
 
-      const btnEnd = createBtn('adskipper-btn-end', '🏁', '结束', '标记广告结束', () => {
+      const btnEnd = createBtn('adskipper-btn-end', '结束', '标记结束时间', () => {
         const current = self.player.getState().currentTime;
-        if (self.pendingStart && current <= self.pendingStart) {
-          self.showToast("结束必须大于开始", "error");
+        if (self.pendingStart !== null && current <= self.pendingStart) {
+          self.showToast('结束时间必须大于开始时间', 'error');
           return;
         }
         self.pendingEnd = current;
         btnEnd.dataset.active = 'true';
         btnEnd.style.background = '#FB7299';
+        btnEnd.style.borderColor = '#FB7299';
         self.updateButtonStates();
-        self.showToast("结束: " + current.toFixed(1) + "s", "info");
-        btnEnd.animate([{ opacity: 1 }, { opacity: 0.5 }, { opacity: 1 }], { duration: 300 });
+        self.showToast('结束: ' + current.toFixed(1) + 's', 'info');
       });
       btnEnd.disabled = true;
       btnEnd.style.opacity = '0.5';
       btnEnd.style.cursor = 'not-allowed';
-
       row1.appendChild(btnStart);
       row1.appendChild(btnEnd);
 
-      // Row 2: Type Selector
       const row2 = createRow();
       const selectType = document.createElement('select');
       selectType.id = 'adskipper-type';
       selectType.style.cssText = 'width:100%;height:32px;background:#333;color:#fff;border:1px solid #555;border-radius:4px;padding:0 6px;font-size:0.9em;outline:none;cursor:pointer;';
       const types = [
-        { val: 'hard_ad', text: '硬广 (Hard Ad)' },
-        { val: 'soft_ad', text: '软广 (Soft Ad)' },
-        { val: 'product_placement', text: '植入 (Placement)' },
-        { val: 'intro_ad', text: '片头 (Intro)' },
-        { val: 'mid_ad', text: '中段 (Mid)' }
+        { val: 'hard_ad', text: '硬广' },
+        { val: 'soft_ad', text: '软广' },
+        { val: 'product_placement', text: '植入' },
+        { val: 'intro_ad', text: '片头' },
+        { val: 'mid_ad', text: '中段' }
       ];
-      types.forEach((t) => {
-        const opt = document.createElement('option');
-        opt.value = t.val;
-        opt.textContent = t.text;
-        selectType.appendChild(opt);
+      types.forEach((item) => {
+        const option = document.createElement('option');
+        option.value = item.val;
+        option.textContent = item.text;
+        selectType.appendChild(option);
       });
-      selectType.onchange = (e) => { self.pendingType = e.target.value; };
+      selectType.onchange = (event) => {
+        self.pendingType = event.target.value;
+      };
       row2.appendChild(selectType);
 
-      // Row 3: Submit + Delete
       const row3 = createRow();
-      const btnSubmit = createBtn('adskipper-btn-submit', '☁️', '提交标注', '提交到服务器', async () => {
-        if (!self.pendingStart || !self.pendingEnd) return;
+      const btnSubmit = createBtn('adskipper-btn-submit', '提交标注', '提交到服务器', async () => {
+        if (self.pendingStart === null || self.pendingEnd === null) return;
 
-        const storage = await new Promise(r => chrome.storage.local.get(['adskipper_token'], r));
+        const storage = await new Promise(resolve => chrome.storage.local.get(['adskipper_token'], resolve));
         if (!storage.adskipper_token) {
-          self.showToast("✗ 请先登录插件", "error");
+          self.showToast('请先登录插件', 'error');
           return;
         }
 
-        btnSubmit.innerHTML = '⏳ 提交中...';
+        btnSubmit.textContent = '提交中...';
         try {
           await self.submitAnnotation(self.pendingStart, self.pendingEnd, self.pendingType);
-          self.showToast("✓ 成功 +10分", "success");
+          self.showToast('提交成功 +10分', 'success');
 
-          // Reset
           self.pendingStart = null;
           self.pendingEnd = null;
-          self.updateButtonStates();
-
           btnStart.dataset.active = 'false';
           btnEnd.dataset.active = 'false';
-          [btnStart, btnEnd].forEach(btn => {
-            btn.style.background = '#333';
-            btn.style.borderColor = '#555';
-          });
-
-          btnSubmit.innerHTML = '<span style="font-size:1.2em;">☁️</span> <span style="font-size:0.9em;">提交标注</span>';
-
-          // Close popover on success
+          btnStart.style.background = '#333';
+          btnEnd.style.background = '#333';
+          btnStart.style.borderColor = '#555';
+          btnEnd.style.borderColor = '#555';
+          self.updateButtonStates();
+          btnSubmit.textContent = '提交标注';
           self.togglePopover(false);
-
-        } catch (err) {
-          self.showToast("✗ " + err.message, "error");
-          btnSubmit.innerHTML = '<span style="font-size:1.2em;">☁️</span> <span style="font-size:0.9em;">提交标注</span>';
+        } catch (error) {
+          self.showToast('提交失败: ' + error.message, 'error');
+          btnSubmit.textContent = '提交标注';
         }
       });
       btnSubmit.disabled = true;
       btnSubmit.style.opacity = '0.5';
       btnSubmit.style.cursor = 'not-allowed';
 
-      // 添加删除按钮
-      const btnDelete = createBtn('adskipper-btn-delete', '🗑️', '删除最近', '删除最近添加的标注', async () => {
-        // 检查是否有可删除的标注
+      const btnDelete = createBtn('adskipper-btn-delete', '删除最近', '删除最近一条标注', async () => {
         if (!self.currentSegmentIds.length) {
-          self.showToast("✗ 暂无可删除的标注", "error");
+          self.showToast('暂无可删除标注', 'error');
           return;
         }
 
-        // 显示确认对话框
-        const confirmResult = await self.showConfirmDialog(
-          "确认删除",
-          `是否确定删除最近添加的标注？\n（ID: ${self.currentSegmentIds[self.currentSegmentIds.length - 1]}）`
-        );
+        const targetId = self.currentSegmentIds[self.currentSegmentIds.length - 1];
+        const confirmed = await self.showConfirmDialog('确认删除', `删除最近标注 ID: ${targetId} ?`);
+        if (!confirmed) return;
 
-        if (!confirmResult) return;
-
-        btnDelete.innerHTML = '⏳ 删除中...';
+        btnDelete.textContent = '删除中...';
         btnDelete.disabled = true;
         btnDelete.style.opacity = '0.5';
 
         try {
-          // 删除最后一个标注
-          const lastSegmentId = self.currentSegmentIds[self.currentSegmentIds.length - 1];
-          await self.deleteAnnotation(lastSegmentId);
-          self.showToast("✓ 删除成功", "success");
-
-          // 刷新标注数据
+          await self.deleteAnnotation(targetId);
           await self.loadSegments(self.player.currentBvid);
-
-          // 重置按钮状态
-          btnDelete.innerHTML = '<span style="font-size:1.2em;">🗑️</span> <span style="font-size:0.9em;">删除最近</span>';
-          btnDelete.disabled = false;
-          btnDelete.style.opacity = '1';
-
-          // 关闭弹窗
+          self.showToast('删除成功', 'success');
           self.togglePopover(false);
-        } catch (err) {
-          self.showToast("✗ " + err.message, "error");
-          btnDelete.innerHTML = '<span style="font-size:1.2em;">🗑️</span> <span style="font-size:0.9em;">删除最近</span>';
-          btnDelete.disabled = false;
-          btnDelete.style.opacity = '1';
+        } catch (error) {
+          self.showToast('删除失败: ' + error.message, 'error');
+        } finally {
+          btnDelete.textContent = '删除最近';
+          self.updateButtonStates();
         }
       });
 
-      // 禁用删除按钮（如果没有标注）
       if (!self.currentSegmentIds.length) {
         btnDelete.disabled = true;
         btnDelete.style.opacity = '0.5';
@@ -590,7 +670,6 @@ import { videoState } from './store.js';
       row3.appendChild(btnSubmit);
       row3.appendChild(btnDelete);
 
-      // Preview Text
       const previewRow = createRow();
       previewRow.style.justifyContent = 'center';
       const preview = document.createElement('span');
@@ -598,28 +677,23 @@ import { videoState } from './store.js';
       preview.style.cssText = 'color:#FB7299;font-size:0.85em;min-height:1.2em;';
       previewRow.appendChild(preview);
 
-      // Assemble Popover
       popover.appendChild(row1);
       popover.appendChild(row2);
       popover.appendChild(row3);
       popover.appendChild(previewRow);
-
-      // Assemble Wrapper
       wrapper.appendChild(toggleBtn);
       wrapper.appendChild(popover);
 
-      // Inject
       if (target.firstChild) {
         target.insertBefore(wrapper, target.firstChild);
       } else {
         target.appendChild(wrapper);
       }
 
-      // ResizeObserver
       const playerContainer = document.querySelector('.bpx-player-container') || document.querySelector('#bilibili-player');
       if (playerContainer) {
-        const ro = new ResizeObserver(entries => {
-          for (let entry of entries) {
+        const resizeObserver = new ResizeObserver((entries) => {
+          for (const entry of entries) {
             if (entry.contentRect.width < 600) {
               wrapper.classList.add('is-compact');
             } else {
@@ -627,26 +701,29 @@ import { videoState } from './store.js';
             }
           }
         });
-        ro.observe(playerContainer);
+        resizeObserver.observe(playerContainer);
       }
 
-      // Preview update loop
       if (this.previewInterval) clearInterval(this.previewInterval);
       this.previewInterval = setInterval(() => {
-        const p = document.getElementById('adskipper-preview');
-        if (!p) return;
-        if (self.pendingStart && self.pendingEnd) {
-          const dur = (self.pendingEnd - self.pendingStart).toFixed(1);
-          p.textContent = '⏱️ 已选 ' + dur + '秒';
-        } else if (self.pendingStart) {
-          p.textContent = '从 ' + self.pendingStart.toFixed(1) + 's...';
-        } else {
-          p.textContent = '';
+        const previewElement = document.getElementById('adskipper-preview');
+        if (!previewElement) return;
+
+        if (self.pendingStart !== null && self.pendingEnd !== null) {
+          const duration = (self.pendingEnd - self.pendingStart).toFixed(1);
+          previewElement.textContent = `已选 ${duration}s`;
+          return;
         }
+
+        if (self.pendingStart !== null) {
+          previewElement.textContent = `从 ${self.pendingStart.toFixed(1)}s 开始...`;
+          return;
+        }
+
+        previewElement.textContent = '';
       }, 200);
     }
 
-    // 显示确认对话框
     showConfirmDialog(title, message) {
       return new Promise((resolve) => {
         // 移除已存在的对话框
@@ -690,7 +767,7 @@ import { videoState } from './store.js';
       });
     }
 
-    // 调用删除API
+    // 调用删除 API
     async deleteAnnotation(segmentId) {
       const storage = await new Promise(r => chrome.storage.local.get(['adskipper_token'], r));
       const token = storage.adskipper_token;
@@ -784,23 +861,20 @@ import { videoState } from './store.js';
         ad_type: type
       };
 
-      console.log("[AdSkipper] 准备提交:", body);
-
-      // Get token
+      console.log('[AdSkipper] Submit annotation:', body);
       const storage = await new Promise(r => chrome.storage.local.get(['adskipper_token'], r));
       const token = storage.adskipper_token;
-
-      console.log("[AdSkipper] Token状态:", token ? "存在" : "不存在");
+      console.log('[AdSkipper] Token status:', token ? 'present' : 'missing');
 
       const headers = { "Content-Type": "application/json" };
       if (token) {
         headers['Authorization'] = 'Bearer ' + token;
-        console.log("[AdSkipper] Authorization Header:", 'Bearer ' + token.substring(0, 20) + '...');
+        console.log('[AdSkipper] Authorization Header:', 'Bearer ' + token.substring(0, 20) + '...');
       } else {
-        console.warn("[AdSkipper] 警告: Token不存在，请求可能会失败");
+        console.warn('[AdSkipper] Warning: request sent without token');
       }
 
-      console.log("[AdSkipper] 请求头:", headers);
+      console.log('[AdSkipper] Request headers:', headers);
 
       const res = await fetch(API_BASE + "/segments", {
         method: "POST",
@@ -809,13 +883,13 @@ import { videoState } from './store.js';
       });
 
       if (!res.ok) {
-        let errorMsg = "提交失败";
+        let errorMsg = 'Submit failed';
         try {
           const data = await res.json();
           errorMsg = data.error || errorMsg;
-          console.error("[AdSkipper] 服务器错误:", data);
+          console.error('[AdSkipper] Server error:', data);
         } catch (e) {
-          console.error("[AdSkipper] 响应解析失败:", res.status, res.statusText);
+          console.error('[AdSkipper] Failed to parse response:', res.status, res.statusText);
         }
         throw new Error(errorMsg);
       }
@@ -830,14 +904,7 @@ import { videoState } from './store.js';
 
       const t = document.createElement("div");
       t.id = 'adskipper-toast';
-
-      // Icon based on type
-      let icon = '';
-      if (type === 'success') icon = '✓ ';
-      else if (type === 'error') icon = '✗ ';
-      else if (type === 'info') icon = 'ℹ ';
-
-      t.innerHTML = `<span>${icon}${msg}</span>`;
+      t.innerHTML = `<span>${msg}</span>`;
 
       const color = type === 'success' ? '#67c23a' : (type === 'error' ? '#ff6b6b' : '#FB7299');
       t.style.cssText = `
@@ -898,7 +965,7 @@ import { videoState } from './store.js';
         box-shadow: 0 4px 16px rgba(0,0,0,0.3);
         animation: slideDown 0.4s ease-out;
       `;
-      toast.innerHTML = `✓ 已跳过 ${duration} 秒广告`;
+      toast.innerHTML = `✓ Auto skipped ${duration}s`;
 
       // Progress bar
       const progress = document.createElement('div');
@@ -960,7 +1027,7 @@ import { videoState } from './store.js';
 
       const self = this;
 
-      // 3. 精准挂载容器选择 - 优先使用视频画面容器，避免控制栏
+      // 3. 精准挂载容器选择，优先挂到视频画面容器，避免控制栏
       // 优先级：.bpx-player-video-wrap > .bpx-player-video-area > fallback
       let playerContainer = document.querySelector('.bpx-player-video-wrap') ||
         document.querySelector('.bpx-player-video-area') ||
@@ -968,7 +1035,7 @@ import { videoState } from './store.js';
         document.querySelector('#bilibili-player');
 
       if (!playerContainer) {
-        console.log("[AdSkipper] 未找到播放窗口容器");
+        console.log('[AdSkipper] Video container not found');
         return;
       }
 
@@ -980,8 +1047,8 @@ import { videoState } from './store.js';
       const btn = document.createElement('div');
       btn.id = 'adskipper-skip-btn';
       btn.textContent = '跳过广告';
-      // 5. 响应式 CSS 定位：使用像素值 + !important 确保严格定位在视频画面右下角
-      // 默认 bottom: 60px，在全屏模式下通过 CSS 覆盖为 100px
+      // 5. 响应式 CSS 定位：使用像素值 + !important 确保位于视频右下角
+      // 默认 bottom: 60px，在全屏模式下动态调整
       btn.style.cssText = `
         position: absolute !important;
         right: 20px !important;
@@ -1036,7 +1103,7 @@ import { videoState } from './store.js';
         }
       });
 
-      // 监听播放器容器的 class 变化（全屏状态通过 class 改变）
+      // 监听播放器容器的 class 变化（全屏状态通常通过 class 变化体现）
       const playerContainerForObserver = document.querySelector('.bpx-player-container') ||
         document.querySelector('#bilibili-player') ||
         playerContainer;
@@ -1052,7 +1119,7 @@ import { videoState } from './store.js';
       btn.onclick = () => {
         self.player.skipTo(ad.end_time);
         self.lastSkipTime = Date.now();
-        self.showToast("已跳过 " + (ad.end_time - ad.start_time).toFixed(1) + " 秒广告", "success");
+        self.showToast('Skipped ' + (ad.end_time - ad.start_time).toFixed(1) + 's', 'success');
         self.hideSkipButton();
       };
 
@@ -1070,56 +1137,46 @@ import { videoState } from './store.js';
     }
 
     addSegmentMarkers() {
-      console.log('[AdSkipper] 开始添加进度条标记...');
-
-      // 移除旧标记
       const oldMarkers = document.querySelectorAll('.adskipper-progress-marker');
-      oldMarkers.forEach(m => m.remove());
+      oldMarkers.forEach(marker => marker.remove());
 
       if (!this.segments.length) {
-        console.log('[AdSkipper] 没有标注段，跳过标记添加');
         return;
       }
 
-      // 找到进度条容器（尝试多种选择器）
-      let progressContainer = document.querySelector('.bpx-player-progress') ||
+      const progressContainer = document.querySelector('.bpx-player-progress') ||
         document.querySelector('.bilibili-player-progress') ||
         document.querySelector('.bpx-player-progress-wrap');
-
       if (!progressContainer) {
-        console.log('[AdSkipper] 未找到进度条容器');
         return;
       }
-      console.log('[AdSkipper] 找到进度条容器:', progressContainer.className);
 
-      // 获取视频总时长
-      const player = this.player.getState();
-      const duration = player.duration;
+      const duration = this.player.getState().duration;
       if (!duration || duration <= 0) {
-        console.log('[AdSkipper] 视频时长无效:', duration);
         return;
       }
 
-      // 获取进度条滑轨（尝试多种选择器）
-      let progressSlide = progressContainer.querySelector('.bpx-player-progress-slide') ||
+      const progressSlide = progressContainer.querySelector('.bpx-player-progress-slide') ||
         progressContainer.querySelector('.bili-progress-slip') ||
         progressContainer.querySelector('.bpx-player-progress-buffer');
-
       if (!progressSlide) {
-        console.log('[AdSkipper] 未找到进度条滑轨');
         return;
       }
-      console.log('[AdSkipper] 找到进度条滑轨:', progressSlide.className);
 
-      // 为每个标注段添加标记
-      this.segments.forEach((seg, index) => {
-        const startPercent = (seg.start_time / duration) * 100;
-        const endPercent = (seg.end_time / duration) * 100;
-        const width = Math.max(endPercent - startPercent, 1); // 最小1%宽度
+      progressSlide.style.position = progressSlide.style.position || 'relative';
+
+      this.segments.forEach((segment, index) => {
+        const startPercent = (segment.start_time / duration) * 100;
+        const endPercent = (segment.end_time / duration) * 100;
+        const width = Math.max(endPercent - startPercent, 0.8);
 
         const marker = document.createElement('div');
         marker.className = 'adskipper-progress-marker';
-        marker.setAttribute('data-segment-id', seg.id);
+        marker.setAttribute('data-segment-id', this.getSegmentKey(segment, index));
+
+        const markerColor = segment.action === 'popup'
+          ? 'rgba(71, 167, 255, 0.88)'
+          : 'rgba(251, 114, 153, 0.82)';
 
         marker.style.cssText = `
           position: absolute;
@@ -1127,138 +1184,100 @@ import { videoState } from './store.js';
           top: 0;
           bottom: 0;
           width: ${width}%;
-          background: rgba(251, 114, 153, 0.8) !important;
+          background: ${markerColor} !important;
           pointer-events: none;
           z-index: 999 !important;
           height: 100% !important;
         `;
-        marker.title = `${seg.start_time.toFixed(1)}s - ${seg.end_time.toFixed(1)}s (${typeLabels[seg.ad_type] || seg.ad_type})`;
+
+        const titleContent = segment.action === 'popup' && segment.content
+          ? ` | ${segment.content.slice(0, 36)}`
+          : '';
+        marker.title = `${segment.start_time.toFixed(1)}s - ${segment.end_time.toFixed(1)}s | ${segment.action}${titleContent}`;
 
         progressSlide.appendChild(marker);
-        console.log(`[AdSkipper] 添加标记 ${index + 1}:`, seg.start_time, seg.end_time, `${startPercent.toFixed(1)}%-${endPercent.toFixed(1)}%`);
       });
-
-      console.log(`[AdSkipper] ✓ 已添加 ${this.segments.length} 个进度条标记`);
     }
 
     handleShowMarkers() {
-      console.log('[AdSkipper] 显示标注列表');
-
       if (!this.segments || this.segments.length === 0) {
-        this.showToast('ℹ️ 当前视频暂无标注', 'info');
+        this.showToast('当前视频暂无片段', 'info');
         return;
       }
 
-      // 如果已经显示，则隐藏
       const existingPanel = document.getElementById('adskipper-segment-panel');
       if (existingPanel) {
         existingPanel.remove();
         return;
       }
 
-      // 创建标注列表面板
       const panel = document.createElement('div');
       panel.id = 'adskipper-segment-panel';
       panel.style.cssText = `
         position: fixed;
         bottom: 20px;
         right: 20px;
-        width: 400px;
-        max-height: 500px;
-        background: #1e1e2e;
+        width: min(420px, 88vw);
+        max-height: 64vh;
+        background: #131d30;
         border-radius: 12px;
-        box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+        box-shadow: 0 10px 36px rgba(0,0,0,0.52);
+        border: 1px solid rgba(99, 169, 255, 0.35);
         z-index: 999999;
         display: flex;
         flex-direction: column;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-family: "Segoe UI", "PingFang SC", sans-serif;
       `;
 
-      // 标题栏
       const header = document.createElement('div');
       header.style.cssText = `
         display: flex;
         justify-content: space-between;
         align-items: center;
-        padding: 16px 20px;
-        border-bottom: 1px solid rgba(255,255,255,0.1);
-        background: rgba(251, 114, 153, 0.1);
+        padding: 14px 16px;
+        border-bottom: 1px solid rgba(255,255,255,0.12);
+        background: rgba(65, 146, 255, 0.10);
       `;
       header.innerHTML = `
-        <span style="color: #FB7299; font-weight: bold; font-size: 16px;">
-          📊 标注历史 (${this.segments.length})
-        </span>
-        <button id="adskipper-close-panel" style="
-          background: none;
-          border: none;
-          color: #aaa;
-          font-size: 20px;
-          cursor: pointer;
-          padding: 4px 8px;
-        ">×</button>
+        <span style="color: #9fd2ff; font-weight: 700; font-size: 15px;">AI 片段列表 (${this.segments.length})</span>
+        <button id="adskipper-close-panel" style="background:none;border:none;color:#b8cee6;font-size:20px;cursor:pointer;">×</button>
       `;
 
-      // 标注列表
       const list = document.createElement('div');
       list.id = 'adskipper-segment-list';
-      list.style.cssText = `
-        overflow-y: auto;
-        flex: 1;
-        padding: 12px;
-      `;
+      list.style.cssText = 'overflow-y:auto;flex:1;padding:10px;display:flex;flex-direction:column;gap:8px;';
 
-      // 渲染标注项
-      this.segments.forEach((seg, index) => {
+      this.segments.forEach((segment, index) => {
         const item = document.createElement('div');
         item.style.cssText = `
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          padding: 12px;
-          margin-bottom: 8px;
-          background: rgba(255,255,255,0.05);
-          border-radius: 8px;
-          border-left: 3px solid #FB7299;
+          display:flex;
+          flex-direction:column;
+          gap:8px;
+          padding:10px;
+          background:rgba(255,255,255,0.04);
+          border-radius:8px;
+          border-left:4px solid ${segment.action === 'popup' ? '#4aa8ff' : '#fb7299'};
         `;
 
-        const typeLabels = {
-          'hard_ad': '硬广',
-          'soft_ad': '软广',
-          'product_placement': '植入',
-          'intro_ad': '片头',
-          'mid_ad': '中段'
-        };
+        const actionLabel = segment.action === 'popup' ? '重点弹窗' : '自动跳过';
+        const content = segment.action === 'popup' ? (segment.content || '该片段暂无文案') : '该片段默认执行跳过';
+        const segmentId = segment.id;
+        const canDelete = Number.isFinite(Number(segmentId)) && Number(segmentId) > 0;
 
         item.innerHTML = `
-          <div>
-            <div style="color: #fff; font-size: 14px; margin-bottom: 4px;">
-              <span style="color: #FB7299;">${seg.start_time.toFixed(1)}s</span> -
-              <span style="color: #FB7299;">${seg.end_time.toFixed(1)}s</span>
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+            <div style="color:#fff;font-size:13px;">
+              <span style="color:#9fd2ff;">${segment.start_time.toFixed(1)}s</span> -
+              <span style="color:#9fd2ff;">${segment.end_time.toFixed(1)}s</span>
             </div>
-            <div style="color: #aaa; font-size: 12px;">
-              ${typeLabels[seg.ad_type] || seg.ad_type}
-            </div>
+            <span style="font-size:11px;color:#d8ecff;background:${segment.action === 'popup' ? 'rgba(74,168,255,.35)' : 'rgba(251,114,153,.35)'};padding:2px 7px;border-radius:99px;">
+              ${actionLabel}
+            </span>
           </div>
-          <div>
-            <button data-index="${index}" class="adskipper-jump-btn" style="
-              padding: 6px 12px;
-              background: #FB7299;
-              border: none;
-              border-radius: 4px;
-              color: #fff;
-              font-size: 12px;
-              cursor: pointer;
-              margin-right: 6px;
-            ">跳转</button>
-            <button data-id="${seg.id}" class="adskipper-delete-btn" style="
-              padding: 6px 12px;
-              background: #555;
-              border: none;
-              border-radius: 4px;
-              color: #fff;
-              font-size: 12px;
-              cursor: pointer;
-            ">删除</button>
+          <div style="font-size:12px;color:#c3d8ee;line-height:1.45;">${content}</div>
+          <div style="display:flex;justify-content:flex-end;gap:8px;">
+            <button data-index="${index}" class="adskipper-jump-btn" style="padding:5px 12px;background:#4aa8ff;border:none;border-radius:4px;color:#fff;font-size:12px;cursor:pointer;">跳转</button>
+            <button data-id="${canDelete ? segmentId : ''}" class="adskipper-delete-btn" ${canDelete ? '' : 'disabled'} style="padding:5px 12px;background:${canDelete ? '#42546f' : '#374255'};border:none;border-radius:4px;color:${canDelete ? '#fff' : '#8898ad'};font-size:12px;cursor:${canDelete ? 'pointer' : 'not-allowed'};">删除</button>
           </div>
         `;
 
@@ -1269,55 +1288,53 @@ import { videoState } from './store.js';
       panel.appendChild(list);
       document.body.appendChild(panel);
 
-      // 绑定事件
       document.getElementById('adskipper-close-panel').onclick = () => panel.remove();
 
-      // 跳转按钮
-      document.querySelectorAll('.adskipper-jump-btn').forEach(btn => {
-        btn.onclick = () => {
-          const index = parseInt(btn.getAttribute('data-index'));
-          const seg = this.segments[index];
-          this.player.skipTo(seg.start_time);
-          this.showToast(`✓ 已跳转到 ${seg.start_time.toFixed(1)}s`, 'success');
+      document.querySelectorAll('.adskipper-jump-btn').forEach(button => {
+        button.onclick = () => {
+          const index = Number(button.getAttribute('data-index'));
+          const segment = this.segments[index];
+          this.seekToSegmentStart(segment);
+          this.showToast(`跳转到 ${segment.start_time.toFixed(1)}s`, 'success');
         };
       });
 
-      // 删除按钮
-      document.querySelectorAll('.adskipper-delete-btn').forEach(btn => {
-        btn.onclick = async () => {
-          const id = parseInt(btn.getAttribute('data-id'));
-          if (!confirm('确定要删除这条标注吗？')) return;
+      document.querySelectorAll('.adskipper-delete-btn').forEach(button => {
+        button.onclick = async () => {
+          const rawId = button.getAttribute('data-id');
+          const deleteId = Number(rawId);
+          if (!Number.isFinite(deleteId) || deleteId <= 0) {
+            this.showToast('当前片段不支持删除', 'info');
+            return;
+          }
+
+          if (!confirm(`确定删除标注 ${deleteId} 吗？`)) return;
 
           try {
-            const token = await this.getToken();
-            await fetch(API_BASE + '/segments/' + id, {
-              method: 'DELETE',
-              headers: { 'Authorization': 'Bearer ' + token }
-            });
+            await this.deleteAnnotation(deleteId);
+            this.segments = this.segments.filter(item => Number(item.id) !== deleteId);
+            videoState.segments = this.segments;
+            this.currentSegmentIds = this.currentSegmentIds.filter(id => Number(id) !== deleteId);
+            button.closest('div').parentElement.remove();
 
-            // 从列表中移除
-            btn.parentElement.parentElement.remove();
-            this.segments = this.segments.filter(s => s.id !== id);
-
-            // 更新标题计数
             const titleSpan = header.querySelector('span');
-            titleSpan.textContent = `📊 标注历史 (${this.segments.length})`;
+            titleSpan.textContent = `AI 片段列表 (${this.segments.length})`;
 
-            this.showToast('✓ 标注已删除', 'success');
-
-            // 如果列表为空，关闭面板
+            this.showToast('删除成功', 'success');
             if (this.segments.length === 0) {
               panel.remove();
             }
-          } catch (err) {
-            this.showToast('✗ 删除失败: ' + err.message, 'error');
+          } catch (error) {
+            this.showToast('删除失败: ' + error.message, 'error');
           }
         };
       });
 
-      this.showToast(`✓ 已显示 ${this.segments.length} 条标注`, 'success');
+      this.showToast(`已显示 ${this.segments.length} 条片段`, 'success');
     }
   }
 
   new AdSkipperCore().init();
 })();
+
+
