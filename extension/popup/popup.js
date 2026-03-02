@@ -71,6 +71,9 @@ async function showUserPanel(user) {
   document.getElementById('display-points').textContent = user.points || 0;
   document.getElementById('display-tier').textContent = (user.tier || 'Bronze').toUpperCase();
   
+  // 确保登录后面板使用最新跳过模式状态
+  loadSkipModeSetting();
+
   // 获取并显示用户标注数量
   await loadUserContributionCount();
 }
@@ -230,25 +233,12 @@ function loadSkipModeSetting() {
 
 // 更新跳过模式 UI
 function updateSkipModeUI(mode) {
-  // 更新所有具有相应 class 的按钮（登录前和登录后各有一组）
-  const autoBtns = document.querySelectorAll('.toggle-btn:first-child');
-  const manualBtns = document.querySelectorAll('.toggle-btn:last-child');
+  const autoBtn = document.getElementById('user-mode-auto');
+  const manualBtn = document.getElementById('user-mode-manual');
+  if (!autoBtn || !manualBtn) return;
 
-  autoBtns.forEach(btn => {
-    if (mode === 'auto') {
-      btn.classList.add('active');
-    } else {
-      btn.classList.remove('active');
-    }
-  });
-
-  manualBtns.forEach(btn => {
-    if (mode === 'manual') {
-      btn.classList.add('active');
-    } else {
-      btn.classList.remove('active');
-    }
-  });
+  autoBtn.classList.toggle('active', mode === 'auto');
+  manualBtn.classList.toggle('active', mode === 'manual');
 }
 
 // 设置跳过模式
@@ -298,16 +288,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 绑定刷新按钮
   document.getElementById('refresh-btn').onclick = refreshAllData;
 
-  // 绑定跳过模式切换按钮（使用 class 选择器，同时绑定登录前和登录后的按钮）
-  document.querySelectorAll('.toggle-btn').forEach(btn => {
-    btn.onclick = () => {
-      if (btn.textContent.includes('自动')) {
-        setSkipMode('auto');
-      } else {
-        setSkipMode('manual');
-      }
-    };
-  });
+  // 绑定登录后面板的跳过模式切换按钮
+  document.getElementById('user-mode-auto').onclick = () => setSkipMode('auto');
+  document.getElementById('user-mode-manual').onclick = () => setSkipMode('manual');
 
   document.getElementById('password').onkeypress = (e) => {
     if (e.key === 'Enter') handleAuth();
