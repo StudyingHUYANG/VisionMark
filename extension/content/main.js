@@ -72,7 +72,7 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         // ==========================
         // Vue 侧边栏初始化
         // ==========================
-        this.initSidebar();
+        this.initAiFloatingButton();
 
         this.player.onTimeUpdate = (t) => this.checkSkip(t);
         this.startInjectionObserver();
@@ -91,11 +91,21 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         if (wrapper && !wrapper.contains(e.target)) {
           this.togglePopover(false);
         }
+
+        const aiButton = document.getElementById('visionmark-ai-fab');
+        const aiPanel = document.getElementById('adskipper-segment-panel');
+        if (aiPanel && aiButton && !aiPanel.contains(e.target) && !aiButton.contains(e.target)) {
+          aiPanel.remove();
+        }
       });
 
       // ESC key listener
       document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') this.togglePopover(false);
+        if (e.key === 'Escape') {
+          this.togglePopover(false);
+          const aiPanel = document.getElementById('adskipper-segment-panel');
+          if (aiPanel) aiPanel.remove();
+        }
       });
 
       // Listen for messages from popup
@@ -132,6 +142,54 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
 
       console.log("[AdSkipper Sidebar] 初始化侧边栏...");
       this.sidebarController = createSidebar(root);
+    }
+
+    initAiFloatingButton() {
+      if (!document.getElementById('visionmark-ai-fab-style')) {
+        const style = document.createElement('style');
+        style.id = 'visionmark-ai-fab-style';
+        style.textContent = `
+          #visionmark-ai-fab {
+            position: fixed;
+            right: 20px;
+            bottom: 20px;
+            z-index: 2147483647;
+            min-width: 46px;
+            height: 46px;
+            border: none;
+            border-radius: 999px;
+            background: linear-gradient(135deg, #FB7299, #ff8e9f);
+            color: #fff;
+            font-size: 14px;
+            font-weight: 700;
+            letter-spacing: 0.4px;
+            cursor: pointer;
+            box-shadow: 0 10px 28px rgba(251, 114, 153, 0.45);
+            transition: transform 0.18s ease, box-shadow 0.18s ease;
+            padding: 0 16px;
+          }
+          #visionmark-ai-fab:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 14px 34px rgba(251, 114, 153, 0.55);
+          }
+        `;
+        document.head.appendChild(style);
+      }
+
+      if (document.getElementById('visionmark-ai-fab')) return;
+
+      const button = document.createElement('button');
+      button.id = 'visionmark-ai-fab';
+      button.type = 'button';
+      button.textContent = 'AI';
+      button.title = 'AI video summary';
+      button.setAttribute('aria-label', 'AI video summary');
+      button.onclick = (event) => {
+        event.stopPropagation();
+        this.handleShowMarkers();
+      };
+
+      document.body.appendChild(button);
     }
 
     getPage() {
@@ -1196,9 +1254,9 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
     }
 
     handleShowMarkers() {
-      if (!this.segments || this.segments.length === 0) {
-        this.showToast('当前视频暂无片段', 'info');
-        return;
+      const safeSegments = Array.isArray(this.segments) ? this.segments : [];
+      if (!safeSegments.length) {
+        this.showToast('No segments found for this video', 'info');
       }
 
       const existingPanel = document.getElementById('adskipper-segment-panel');
@@ -1235,15 +1293,30 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         background: rgba(65, 146, 255, 0.10);
       `;
       header.innerHTML = `
-        <span style="color: #9fd2ff; font-weight: 700; font-size: 15px;">AI 片段列表 (${this.segments.length})</span>
+        <span style="color: #9fd2ff; font-weight: 700; font-size: 15px;">AI 片段列表 (${safeSegments.length})</span>
         <button id="adskipper-close-panel" style="background:none;border:none;color:#b8cee6;font-size:20px;cursor:pointer;">×</button>
       `;
+
+      const summaryBlock = document.createElement('div');
+      summaryBlock.style.cssText = `
+        margin: 10px 10px 0;
+        padding: 10px 12px;
+        border-radius: 8px;
+        background: rgba(255,255,255,0.06);
+        color: #cfe1ff;
+        font-size: 12px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        max-height: 120px;
+        overflow-y: auto;
+      `;
+      summaryBlock.textContent = this.aiSummary || '暂无 AI 总结';
 
       const list = document.createElement('div');
       list.id = 'adskipper-segment-list';
       list.style.cssText = 'overflow-y:auto;flex:1;padding:10px;display:flex;flex-direction:column;gap:8px;';
 
-      this.segments.forEach((segment, index) => {
+      safeSegments.forEach((segment, index) => {
         const item = document.createElement('div');
         item.style.cssText = `
           display:flex;
@@ -1280,7 +1353,15 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         list.appendChild(item);
       });
 
+      if (!safeSegments.length) {
+        const empty = document.createElement('div');
+        empty.style.cssText = 'padding: 16px 10px; text-align: center; color: #9fb6d8; font-size: 12px;';
+        empty.textContent = '当前视频暂无可用片段';
+        list.appendChild(empty);
+      }
+
       panel.appendChild(header);
+      panel.appendChild(summaryBlock);
       panel.appendChild(list);
       document.body.appendChild(panel);
 
@@ -1289,7 +1370,7 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
       document.querySelectorAll('.adskipper-jump-btn').forEach(button => {
         button.onclick = () => {
           const index = Number(button.getAttribute('data-index'));
-          const segment = this.segments[index];
+          const segment = safeSegments[index];
           this.seekToSegmentStart(segment);
           this.showToast(`跳转到 ${segment.start_time.toFixed(1)}s`, 'success');
         };
@@ -1326,7 +1407,7 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         };
       });
 
-      this.showToast(`已显示 ${this.segments.length} 条片段`, 'success');
+      this.showToast(`已显示 ${safeSegments.length} 条片段`, 'success');
     }
   }
 
