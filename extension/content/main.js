@@ -67,10 +67,19 @@
 
         const bvid = this.player.currentBvid;
         if (bvid) {
-          this.loadSegments(bvid).then(() => {
+          // 先加载已有的广告段
+          this.loadSegments(bvid).then(async () => {
+            // 如果没有广告段数据，自动触发视频分析
+            if (this.segments.length === 0) {
+              console.log("[AdSkipper] 没有广告段数据，尝试自动分析视频...");
+              await this.analyzeVideo(bvid);
+            }
             window.adSkipper = this;
           });
         }
+
+        // 监听B站视频切换（URL变化）
+        this.startVideoChangeListener();
       });
 
       // Global click listener for closing popover
@@ -99,6 +108,87 @@
       console.log('[AdSkipper] 调试模式已启用，使用: adSkipperDebug.addSegmentMarkers() 手动添加标记');
     }
 
+    /**
+     * 监听B站视频切换
+     */
+    startVideoChangeListener() {
+      let lastUrl = window.location.href;
+      let lastBvid = this.player.currentBvid;
+
+      // 使用 MutationObserver 监听 URL 变化（B站是SPA，使用 pushState）
+      const observer = new MutationObserver(() => {
+        const currentUrl = window.location.href;
+
+        if (currentUrl !== lastUrl) {
+          console.log('[AdSkipper] 检测到URL变化:', currentUrl);
+
+          // 重新提取bvid
+          this.player.extractVideoId();
+          const newBvid = this.player.currentBvid;
+
+          // 如果bvid变化了，说明切换了视频
+          if (newBvid && newBvid !== lastBvid) {
+            console.log('[AdSkipper] 检测到视频切换:', lastBvid, '->', newBvid);
+            lastBvid = newBvid;
+
+            // 重置状态
+            this.segments = [];
+            this.currentSegmentIds = [];
+            this.noSegmentLogPrinted = false;
+            this.matchProcessLogPrinted = false;
+
+            // 移除旧的进度条标记
+            this.removeSegmentMarkers();
+
+            // 加载新视频的广告段
+            this.loadSegments(newBvid).then(async () => {
+              // 如果没有广告段数据，自动触发视频分析
+              if (this.segments.length === 0) {
+                console.log("[AdSkipper] 新视频没有广告段数据，尝试自动分析...");
+                await this.analyzeVideo(newBvid);
+              }
+            });
+          }
+
+          lastUrl = currentUrl;
+        }
+      });
+
+      // 监听 document.title 和 URL 变化
+      observer.observe(document.querySelector('title'), { subtree: true, characterData: true, childList: true });
+
+      // 同时监听 popstate 事件（浏览器前进/后退）
+      window.addEventListener('popstate', () => {
+        const currentUrl = window.location.href;
+        if (currentUrl !== lastUrl) {
+          console.log('[AdSkipper] popstate: URL变化');
+          // 触发上述逻辑
+          const newBvid = this.player.currentBvid;
+          if (newBvid && newBvid !== lastBvid) {
+            lastBvid = newBvid;
+            this.segments = [];
+            this.removeSegmentMarkers();
+            this.loadSegments(newBvid).then(async () => {
+              if (this.segments.length === 0) {
+                await this.analyzeVideo(newBvid);
+              }
+            });
+          }
+          lastUrl = currentUrl;
+        }
+      });
+
+      console.log('[AdSkipper] 视频切换监听已启动');
+    }
+
+    /**
+     * 移除进度条上的标记
+     */
+    removeSegmentMarkers() {
+      const existingMarkers = document.querySelectorAll('.adskipper-marker');
+      existingMarkers.forEach(marker => marker.remove());
+    }
+
     getPage() {
       const p = new URLSearchParams(window.location.search).get('p');
       return p ? parseInt(p) : 1;
@@ -118,14 +208,23 @@
         const storage = await new Promise(r => chrome.storage.local.get(['skip_types'], r));
         const skipTypes = storage.skip_types || ['hard_ad', 'soft_ad', 'product_placement'];
 
+        console.log("[AdSkipper] 当前过滤类型:", skipTypes);
+
         const url = API_BASE + "/segments?bvid=" + bvid + "&page=" + this.getPage();
         const res = await fetch(url);
         const data = await res.json();
 
+        console.log("[AdSkipper] 从服务器返回的广告段:", data.segments);
+        console.log("[AdSkipper] 返回的广告段类型:", data.segments?.map(s => s.ad_type));
+
         // Filter by user preferences
-        this.segments = (data.segments || []).filter(seg =>
+        const beforeFilter = data.segments || [];
+        this.segments = beforeFilter.filter(seg =>
           skipTypes.includes(seg.ad_type || 'hard_ad')
         );
+
+        console.log("[AdSkipper] 过滤后的广告段数量:", this.segments.length);
+        console.log("[AdSkipper] 被过滤掉的广告段:", beforeFilter.filter(seg => !skipTypes.includes(seg.ad_type || 'hard_ad')));
 
         // 保存标注ID用于删除
         this.currentSegmentIds = this.segments.map(seg => seg.id).filter(id => id);
@@ -136,6 +235,419 @@
       } catch(e) {
         console.error("加载失败:", e);
       }
+    }
+
+    // 自动分析视频
+    async analyzeVideo(bvid) {
+      try {
+        const token = await this.getToken();
+        if (!token) {
+          console.log("[AdSkipper] 未登录，跳过视频分析");
+          return;
+        }
+
+        console.log("[AdSkipper] 开始分析视频:", bvid);
+
+        // 显示分析进度
+        this.showAnalysisProgress();
+
+        const url = API_BASE + "/video-analysis/analyze";
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + token
+          },
+          body: JSON.stringify({ bvid })
+        });
+
+        const result = await res.json();
+
+        // 隐藏分析进度
+        this.hideAnalysisProgress();
+
+        if (!res.ok) {
+          console.error("[AdSkipper] 分析失败:", result.message || result.error);
+          this.showToast('✗ 分析失败: ' + (result.message || result.error), 'error');
+          return;
+        }
+
+        if (result.success && result.data) {
+          console.log("[AdSkipper] ✅✅✅ 分析成功 第1步");
+          console.log("[AdSkipper] 分析成功:", result.data);
+          console.log("[AdSkipper] ✅✅✅ 分析成功 第2步");
+          console.log("[AdSkipper] title:", result.data.title);
+          console.log("[AdSkipper] ✅✅✅ 分析成功 第3步");
+          console.log("[AdSkipper] summary:", result.data.summary);
+          console.log("[AdSkipper] tags:", result.data.tags);
+          console.log("[AdSkipper] ad_segments:", result.data.ad_segments);
+          console.log("[AdSkipper] knowledge_points:", result.data.knowledge_points);
+          console.log("[AdSkipper] hot_words:", result.data.hot_words);
+
+          // 转换数据格式
+          const adaptedData = {
+            analysis: {
+              title: result.data.title || '视频分析',
+              tags: result.data.tags || [],
+              summary: result.data.summary || '暂无总结',
+              segments: result.data.ad_segments ? result.data.ad_segments.map(seg => ({
+                title: seg.description || '广告段',
+                time_range: `${this.formatTime(seg.start_time)} - ${this.formatTime(seg.end_time)}`,
+                start_time: seg.start_time,
+                end_time: seg.end_time,
+                summary: seg.description,
+                highlight: seg.highlight,
+                key_points: []
+              })) : [],
+              knowledge_points: result.data.knowledge_points || [],
+              hot_words: result.data.hot_words || [],
+              transcript: result.data.transcript
+            },
+            bvid: result.data.bvid,
+            analyzed_at: result.data.analyzed_at
+          };
+
+          console.log("[AdSkipper] 转换后的数据:", adaptedData);
+          console.log("[AdSkipper] 准备调用 showAnalysisResult...");
+
+          // ⭐ 先显示完整分析报告（无论是否有广告段）
+          try {
+            this.showAnalysisResult(adaptedData);
+            console.log("[AdSkipper] showAnalysisResult 调用完成");
+          } catch (e) {
+            console.error("[AdSkipper] showAnalysisResult 出错:", e);
+            console.error("[AdSkipper] 错误堆栈:", e.stack);
+          }
+
+          // 如果分析出广告段，重新加载广告段数据
+          if (result.data.ad_segments && result.data.ad_segments.length > 0) {
+            console.log("[AdSkipper] 发现", result.data.ad_segments.length, "个广告段，重新加载...");
+            console.log("[AdSkipper] 广告段类型:", result.data.ad_segments.map(s => s.ad_type));
+
+            // 延迟加载，给用户先看报告
+            setTimeout(() => this.loadSegments(bvid), 1000);
+          }
+
+          this.showToast('✓ 视频分析完成', 'success');
+        }
+      } catch(e) {
+        console.error("[AdSkipper] 视频分析出错:", e);
+        this.hideAnalysisProgress();
+        this.showToast('✗ 分析出错: ' + e.message, 'error');
+      }
+    }
+
+    /**
+     * 显示分析进度
+     */
+    showAnalysisProgress() {
+      const existing = document.getElementById('adskipper-analysis-progress');
+      if (existing) existing.remove();
+
+      const progress = document.createElement('div');
+      progress.id = 'adskipper-analysis-progress';
+      progress.style.cssText = `
+        position: fixed;
+        top: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: #fff;
+        padding: 16px 24px;
+        border-radius: 12px;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        z-index: 999999;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      `;
+      progress.innerHTML = `
+        <div style="width: 20px; height: 20px; border: 2px solid #fff; border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite;"></div>
+        <span style="font-size: 14px; font-weight: 500;">AI正在分析视频...</span>
+        <style>
+          @keyframes spin {
+            to { transform: rotate(360deg); }
+          }
+        </style>
+      `;
+
+      document.body.appendChild(progress);
+    }
+
+    /**
+     * 隐藏分析进度
+     */
+    hideAnalysisProgress() {
+      const progress = document.getElementById('adskipper-analysis-progress');
+      if (progress) progress.remove();
+    }
+
+    /**
+     * 将秒数格式化为时间字符串
+     */
+    formatTime(seconds) {
+      if (!seconds && seconds !== 0) return '00:00';
+      const mins = Math.floor(seconds / 60);
+      const secs = Math.floor(seconds % 60);
+      return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    }
+
+    /**
+     * 解析时间字符串为秒数
+     */
+    parseTimeStr(str) {
+      if (!str) return 0;
+
+      // 处理 "1分30秒" 格式
+      if (str.includes('分') || str.includes('秒')) {
+        const minMatch = str.match(/(\d+)分/);
+        const secMatch = str.match(/(\d+)秒/);
+        const min = minMatch ? parseInt(minMatch[1]) : 0;
+        const sec = secMatch ? parseInt(secMatch[1]) : 0;
+        return min * 60 + sec;
+      }
+
+      // 移除可能存在的非数字字符（除了冒号）
+      const cleanStr = str.replace(/[^\d:]/g, '');
+      const parts = cleanStr.split(':').map(Number);
+      if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+      if (parts.length === 2) return parts[0] * 60 + parts[1];
+      return parts[0] || 0;
+    }
+
+    /**
+     * HTML转义
+     */
+    escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    /**
+     * 显示分析结果
+     */
+    showAnalysisResult(data) {
+      console.log('[AdSkipper] ===== 显示分析结果 =====');
+      console.log('[AdSkipper] 完整数据:', JSON.stringify(data, null, 2));
+
+      const analysis = data.analysis;
+      console.log('[AdSkipper] analysis对象:', analysis);
+      console.log('[AdSkipper] title:', analysis?.title);
+      console.log('[AdSkipper] summary:', analysis?.summary);
+      console.log('[AdSkipper] tags:', analysis?.tags);
+      console.log('[AdSkipper] segments数量:', analysis?.segments?.length);
+      console.log('[AdSkipper] knowledge_points数量:', analysis?.knowledge_points?.length);
+      console.log('[AdSkipper] hot_words数量:', analysis?.hot_words?.length);
+
+      // 如果有旧的结果面板，先移除
+      const existingPanel = document.getElementById('adskipper-analysis-result');
+      if (existingPanel) {
+        console.log('[AdSkipper] 移除旧的分析面板');
+        existingPanel.remove();
+      }
+
+      const panel = document.createElement('div');
+      panel.id = 'adskipper-analysis-result';
+      panel.style.cssText = `
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 600px;
+        max-height: 80vh;
+        background: #1e1e2e;
+        border-radius: 16px;
+        box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+        z-index: 999999;
+        display: flex;
+        flex-direction: column;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        overflow: hidden;
+      `;
+
+      console.log('[AdSkipper] 面板元素已创建');
+
+      // 标题栏
+      const header = document.createElement('div');
+      header.style.cssText = `
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 20px 24px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: #fff;
+      `;
+      header.innerHTML = `
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span style="font-size: 24px;">🤖</span>
+          <div>
+            <div style="font-size: 18px; font-weight: bold;">AI视频分析报告</div>
+            <div style="font-size: 12px; opacity: 0.8;">通义千问 Qwen-VL</div>
+          </div>
+        </div>
+        <button id="adskipper-close-analysis" style="
+          background: rgba(255,255,255,0.2);
+          border: none;
+          color: #fff;
+          font-size: 24px;
+          width: 32px;
+          height: 32px;
+          border-radius: 50%;
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        ">×</button>
+      `;
+
+      // 内容区域
+      const content = document.createElement('div');
+      content.style.cssText = `
+        overflow-y: auto;
+        flex: 1;
+        padding: 24px;
+        color: #fff;
+      `;
+
+      // 构建HTML内容
+      let html = '';
+
+      // 标题和标签
+      if (analysis.title || (analysis.tags && analysis.tags.length)) {
+        html += '<div style="margin-bottom: 20px;">';
+        if (analysis.title) {
+          html += `<h2 style="font-size: 16px; margin-bottom: 8px;">${this.escapeHtml(analysis.title)}</h2>`;
+        }
+        if (analysis.tags && analysis.tags.length) {
+          html += '<div style="display: flex; flex-wrap: wrap; gap: 8px;">';
+          analysis.tags.forEach(tag => {
+            html += `<span style="background: rgba(251, 114, 153, 0.2); color: #FB7299; padding: 4px 12px; border-radius: 12px; font-size: 12px;">${this.escapeHtml(tag)}</span>`;
+          });
+          html += '</div>';
+        }
+        html += '</div>';
+      }
+
+      // 整体总结
+      if (analysis.summary) {
+        html += '<div style="margin-bottom: 20px;">';
+        html += '<h3 style="color: #FB7299; font-size: 14px; margin-bottom: 12px;">📝 内容总结</h3>';
+        html += `
+          <div style="background: rgba(251, 114, 153, 0.1); padding: 16px; border-radius: 8px; border-left: 3px solid #FB7299;">
+            <div style="font-size: 14px; line-height: 1.6; color: #e0e0e0;">${this.escapeHtml(analysis.summary)}</div>
+          </div>
+        `;
+        html += '</div>';
+      }
+
+      // 时间段分析
+      if (analysis.segments && analysis.segments.length) {
+        html += '<div style="margin-bottom: 20px;">';
+        html += '<h3 style="color: #409eff; font-size: 14px; margin-bottom: 12px;">📺 内容分段</h3>';
+        analysis.segments.forEach((seg, idx) => {
+          html += `
+            <div style="background: rgba(255,255,255,0.05); padding: 12px; border-radius: 8px; margin-bottom: 8px; border-left: 3px solid #409eff;">
+              <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                <span style="color: #409eff; font-weight: bold;">${this.escapeHtml(seg.title || `段落 ${idx + 1}`)}</span>
+                <span style="color: #888; font-size: 12px;">${this.escapeHtml(seg.time_range || '')}</span>
+              </div>
+              <div style="font-size: 13px; color: #ccc; margin-bottom: 8px;">${this.escapeHtml(seg.summary || '')}</div>
+            </div>
+          `;
+        });
+        html += '</div>';
+      }
+
+      // 知识点提取
+      if (analysis.knowledge_points && analysis.knowledge_points.length) {
+        html += '<div style="margin-bottom: 20px;">';
+        html += '<h3 style="color: #67c23a; font-size: 14px; margin-bottom: 12px;">💡 知识点提取</h3>';
+        analysis.knowledge_points.forEach((kp, idx) => {
+          html += `
+            <div style="background: rgba(103, 194, 58, 0.1); padding: 12px; border-radius: 8px; margin-bottom: 8px; border-left: 3px solid #67c23a;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <div style="color: #67c23a; font-weight: bold;">${this.escapeHtml(kp.term || kp.topic || `知识点 ${idx + 1}`)}</div>
+                ${kp.timestamp
+                  ? `<span class="adskipper-time-jump" data-time="${this.escapeHtml(kp.timestamp)}" style="background: rgba(103, 194, 58, 0.3); color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; user-select: none;" title="点击跳转">⏱ ${this.escapeHtml(kp.timestamp)}</span>`
+                  : ''
+                }
+              </div>
+              <div style="font-size: 13px; color: #ccc;">${this.escapeHtml(kp.explanation || kp.description || '')}</div>
+            </div>
+          `;
+        });
+        html += '</div>';
+      }
+
+      // 热词和梗
+      if (analysis.hot_words && analysis.hot_words.length) {
+        html += '<div style="margin-bottom: 20px;">';
+        html += '<h3 style="color: #e6a23c; font-size: 14px; margin-bottom: 12px;">🔥 热词和梗</h3>';
+        analysis.hot_words.forEach((hw, idx) => {
+          html += `
+            <div style="background: rgba(230, 162, 60, 0.1); padding: 12px; border-radius: 8px; margin-bottom: 8px; border-left: 3px solid #e6a23c;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <div style="color: #e6a23c; font-weight: bold; font-size: 15px;">${this.escapeHtml(hw.word || hw.term || `热词 ${idx + 1}`)}</div>
+                ${hw.timestamp
+                  ? `<span class="adskipper-time-jump" data-time="${this.escapeHtml(hw.timestamp)}" style="background: rgba(230, 162, 60, 0.3); color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; user-select: none;" title="点击跳转">⏱ ${this.escapeHtml(hw.timestamp)}</span>`
+                  : ''
+                }
+              </div>
+              <div style="font-size: 13px; color: #ccc;">${this.escapeHtml(hw.explanation || hw.meaning || '')}</div>
+            </div>
+          `;
+        });
+        html += '</div>';
+      }
+
+      content.innerHTML = html || '<div style="text-align: center; color: #888; padding: 40px;">暂无分析结果</div>';
+
+      // 底部按钮
+      const footer = document.createElement('div');
+      footer.style.cssText = `
+        padding: 16px 24px;
+        border-top: 1px solid rgba(255,255,255,0.1);
+        display: flex;
+        justify-content: flex-end;
+        gap: 12px;
+      `;
+      footer.innerHTML = `
+        <button id="adskipper-analysis-close-btn" style="
+          padding: 10px 20px;
+          background: #FB7299;
+          border: none;
+          border-radius: 6px;
+          color: #fff;
+          cursor: pointer;
+          font-size: 13px;
+          font-weight: bold;
+        ">关闭</button>
+      `;
+
+      panel.appendChild(header);
+      panel.appendChild(content);
+      panel.appendChild(footer);
+      document.body.appendChild(panel);
+
+      // 绑定事件
+      document.getElementById('adskipper-close-analysis').onclick = () => panel.remove();
+      document.getElementById('adskipper-analysis-close-btn').onclick = () => panel.remove();
+
+      // 时间跳转
+      panel.querySelectorAll('.adskipper-time-jump').forEach(el => {
+        el.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const timeStr = el.getAttribute('data-time');
+          const seconds = this.parseTimeStr(timeStr);
+          if (seconds >= 0) {
+            this.player.skipTo(seconds);
+            this.showToast(`✓ 跳转到 ${timeStr}`, 'success');
+          }
+        };
+      });
     }
 
     // 替换后的 checkSkip 方法
