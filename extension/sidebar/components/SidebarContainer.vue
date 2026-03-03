@@ -23,25 +23,26 @@
         :active-key="activeKey"
         :loading="loading"
         @seek="handleSeek"
+        @delete="handleDeleteRequest"
       />
     </div>
-  </aside>
 
-  <!-- Toggle tab when sidebar is hidden -->
-  <button
-    v-if="!visible"
-    class="vm-toggle-tab"
-    @click="handleShow"
-  >
-    <span class="vm-toggle-tab__icon">AI</span>
-  </button>
+    <ConfirmDialog
+      v-model="showDeleteDialog"
+      title="删除确认"
+      :message="deleteDialogMessage"
+      @confirm="handleDeleteConfirm"
+      @cancel="handleDeleteCancel"
+    />
+  </aside>
 </template>
 
 <script setup>
-import { computed } from 'vue';
+import { ref, computed } from 'vue';
 import SidebarHeader from './SidebarHeader.vue';
 import SummaryCard from './SummaryCard.vue';
 import TimelineList from './TimelineList.vue';
+import ConfirmDialog from './ConfirmDialog.vue';
 
 const props = defineProps({
   visible: {
@@ -90,11 +91,18 @@ const props = defineProps({
   }
 });
 
-const emit = defineEmits(['update:visible', 'seek', 'refresh']);
+const emit = defineEmits(['update:visible', 'seek', 'refresh', 'delete']);
 
-function handleShow() {
-  emit('update:visible', true);
-}
+// Delete dialog state
+const showDeleteDialog = ref(false);
+const pendingDeleteId = ref(null);
+
+const deleteDialogMessage = computed(() => {
+  if (pendingDeleteId.value) {
+    return `确定要删除这个标注片段吗？\n此操作无法撤销。`;
+  }
+  return '确定要删除这个标注片段吗？';
+});
 
 function handleClose() {
   emit('update:visible', false);
@@ -107,6 +115,22 @@ function handleRefresh() {
 function handleSeek(time) {
   emit('seek', time);
 }
+
+function handleDeleteRequest(segmentId) {
+  pendingDeleteId.value = segmentId;
+  showDeleteDialog.value = true;
+}
+
+function handleDeleteConfirm() {
+  if (pendingDeleteId.value !== null) {
+    emit('delete', pendingDeleteId.value);
+    pendingDeleteId.value = null;
+  }
+}
+
+function handleDeleteCancel() {
+  pendingDeleteId.value = null;
+}
 </script>
 
 <style scoped>
@@ -117,22 +141,42 @@ function handleSeek(time) {
   height: calc(100vh - 64px) !important;
   width: 380px !important;
   z-index: 2147483647 !important;
-  
-  /* 极致毛玻璃高级感 (Glassmorphism) */
-  background-color: rgba(255, 255, 255, 0.75);
-  backdrop-filter: saturate(180%) blur(24px);
-  -webkit-backdrop-filter: saturate(180%) blur(24px);
-  
+
+  /* Crystal Glass 多层毛玻璃效果 */
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.95) 0%, rgba(255, 245, 248, 0.82) 30%, rgba(255, 255, 255, 0.75) 100%),
+    var(--vm-gradient-soft);
+  backdrop-filter: saturate(180%) blur(28px);
+  -webkit-backdrop-filter: saturate(180%) blur(28px);
+
+  /* 精致的光影边框 */
   border-radius: 16px 0 0 16px;
-  border-left: 1px solid rgba(255, 255, 255, 0.4);
-  box-shadow: -8px 0 32px rgba(0, 0, 0, 0.08);
-  
+  border-left: 1px solid rgba(255, 255, 255, 0.7);
+  border-top: 1px solid rgba(255, 255, 255, 0.5);
+  box-shadow:
+    -12px 0 40px rgba(251, 114, 153, 0.06),
+    -4px 0 20px rgba(0, 0, 0, 0.04),
+    inset 1px 0 0 rgba(255, 255, 255, 0.9),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95);
+
   transform: translateX(0);
   transition: transform 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
   overflow: hidden;
   display: flex;
   flex-direction: column;
   font-family: var(--vm-font-family);
+}
+
+.vm-sidebar::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 120px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.6) 0%, transparent 100%);
+  pointer-events: none;
+  border-radius: 16px 0 0 0;
 }
 
 .vm-sidebar--hidden {
@@ -143,34 +187,5 @@ function handleSeek(time) {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
-}
-
-.vm-toggle-tab {
-  position: fixed;
-  right: 0;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 32px;
-  height: 80px;
-  background: var(--vm-color-primary);
-  color: white;
-  border: none;
-  border-radius: 8px 0 0 8px;
-  cursor: pointer;
-  z-index: 99998;
-  box-shadow: -2px 0 10px rgba(251, 114, 153, 0.3);
-  transition: all 0.2s;
-}
-
-.vm-toggle-tab:hover {
-  width: 36px;
-  box-shadow: -4px 0 15px rgba(251, 114, 153, 0.5);
-}
-
-.vm-toggle-tab__icon {
-  writing-mode: vertical-rl;
-  font-weight: 600;
-  font-size: 14px;
-  letter-spacing: 2px;
 }
 </style>

@@ -67,8 +67,29 @@ defineEmits(['close', 'refresh']);
   align-items: center;
   justify-content: space-between;
   padding: 16px;
-  border-bottom: 1px solid #eee;
-  background: var(--vm-bg-primary);
+  position: relative;
+
+  /* 毛玻璃背景 */
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.85) 0%, rgba(255, 255, 255, 0.65) 100%);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+/* 底部渐变分隔线 */
+.vm-header::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 16px;
+  right: 16px;
+  height: 1px;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    rgba(251, 114, 153, 0.2) 20%,
+    rgba(251, 114, 153, 0.15) 50%,
+    rgba(251, 114, 153, 0.2) 80%,
+    transparent 100%
+  );
 }
 
 .vm-header__left {
@@ -122,22 +143,31 @@ defineEmits(['close', 'refresh']);
   width: 32px;
   height: 32px;
   border: none;
-  background: #f0f0f0;
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.9) 0%, rgba(245, 245, 245, 0.8) 100%);
   border-radius: 8px;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   color: var(--vm-text-secondary);
-  transition: all 0.2s;
+  transition: all 0.2s cubic-bezier(0.2, 0.8, 0.2, 1);
+  box-shadow:
+    0 2px 6px rgba(0, 0, 0, 0.04),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.5);
 }
 
 .vm-header__btn:hover {
-  background: #e0e0e0;
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.95) 0%, rgba(240, 240, 240, 0.9) 100%);
   color: var(--vm-text-primary);
+  box-shadow:
+    0 4px 12px rgba(251, 114, 153, 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 1);
+  transform: translateY(-1px);
 }
 
 .vm-header__btn--refresh:hover {
   color: var(--vm-color-highlight);
+  background: linear-gradient(145deg, rgba(25, 118, 210, 0.08) 0%, rgba(255, 255, 255, 0.95) 100%);
 }
 </style>

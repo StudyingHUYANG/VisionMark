@@ -1,10 +1,10 @@
-import { createApp, reactive, readonly } from 'vue';
+import { createApp, h, reactive } from 'vue';
 import SidebarContainer from './components/SidebarContainer.vue';
 import './styles/variables.css';
 
 // Shared state - exported for main.js to access directly
 const sidebarState = reactive({
-  isVisible: true,
+  isVisible: false,
   isLoading: false,
   loadError: null,
   bvid: null,
@@ -21,30 +21,37 @@ const sidebarState = reactive({
  * @returns {Object} Controller object with methods to control the sidebar
  */
 export function createSidebar(container) {
-  const app = createApp(SidebarContainer, {
-    visible: sidebarState.isVisible,
-    bvid: sidebarState.bvid,
-    segmentCount: sidebarState.segments.length,
-    summary: sidebarState.aiSummary,
-    segments: readonly(sidebarState.segments),
-    activeKey: sidebarState.activeSegmentKey,
-    loading: sidebarState.isLoading,
-    error: sidebarState.loadError,
-    'onUpdate:visible': (value) => {
-      sidebarState.isVisible = value;
-    },
-    onSeek: (time) => {
-      window.dispatchEvent(new CustomEvent('visionmark:seek', {
-        detail: { time: Number(time) || 0 }
-      }));
-    },
-    onRefresh: () => {
-      window.dispatchEvent(new Event('visionmark:refresh-ai'));
+  const app = createApp({
+    name: 'VisionMarkSidebarRoot',
+    render() {
+      return h(SidebarContainer, {
+        visible: sidebarState.isVisible,
+        bvid: sidebarState.bvid,
+        segmentCount: sidebarState.segments.length,
+        summary: sidebarState.aiSummary,
+        segments: sidebarState.segments,
+        activeKey: sidebarState.activeSegmentKey,
+        loading: sidebarState.isLoading,
+        error: sidebarState.loadError,
+        'onUpdate:visible': (value) => {
+          sidebarState.isVisible = value;
+        },
+        onSeek: (time) => {
+          window.dispatchEvent(new CustomEvent('visionmark:seek', {
+            detail: { time: Number(time) || 0 }
+          }));
+        },
+        onRefresh: () => {
+          window.dispatchEvent(new Event('visionmark:refresh-ai'));
+        },
+        onDelete: (segmentId) => {
+          window.dispatchEvent(new CustomEvent('visionmark:delete-segment', {
+            detail: { segmentId: Number(segmentId) }
+          }));
+        }
+      });
     }
   });
-
-  // Watch state changes and update props
-  const unwatch = app.config.globalProperties.$watchEffect = () => {};
 
   const instance = app.mount(container);
 

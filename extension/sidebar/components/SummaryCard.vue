@@ -47,14 +47,40 @@ const displaySummary = computed(() => {
 .vm-summary {
   margin: 12px 16px;
   padding: 16px;
-  background: linear-gradient(135deg, #f8f9fa 0%, #fff5f8 100%);
+  position: relative;
+
+  /* 水晶玻璃卡片效果 */
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.92) 0%, rgba(255, 248, 250, 0.88) 50%, rgba(255, 245, 248, 0.85) 100%);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   border-radius: 12px;
+
+  /* 精致光影 */
+  box-shadow:
+    0 4px 20px rgba(251, 114, 153, 0.06),
+    0 2px 8px rgba(0, 0, 0, 0.02),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95),
+    inset 0 -1px 0 rgba(251, 114, 153, 0.03);
+
+  border: 1px solid rgba(255, 255, 255, 0.6);
   min-height: 80px;
-  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.03);
+}
+
+/* 装饰性高光 */
+.vm-summary::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 50%;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.4) 0%, transparent 100%);
+  border-radius: 12px 12px 0 0;
+  pointer-events: none;
 }
 
 .vm-summary--loading {
-  background: rgba(255, 255, 255, 0.6);
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.7) 0%, rgba(255, 255, 255, 0.6) 100%);
 }
 
 .vm-summary__text {
