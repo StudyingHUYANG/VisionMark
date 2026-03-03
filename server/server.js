@@ -136,10 +136,12 @@ app.get('/api/v1/health', (req, res) => res.json({ ok: true }));
 // 引入路由文件
 const statsRouter = require('./routes/stats.js');
 const segmentsRouter = require('./routes/segments.js');
+const videoAnalysisRouter = require('./routes/videoAnalysis.js');
 
 // 注册路由
 app.use('/api/v1/stats', statsRouter);
 app.use('/api/v1/segments', segmentsRouter); // 补充批量/删除接口，和原有segments接口合并
+app.use('/video-analysis', videoAnalysisRouter); // AI视频分析路由
 
 // Get user's all segments
 app.get('/api/v1/segments/user', authenticateToken, (req, res) => {
