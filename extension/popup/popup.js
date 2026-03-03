@@ -3,6 +3,91 @@ const API_BASE = window.LOCAL_CONFIG
   ? window.LOCAL_CONFIG.API_BASE + '/' + window.LOCAL_CONFIG.API_VERSION
   : 'http://localhost:8080/api/v1';
 
+const NETWORK_ERROR_CODE = 'NETWORK_UNAVAILABLE';
+const NETWORK_COOLDOWN_MS = 30000;
+const NETWORK_TIMEOUT_MS = 6000;
+const USER_CACHE_TTL_MS = 5000;
+
+const networkState = {
+  offlineUntil: 0,
+  hasLoggedOffline: false,
+  wasOffline: false
+};
+
+const userInfoCache = {
+  data: null,
+  updatedAt: 0,
+  pending: null
+};
+
+function createNetworkUnavailableError() {
+  const error = new Error('Failed to fetch');
+  error.code = NETWORK_ERROR_CODE;
+  return error;
+}
+
+function isNetworkFailure(error) {
+  if (!error) return false;
+  if (error.name === 'AbortError') return true;
+  const message = String(error.message || '').toLowerCase();
+  if (message.includes('failed to fetch') || message.includes('networkerror') || message.includes('load failed')) {
+    return true;
+  }
+  return error instanceof TypeError;
+}
+
+function markNetworkOffline(error) {
+  networkState.offlineUntil = Date.now() + NETWORK_COOLDOWN_MS;
+  networkState.wasOffline = true;
+  if (!networkState.hasLoggedOffline) {
+    console.warn('[Popup] Backend unreachable, pausing requests for 30s.', error);
+    networkState.hasLoggedOffline = true;
+  }
+}
+
+function markNetworkOnline() {
+  if (networkState.wasOffline) {
+    console.info('[Popup] Backend connection restored.');
+  }
+  networkState.offlineUntil = 0;
+  networkState.hasLoggedOffline = false;
+  networkState.wasOffline = false;
+}
+
+async function safeFetch(url, options = {}) {
+  if (Date.now() < networkState.offlineUntil) {
+    throw createNetworkUnavailableError();
+  }
+
+  const controller = options.signal ? null : new AbortController();
+  const timeoutId = setTimeout(() => {
+    if (controller) controller.abort();
+  }, NETWORK_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: options.signal || (controller ? controller.signal : undefined)
+    });
+    clearTimeout(timeoutId);
+    markNetworkOnline();
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (isNetworkFailure(error)) {
+      markNetworkOffline(error);
+      throw createNetworkUnavailableError();
+    }
+    throw error;
+  }
+}
+
+function resetUserInfoCache() {
+  userInfoCache.data = null;
+  userInfoCache.updatedAt = 0;
+  userInfoCache.pending = null;
+}
+
 // 统一的API请求函数
 async function apiRequest(endpoint, options = {}) {
   try {
@@ -13,7 +98,7 @@ async function apiRequest(endpoint, options = {}) {
     };
     if (token) headers['Authorization'] = 'Bearer ' + token;
     
-    const res = await fetch(API_BASE + endpoint, {
+    const res = await safeFetch(API_BASE + endpoint, {
       ...options,
       headers
     });
@@ -28,7 +113,9 @@ async function apiRequest(endpoint, options = {}) {
     if (!res.ok) throw new Error(data.error || '请求失败');
     return data;
   } catch(err) {
-    console.error('API Error:', err);
+    if (err.code !== NETWORK_ERROR_CODE) {
+      console.error('API Error:', err);
+    }
     throw err;
   }
 }
@@ -54,6 +141,29 @@ async function checkAuth() {
   }
   showLoginForm();
   return false;
+}
+
+async function getCurrentUserInfo(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && userInfoCache.data && (now - userInfoCache.updatedAt) < USER_CACHE_TTL_MS) {
+    return userInfoCache.data;
+  }
+
+  if (!forceRefresh && userInfoCache.pending) {
+    return userInfoCache.pending;
+  }
+
+  userInfoCache.pending = apiRequest('/auth/me')
+    .then((data) => {
+      userInfoCache.data = data;
+      userInfoCache.updatedAt = Date.now();
+      return data;
+    })
+    .finally(() => {
+      userInfoCache.pending = null;
+    });
+
+  return userInfoCache.pending;
 }
 
 function showLoginForm() {
@@ -82,12 +192,12 @@ async function showUserPanel(user) {
 async function loadUserContributionCount() {
   try {
     // 首先获取当前用户的ID
-    const userInfo = await apiRequest('/auth/me');
+    const userInfo = await getCurrentUserInfo();
     const userId = await getUserIdByUsername(userInfo.username);
     
     if (userId) {
       // 调用用户贡献API获取标注总数
-      const response = await fetch(`${API_BASE}/stats/user/contributions?user_id=${userId}&page_size=1`);
+      const response = await safeFetch(`${API_BASE}/stats/user/contributions?user_id=${userId}&page_size=1`);
       if (response.ok) {
         const data = await response.json();
         if (data.code === 200) {
@@ -97,7 +207,9 @@ async function loadUserContributionCount() {
       }
     }
   } catch(err) {
-    console.error('[Popup] 获取标注数量失败:', err);
+    if (err.code !== NETWORK_ERROR_CODE) {
+      console.error('[Popup] 获取标注数量失败:', err);
+    }
     document.getElementById('display-count').textContent = '0';
   }
 }
@@ -118,12 +230,14 @@ async function getUserIdByUsername(username) {
     
     // 如果没有存储userId，则需要通过API获取
     // 这里假设登录API返回的用户信息包含userId
-    const loginData = await apiRequest('/auth/me');
+    const loginData = await getCurrentUserInfo();
     // 注意：当前的/auth/me API不返回userId，我们需要修改它或者添加新的端点
     
     return null;
   } catch(err) {
-    console.error('获取用户ID失败:', err);
+    if (err.code !== NETWORK_ERROR_CODE) {
+      console.error('获取用户ID失败:', err);
+    }
     return null;
   }
 }
@@ -131,7 +245,7 @@ async function getUserIdByUsername(username) {
 // 刷新用户信息（包括积分和标注数量）
 async function refreshUserInfo() {
   try {
-    const user = await apiRequest('/auth/me');
+    const user = await getCurrentUserInfo(true);
     // 更新localStorage
     localStorage.setItem('adskipper_user', JSON.stringify(user));
     // 更新显示
@@ -142,7 +256,9 @@ async function refreshUserInfo() {
     // 同时刷新标注数量
     await loadUserContributionCount();
   } catch(err) {
-    console.error('[Popup] 刷新用户信息失败:', err);
+    if (err.code !== NETWORK_ERROR_CODE) {
+      console.error('[Popup] 刷新用户信息失败:', err);
+    }
   }
 }
 
@@ -188,6 +304,9 @@ async function handleAuth() {
       chrome.storage.local.set({ adskipper_token: data.token }, () => {
         console.log('[Popup] Token已同步到chrome.storage.local');
       });
+      userInfoCache.data = data;
+      userInfoCache.updatedAt = Date.now();
+      userInfoCache.pending = null;
       showUserPanel(data);
     } else {
       showError('✓ 注册成功，请登录');
@@ -218,6 +337,7 @@ function toggleMode() {
 function logout() {
   localStorage.removeItem('adskipper_token');
   localStorage.removeItem('adskipper_user');
+  resetUserInfoCache();
   // 同时清理 chrome.storage.local
   chrome.storage.local.remove(['adskipper_token']);
   showLoginForm();

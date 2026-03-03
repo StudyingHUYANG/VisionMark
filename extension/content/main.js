@@ -15,6 +15,7 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
   class AdSkipperCore {
     constructor() {
       this.player = new BilibiliPlayerController();
+      this.sidebarController = null;
       this.segments = [];
       this.allSegments = [];
       this.aiSummary = '';
@@ -36,6 +37,13 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
       // 存储当前视频的标注 ID（用于删除）
       this.currentSegmentIds = [];
       this.isLoadingSegments = false;
+      this.networkState = {
+        offlineUntil: 0,
+        hasLoggedOffline: false,
+        wasOffline: false
+      };
+      this.networkCooldownMs = 30000;
+      this.networkTimeoutMs = 6000;
 
 
     }
@@ -72,6 +80,7 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         // ==========================
         // Vue 侧边栏初始化
         // ==========================
+        this.initSidebar();
         this.initAiFloatingButton();
 
         this.player.onTimeUpdate = (t) => this.checkSkip(t);
@@ -92,26 +101,22 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
           this.togglePopover(false);
         }
 
-        const aiButton = document.getElementById('visionmark-ai-fab');
-        const aiPanel = document.getElementById('adskipper-segment-panel');
-        if (aiPanel && aiButton && !aiPanel.contains(e.target) && !aiButton.contains(e.target)) {
-          aiPanel.remove();
-        }
       });
 
       // ESC key listener
       document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
           this.togglePopover(false);
-          const aiPanel = document.getElementById('adskipper-segment-panel');
-          if (aiPanel) aiPanel.remove();
+          if (this.sidebarController) {
+            this.sidebarController.hide();
+          }
         }
       });
 
       // Listen for messages from popup
       chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (message.action === 'showSegmentMarkers') {
-          this.handleShowMarkers();
+          this.showSidebar({ refresh: true });
           sendResponse({ success: true });
         }
       });
@@ -128,13 +133,24 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         }
       });
 
+      window.addEventListener('visionmark:delete-segment', (event) => {
+        const segmentId = Number(event?.detail?.segmentId);
+        this.handleSidebarDelete(segmentId);
+      });
+
       // 调试：将实例暴露到全局，便于控制台调试
       window.adSkipperDebug = this;
       console.log('[AdSkipper] 调试模式已启用，使用: adSkipperDebug.addSegmentMarkers() 手动添加标记');
     }
 
     initSidebar() {
-      if (document.getElementById('vm-sidebar-root')) return;
+      if (this.sidebarController) return;
+
+      const existingRoot = document.getElementById('vm-sidebar-root');
+      if (existingRoot) {
+        this.sidebarController = createSidebar(existingRoot);
+        return;
+      }
 
       const root = document.createElement('div');
       root.id = 'vm-sidebar-root';
@@ -186,10 +202,50 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
       button.setAttribute('aria-label', 'AI video summary');
       button.onclick = (event) => {
         event.stopPropagation();
-        this.handleShowMarkers();
+        this.toggleSidebar();
       };
 
       document.body.appendChild(button);
+    }
+
+    ensureSidebarReady() {
+      if (this.sidebarController) return true;
+      this.initSidebar();
+      return Boolean(this.sidebarController);
+    }
+
+    showSidebar(options = {}) {
+      if (!this.ensureSidebarReady()) return;
+
+      if (options.refresh && this.player.currentBvid) {
+        this.loadSegments(this.player.currentBvid);
+      }
+
+      this.sidebarController.show();
+    }
+
+    toggleSidebar() {
+      if (!this.ensureSidebarReady()) return;
+      this.sidebarController.toggle();
+    }
+
+    async handleSidebarDelete(segmentId) {
+      if (!Number.isFinite(segmentId) || segmentId <= 0) {
+        this.showToast('当前片段不支持删除', 'info');
+        return;
+      }
+
+      // Confirmation is now handled by Vue ConfirmDialog component
+      // This method is called after user confirms deletion
+      try {
+        await this.deleteAnnotation(segmentId);
+        if (this.player.currentBvid) {
+          await this.loadSegments(this.player.currentBvid);
+        }
+        this.showToast('删除成功', 'success');
+      } catch (error) {
+        this.showToast('删除失败: ' + error.message, 'error');
+      }
     }
 
     getPage() {
@@ -205,6 +261,68 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
       });
     }
 
+    createNetworkUnavailableError() {
+      const error = new Error('Failed to fetch');
+      error.code = 'NETWORK_UNAVAILABLE';
+      return error;
+    }
+
+    isNetworkFailure(error) {
+      if (!error) return false;
+      if (error.name === 'AbortError') return true;
+      const message = String(error.message || '').toLowerCase();
+      if (message.includes('failed to fetch') || message.includes('networkerror') || message.includes('load failed')) {
+        return true;
+      }
+      return error instanceof TypeError;
+    }
+
+    markNetworkOffline(context, error) {
+      this.networkState.offlineUntil = Date.now() + this.networkCooldownMs;
+      this.networkState.wasOffline = true;
+      if (!this.networkState.hasLoggedOffline) {
+        console.warn(`[AdSkipper] Backend unreachable during ${context}, pausing requests for 30s.`, error);
+        this.networkState.hasLoggedOffline = true;
+      }
+    }
+
+    markNetworkOnline() {
+      if (this.networkState.wasOffline) {
+        console.info('[AdSkipper] Backend connection restored.');
+      }
+      this.networkState.offlineUntil = 0;
+      this.networkState.hasLoggedOffline = false;
+      this.networkState.wasOffline = false;
+    }
+
+    async safeFetch(url, options = {}, context = 'request') {
+      if (Date.now() < this.networkState.offlineUntil) {
+        throw this.createNetworkUnavailableError();
+      }
+
+      const controller = options.signal ? null : new AbortController();
+      const timeoutId = setTimeout(() => {
+        if (controller) controller.abort();
+      }, this.networkTimeoutMs);
+
+      try {
+        const response = await fetch(url, {
+          ...options,
+          signal: options.signal || (controller ? controller.signal : undefined)
+        });
+        clearTimeout(timeoutId);
+        this.markNetworkOnline();
+        return response;
+      } catch (error) {
+        clearTimeout(timeoutId);
+        if (this.isNetworkFailure(error)) {
+          this.markNetworkOffline(context, error);
+          throw this.createNetworkUnavailableError();
+        }
+        throw error;
+      }
+    }
+
     async loadSegments(bvid) {
       if (!bvid || this.isLoadingSegments) return;
       this.isLoadingSegments = true;
@@ -216,7 +334,7 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         const skipTypes = storage.skip_types || ['hard_ad', 'soft_ad', 'product_placement'];
 
         const url = API_BASE + "/segments?bvid=" + bvid + "&page=" + this.getPage();
-        const res = await fetch(url);
+        const res = await this.safeFetch(url, {}, 'load segments');
         if (!res.ok) {
           throw new Error("Failed to load segments: " + res.status);
         }
@@ -234,6 +352,8 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         });
         this.aiSummary = typeof data.ai_summary === 'string' ? data.ai_summary.trim() : '';
         this.currentSegmentIds = this.segments.map(seg => seg.id).filter(id => id);
+        sidebarState.bvid = bvid;
+        sidebarState.cid = this.player.currentCid || null;
 
         sidebarState.aiSummary = this.aiSummary || '暂无 AI 总结';
         sidebarState.segments = this.segments;
@@ -241,12 +361,16 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
 
         this.addSegmentMarkers();
       } catch (error) {
-        console.error('[AdSkipper] Load segments failed:', error);
+        if (error.code !== 'NETWORK_UNAVAILABLE') {
+          console.error('[AdSkipper] Load segments failed:', error);
+        }
         this.segments = [];
         this.allSegments = [];
         this.currentSegmentIds = [];
+        sidebarState.bvid = bvid;
+        sidebarState.cid = this.player.currentCid || null;
         sidebarState.segments = [];
-        sidebarState.aiSummary = sidebarState.aiSummary || 'AI 总结加载失败';
+        sidebarState.aiSummary = 'AI 总结加载失败';
         sidebarState.loadError = error.message || 'load failed';
       } finally {
         this.isLoadingSegments = false;
@@ -460,47 +584,6 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
           .adskipper-toggle-text { display: block; font-size: 13px; font-weight: 500; }
           .is-compact #adskipper-toggle { padding: 0 6px !important; justify-content: center; }
           #adskipper-toggle:hover { filter: brightness(1.1); }
-          #adskipper-confirm-dialog {
-            position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            background: rgba(20, 20, 20, 0.98);
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255,255,255,0.1);
-            border-radius: 8px;
-            padding: 20px;
-            z-index: 999999;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.6);
-            color: #fff;
-            min-width: 300px;
-          }
-          #adskipper-confirm-dialog h3 {
-            margin: 0 0 15px 0;
-            font-size: 16px;
-            color: #FB7299;
-          }
-          #adskipper-confirm-dialog .btn-group {
-            display: flex;
-            gap: 10px;
-            justify-content: flex-end;
-            margin-top: 20px;
-          }
-          #adskipper-confirm-dialog button {
-            padding: 6px 16px;
-            border-radius: 4px;
-            border: none;
-            cursor: pointer;
-            font-size: 14px;
-          }
-          #adskipper-confirm-ok {
-            background: #FB7299;
-            color: white;
-          }
-          #adskipper-confirm-cancel {
-            background: #555;
-            color: white;
-          }
         `;
         document.head.appendChild(style);
       }
@@ -695,7 +778,8 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         }
 
         const targetId = self.currentSegmentIds[self.currentSegmentIds.length - 1];
-        const confirmed = await self.showConfirmDialog('确认删除', `删除最近标注 ID: ${targetId} ?`);
+        // Use native confirm for control panel popover (dark theme UI)
+        const confirmed = confirm(`确定删除最近标注 ID: ${targetId} ?`);
         if (!confirmed) return;
 
         btnDelete.textContent = '删除中...';
@@ -778,49 +862,6 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
       }, 200);
     }
 
-    showConfirmDialog(title, message) {
-      return new Promise((resolve) => {
-        // 移除已存在的对话框
-        const oldDialog = document.getElementById('adskipper-confirm-dialog');
-        if (oldDialog) oldDialog.remove();
-
-        // 创建对话框
-        const dialog = document.createElement('div');
-        dialog.id = 'adskipper-confirm-dialog';
-        dialog.innerHTML = `
-          <h3>${title}</h3>
-          <p>${message}</p>
-          <div class="btn-group">
-            <button id="adskipper-confirm-cancel">取消</button>
-            <button id="adskipper-confirm-ok">确认</button>
-          </div>
-        `;
-        document.body.appendChild(dialog);
-
-        // 绑定事件
-        document.getElementById('adskipper-confirm-ok').onclick = () => {
-          dialog.remove();
-          resolve(true);
-        };
-        document.getElementById('adskipper-confirm-cancel').onclick = () => {
-          dialog.remove();
-          resolve(false);
-        };
-
-        // 点击外部关闭
-        const clickOutsideHandler = (e) => {
-          if (!dialog.contains(e.target)) {
-            dialog.remove();
-            resolve(false);
-            document.removeEventListener('click', clickOutsideHandler);
-          }
-        };
-        setTimeout(() => {
-          document.addEventListener('click', clickOutsideHandler);
-        }, 0);
-      });
-    }
-
     // 调用删除 API
     async deleteAnnotation(segmentId) {
       const storage = await new Promise(r => chrome.storage.local.get(['adskipper_token'], r));
@@ -837,10 +878,10 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
 
       console.log("[AdSkipper] 准备删除标注 ID:", segmentId);
 
-      const res = await fetch(`${API_BASE}/segments/${segmentId}`, {
+      const res = await this.safeFetch(`${API_BASE}/segments/${segmentId}`, {
         method: "DELETE",
         headers: headers
-      });
+      }, 'delete annotation');
 
       if (!res.ok) {
         let errorMsg = "删除失败";
@@ -930,11 +971,11 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
 
       console.log('[AdSkipper] Request headers:', headers);
 
-      const res = await fetch(API_BASE + "/segments", {
+      const res = await this.safeFetch(API_BASE + "/segments", {
         method: "POST",
         headers: headers,
         body: JSON.stringify(body)
-      });
+      }, 'submit annotation');
 
       if (!res.ok) {
         let errorMsg = 'Submit failed';
@@ -1254,160 +1295,7 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
     }
 
     handleShowMarkers() {
-      const safeSegments = Array.isArray(this.segments) ? this.segments : [];
-      if (!safeSegments.length) {
-        this.showToast('No segments found for this video', 'info');
-      }
-
-      const existingPanel = document.getElementById('adskipper-segment-panel');
-      if (existingPanel) {
-        existingPanel.remove();
-        return;
-      }
-
-      const panel = document.createElement('div');
-      panel.id = 'adskipper-segment-panel';
-      panel.style.cssText = `
-        position: fixed;
-        bottom: 20px;
-        right: 20px;
-        width: min(420px, 88vw);
-        max-height: 64vh;
-        background: #131d30;
-        border-radius: 12px;
-        box-shadow: 0 10px 36px rgba(0,0,0,0.52);
-        border: 1px solid rgba(99, 169, 255, 0.35);
-        z-index: 999999;
-        display: flex;
-        flex-direction: column;
-        font-family: "Segoe UI", "PingFang SC", sans-serif;
-      `;
-
-      const header = document.createElement('div');
-      header.style.cssText = `
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 14px 16px;
-        border-bottom: 1px solid rgba(255,255,255,0.12);
-        background: rgba(65, 146, 255, 0.10);
-      `;
-      header.innerHTML = `
-        <span style="color: #9fd2ff; font-weight: 700; font-size: 15px;">AI 片段列表 (${safeSegments.length})</span>
-        <button id="adskipper-close-panel" style="background:none;border:none;color:#b8cee6;font-size:20px;cursor:pointer;">×</button>
-      `;
-
-      const summaryBlock = document.createElement('div');
-      summaryBlock.style.cssText = `
-        margin: 10px 10px 0;
-        padding: 10px 12px;
-        border-radius: 8px;
-        background: rgba(255,255,255,0.06);
-        color: #cfe1ff;
-        font-size: 12px;
-        line-height: 1.5;
-        white-space: pre-wrap;
-        max-height: 120px;
-        overflow-y: auto;
-      `;
-      summaryBlock.textContent = this.aiSummary || '暂无 AI 总结';
-
-      const list = document.createElement('div');
-      list.id = 'adskipper-segment-list';
-      list.style.cssText = 'overflow-y:auto;flex:1;padding:10px;display:flex;flex-direction:column;gap:8px;';
-
-      safeSegments.forEach((segment, index) => {
-        const item = document.createElement('div');
-        item.style.cssText = `
-          display:flex;
-          flex-direction:column;
-          gap:8px;
-          padding:10px;
-          background:rgba(255,255,255,0.04);
-          border-radius:8px;
-          border-left:4px solid ${segment.action === 'popup' ? '#4aa8ff' : '#fb7299'};
-        `;
-
-        const actionLabel = segment.action === 'popup' ? '重点弹窗' : '自动跳过';
-        const content = segment.action === 'popup' ? (segment.content || '该片段暂无文案') : '该片段默认执行跳过';
-        const segmentId = segment.id;
-        const canDelete = Number.isFinite(Number(segmentId)) && Number(segmentId) > 0;
-
-        item.innerHTML = `
-          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
-            <div style="color:#fff;font-size:13px;">
-              <span style="color:#9fd2ff;">${segment.start_time.toFixed(1)}s</span> -
-              <span style="color:#9fd2ff;">${segment.end_time.toFixed(1)}s</span>
-            </div>
-            <span style="font-size:11px;color:#d8ecff;background:${segment.action === 'popup' ? 'rgba(74,168,255,.35)' : 'rgba(251,114,153,.35)'};padding:2px 7px;border-radius:99px;">
-              ${actionLabel}
-            </span>
-          </div>
-          <div style="font-size:12px;color:#c3d8ee;line-height:1.45;">${content}</div>
-          <div style="display:flex;justify-content:flex-end;gap:8px;">
-            <button data-index="${index}" class="adskipper-jump-btn" style="padding:5px 12px;background:#4aa8ff;border:none;border-radius:4px;color:#fff;font-size:12px;cursor:pointer;">跳转</button>
-            <button data-id="${canDelete ? segmentId : ''}" class="adskipper-delete-btn" ${canDelete ? '' : 'disabled'} style="padding:5px 12px;background:${canDelete ? '#42546f' : '#374255'};border:none;border-radius:4px;color:${canDelete ? '#fff' : '#8898ad'};font-size:12px;cursor:${canDelete ? 'pointer' : 'not-allowed'};">删除</button>
-          </div>
-        `;
-
-        list.appendChild(item);
-      });
-
-      if (!safeSegments.length) {
-        const empty = document.createElement('div');
-        empty.style.cssText = 'padding: 16px 10px; text-align: center; color: #9fb6d8; font-size: 12px;';
-        empty.textContent = '当前视频暂无可用片段';
-        list.appendChild(empty);
-      }
-
-      panel.appendChild(header);
-      panel.appendChild(summaryBlock);
-      panel.appendChild(list);
-      document.body.appendChild(panel);
-
-      document.getElementById('adskipper-close-panel').onclick = () => panel.remove();
-
-      document.querySelectorAll('.adskipper-jump-btn').forEach(button => {
-        button.onclick = () => {
-          const index = Number(button.getAttribute('data-index'));
-          const segment = safeSegments[index];
-          this.seekToSegmentStart(segment);
-          this.showToast(`跳转到 ${segment.start_time.toFixed(1)}s`, 'success');
-        };
-      });
-
-      document.querySelectorAll('.adskipper-delete-btn').forEach(button => {
-        button.onclick = async () => {
-          const rawId = button.getAttribute('data-id');
-          const deleteId = Number(rawId);
-          if (!Number.isFinite(deleteId) || deleteId <= 0) {
-            this.showToast('当前片段不支持删除', 'info');
-            return;
-          }
-
-          if (!confirm(`确定删除标注 ${deleteId} 吗？`)) return;
-
-          try {
-            await this.deleteAnnotation(deleteId);
-            this.segments = this.segments.filter(item => Number(item.id) !== deleteId);
-            sidebarState.segments = this.segments;
-            this.currentSegmentIds = this.currentSegmentIds.filter(id => Number(id) !== deleteId);
-            button.closest('div').parentElement.remove();
-
-            const titleSpan = header.querySelector('span');
-            titleSpan.textContent = `AI 片段列表 (${this.segments.length})`;
-
-            this.showToast('删除成功', 'success');
-            if (this.segments.length === 0) {
-              panel.remove();
-            }
-          } catch (error) {
-            this.showToast('删除失败: ' + error.message, 'error');
-          }
-        };
-      });
-
-      this.showToast(`已显示 ${safeSegments.length} 条片段`, 'success');
+      this.showSidebar({ refresh: true });
     }
   }
 
