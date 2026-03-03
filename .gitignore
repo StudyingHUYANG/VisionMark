@@ -23,3 +23,6 @@ node_modules/
 *.log
 .DS_Store
 
+# 忽略下载的视频和关键帧
+downloads/
+

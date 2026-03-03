@@ -1,3 +1,6 @@
+// 加载环境变量（必须在最前面）
+require('dotenv').config();
+
 const { authenticateToken } = require('./middlewares/auth.js');
 const express = require('express');
 const Database = require('better-sqlite3');
