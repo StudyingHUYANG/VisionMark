@@ -27,6 +27,13 @@ db.exec(`
     password_hash TEXT NOT NULL,
     points INTEGER DEFAULT 0
   );
+
+  CREATE TABLE IF NOT EXISTS user_points (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    total_points INTEGER DEFAULT 0,
+    tier TEXT DEFAULT 'bronze'
+  );
   
   CREATE TABLE IF NOT EXISTS videos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
