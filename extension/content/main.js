@@ -1,7 +1,14 @@
-import { createSidebar, sidebarState } from '../sidebar/index.js';
-
 (function () {
+  'use strict';
+
   if (window.adSkipper) return;
+
+  // Sidebar state (will be initialized when sidebar loads)
+  let sidebarState = null;
+
+  // API 基础路径
+  const API_BASE = window.API_BASE || 'http://localhost:8080/api/v1';
+  const VIDEO_ANALYSIS_BASE = window.LOCAL_CONFIG?.API_BASE || 'http://localhost:8080';
 
   // 广告类型标签映射
   const typeLabels = {
@@ -80,7 +87,12 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         // ==========================
         // Vue 侧边栏初始化
         // ==========================
-        this.initSidebar();
+        this.initSidebar().then(() => {
+          console.log("[AdSkipper] Sidebar 初始化完成");
+        }).catch(err => {
+          console.error("[AdSkipper] Sidebar 初始化失败:", err);
+        });
+
         this.initAiFloatingButton();
 
         this.player.onTimeUpdate = (t) => this.checkSkip(t);
@@ -118,14 +130,6 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         }
       });
 
-      // Listen for messages from popup
-      chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-        if (message.action === 'showSegmentMarkers') {
-          this.showSidebar({ refresh: true });
-          sendResponse({ success: true });
-        }
-      });
-
       window.addEventListener('visionmark:seek', (event) => {
         const time = Number(event?.detail?.time);
         if (!Number.isFinite(time)) return;
@@ -148,8 +152,14 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
       console.log('[AdSkipper] 调试模式已启用，使用: adSkipperDebug.addSegmentMarkers() 手动添加标记');
     }
 
-    initSidebar() {
+    async initSidebar() {
       if (this.sidebarController) return;
+
+      // 动态导入 sidebar 模块
+      const { createSidebar, sidebarState: importedSidebarState } = await import('../sidebar/index.js');
+
+      // 将导入的 sidebarState 赋值给局部变量
+      sidebarState = importedSidebarState;
 
       const existingRoot = document.getElementById('vm-sidebar-root');
       if (existingRoot) {
@@ -166,15 +176,18 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
     }
 
     initAiFloatingButton() {
+      console.log("[AdSkipper] 创建AI浮动按钮...");
+
       if (!document.getElementById('visionmark-ai-fab-style')) {
+        console.log("[AdSkipper] 添加AI按钮样式...");
         const style = document.createElement('style');
         style.id = 'visionmark-ai-fab-style';
         style.textContent = `
           #visionmark-ai-fab {
-            position: fixed;
-            right: 20px;
-            bottom: 20px;
-            z-index: 2147483647;
+            position: fixed !important;
+            left: 20px !important;
+            top: 100px !important;
+            z-index: 2147483647 !important;
             min-width: 46px;
             height: 46px;
             border: none;
@@ -188,6 +201,9 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
             box-shadow: 0 10px 28px rgba(251, 114, 153, 0.45);
             transition: transform 0.18s ease, box-shadow 0.18s ease;
             padding: 0 16px;
+            display: block !important;
+            visibility: visible !important;
+            opacity: 1 !important;
           }
           #visionmark-ai-fab:hover {
             transform: translateY(-2px);
@@ -195,10 +211,15 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
           }
         `;
         document.head.appendChild(style);
+        console.log("[AdSkipper] AI按钮样式已添加");
       }
 
-      if (document.getElementById('visionmark-ai-fab')) return;
+      if (document.getElementById('visionmark-ai-fab')) {
+        console.log("[AdSkipper] AI按钮已存在，跳过创建");
+        return;
+      }
 
+      console.log("[AdSkipper] 创建AI按钮DOM元素...");
       const button = document.createElement('button');
       button.id = 'visionmark-ai-fab';
       button.type = 'button';
@@ -211,6 +232,24 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
       };
 
       document.body.appendChild(button);
+      console.log("[AdSkipper] ✅ AI按钮已创建并添加到body");
+
+      // 验证按钮是否真的在DOM中并检查位置
+      setTimeout(() => {
+        const btn = document.getElementById('visionmark-ai-fab');
+        if (btn) {
+          const rect = btn.getBoundingClientRect();
+          console.log("[AdSkipper] ✅ 验证：AI按钮在DOM中");
+          console.log("[AdSkipper] 📍 位置信息:");
+          console.log("  - 尺寸:", btn.offsetWidth, "x", btn.offsetHeight);
+          console.log("  - 屏幕位置:", rect.left, ",", rect.top);
+          console.log("  - right/top:", rect.right, ",", rect.bottom);
+          console.log("  - 在视口内:", rect.top >= 0 && rect.left >= 0 && rect.bottom <= window.innerHeight && rect.right <= window.innerWidth);
+          console.log("  - z-index:", window.getComputedStyle(btn).zIndex);
+        } else {
+          console.error("[AdSkipper] ❌ 错误：AI按钮创建后未在DOM中找到！");
+        }
+      }, 100);
     }
 
     ensureSidebarReady() {
@@ -331,8 +370,10 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
     async loadSegments(bvid) {
       if (!bvid || this.isLoadingSegments) return;
       this.isLoadingSegments = true;
-      sidebarState.isLoading = true;
-      sidebarState.loadError = null;
+      if (sidebarState) {
+        sidebarState.isLoading = true;
+        sidebarState.loadError = null;
+      }
 
       try {
         const storage = await new Promise(r => chrome.storage.local.get(['skip_types'], r));
@@ -345,6 +386,11 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         }
 
         const data = await res.json();
+        console.log("[AdSkipper] 📊 后端返回的数据结构:", Object.keys(data));
+        console.log("[AdSkipper] 📊 data.ai_title:", data.ai_title);
+        console.log("[AdSkipper] 📊 data.knowledge_points:", data.knowledge_points);
+        console.log("[AdSkipper] 📊 data.hot_words:", data.hot_words);
+
         const normalizedSegments = (data.segments || [])
           .map((segment, index) => this.normalizeSegment(segment, index))
           .filter(segment => Number.isFinite(segment.start_time) && Number.isFinite(segment.end_time) && segment.end_time > segment.start_time);
@@ -357,12 +403,32 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         });
         this.aiSummary = typeof data.ai_summary === 'string' ? data.ai_summary.trim() : '';
         this.currentSegmentIds = this.segments.map(seg => seg.id).filter(id => id);
-        sidebarState.bvid = bvid;
-        sidebarState.cid = this.player.currentCid || null;
+        if (sidebarState) {
+          sidebarState.bvid = bvid;
+          sidebarState.cid = this.player.currentCid || null;
 
-        sidebarState.aiSummary = this.aiSummary || '暂无 AI 总结';
-        sidebarState.segments = this.segments;
-        sidebarState.activeSegmentKey = null;
+          sidebarState.aiSummary = this.aiSummary || '暂无 AI 总结';
+          // 确保其他AI分析信息也被保留（如果后端返回了这些字段）
+          if (data.ai_title !== undefined) {
+            sidebarState.aiTitle = data.ai_title || '';
+          }
+          if (data.knowledge_points !== undefined) {
+            sidebarState.knowledgePoints = data.knowledge_points || [];
+          }
+          if (data.hot_words !== undefined) {
+            sidebarState.hotWords = data.hot_words || [];
+          }
+          sidebarState.segments = this.segments;
+          sidebarState.activeSegmentKey = null;
+
+          console.log("[AdSkipper] 📊 侧边栏状态更新后:");
+          console.log("  - aiTitle:", sidebarState.aiTitle);
+          console.log("  - aiSummary:", sidebarState.aiSummary?.substring(0, 50));
+          console.log("  - knowledgePoints:", sidebarState.knowledgePoints);
+          console.log("  - hotWords:", sidebarState.hotWords);
+          console.log("  - isLoading:", sidebarState.isLoading);
+          console.log("  - loadError:", sidebarState.loadError);
+        }
 
         this.addSegmentMarkers();
       } catch (error) {
@@ -372,14 +438,18 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         this.segments = [];
         this.allSegments = [];
         this.currentSegmentIds = [];
-        sidebarState.bvid = bvid;
-        sidebarState.cid = this.player.currentCid || null;
-        sidebarState.segments = [];
-        sidebarState.aiSummary = 'AI 总结加载失败';
-        sidebarState.loadError = error.message || 'load failed';
+        if (sidebarState) {
+          sidebarState.bvid = bvid;
+          sidebarState.cid = this.player.currentCid || null;
+          sidebarState.segments = [];
+          sidebarState.aiSummary = 'AI 总结加载失败';
+          sidebarState.loadError = error.message || 'load failed';
+        }
       } finally {
         this.isLoadingSegments = false;
-        sidebarState.isLoading = false;
+        if (sidebarState) {
+          sidebarState.isLoading = false;
+        }
       }
     }
 
@@ -416,7 +486,13 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
 
         console.log("[AdSkipper] 开始分析视频:", bvid);
 
-        const url = API_BASE + "/video-analysis/analyze";
+        // 设置加载状态
+        if (sidebarState) {
+          sidebarState.isLoading = true;
+          sidebarState.loadError = null;
+        }
+
+        const url = VIDEO_ANALYSIS_BASE + "/video-analysis/analyze";
         const res = await fetch(url, {
           method: 'POST',
           headers: {
@@ -430,6 +506,10 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
 
         if (!res.ok) {
           console.error("[AdSkipper] 分析失败:", result.message || result.error);
+          if (sidebarState) {
+            sidebarState.isLoading = false;
+            sidebarState.loadError = result.message || result.error || '分析失败';
+          }
           return;
         }
 
@@ -442,18 +522,52 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
           console.log("[AdSkipper] hot_words:", result.data.hot_words?.length || 0);
 
           // 更新侧边栏显示
-          sidebarState.aiSummary = result.data.summary || '暂无总结';
-          sidebarState.bvid = bvid;
-          sidebarState.cid = this.player.currentCid || null;
+          if (sidebarState) {
+            sidebarState.aiSummary = result.data.summary || '暂无总结';
+            sidebarState.aiTitle = result.data.title || '';
+            sidebarState.knowledgePoints = result.data.knowledge_points || [];
+            sidebarState.hotWords = result.data.hot_words || [];
+            sidebarState.bvid = bvid;
+            sidebarState.cid = this.player.currentCid || null;
+            sidebarState.isLoading = false; // 结束加载状态
 
-          // 如果分析出广告段，重新加载
-          if (result.data.ad_segments && result.data.ad_segments.length > 0) {
-            console.log("[AdSkipper] 发现", result.data.ad_segments.length, "个广告段，重新加载...");
-            setTimeout(() => this.loadSegments(bvid), 500);
+            // 处理 AI 分析的分段数据
+            if (result.data.ad_segments && result.data.ad_segments.length > 0) {
+              console.log("[AdSkipper] 发现", result.data.ad_segments.length, "个 AI 分析分段");
+
+              // 将 AI 分段转换为 TimelineItem 期望的格式
+              const aiSegments = result.data.ad_segments.map((seg, index) => ({
+                id: `ai-${bvid}-${index}`, // 生成唯一 ID
+                start_time: seg.start_time,
+                end_time: seg.end_time,
+                action: seg.highlight ? 'popup' : 'skip', // highlight 为 true 时为重点
+                content: seg.description || '',
+                ad_type: seg.ad_type || (seg.highlight ? 'hard_ad' : 'soft_ad'),
+                is_ai_segment: true // 标记为 AI 分析的片段
+              }));
+
+              // 将 AI 分段添加到侧边栏
+              sidebarState.segments = aiSegments;
+              console.log("[AdSkipper] AI 分段已添加到侧边栏:", aiSegments.length);
+            } else {
+              // 如果没有 AI 分段，清空分段列表
+              sidebarState.segments = [];
+            }
+
+            console.log("[AdSkipper] ✅ 侧边栏数据已更新:");
+            console.log("  - aiTitle:", sidebarState.aiTitle);
+            console.log("  - aiSummary:", sidebarState.aiSummary ? sidebarState.aiSummary.substring(0, 50) + '...' : '');
+            console.log("  - knowledgePoints:", sidebarState.knowledgePoints.length);
+            console.log("  - hotWords:", sidebarState.hotWords.length);
+            console.log("  - segments:", sidebarState.segments.length);
           }
         }
       } catch (error) {
         console.error("[AdSkipper] 分析视频出错:", error);
+        if (sidebarState) {
+          sidebarState.isLoading = false;
+          sidebarState.loadError = '分析失败：' + error.message;
+        }
       }
     }
 
@@ -555,16 +669,20 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
 
     // 更新后的 checkSkip 方法
     checkSkip(currentTime) {
-      sidebarState.currentTime = currentTime;
-      if (this.player.currentBvid) {
-        sidebarState.bvid = this.player.currentBvid;
-      }
-      if (this.player.currentCid) {
-        sidebarState.cid = this.player.currentCid;
+      if (sidebarState) {
+        sidebarState.currentTime = currentTime;
+        if (this.player.currentBvid) {
+          sidebarState.bvid = this.player.currentBvid;
+        }
+        if (this.player.currentCid) {
+          sidebarState.cid = this.player.currentCid;
+        }
       }
 
       if (!this.segments.length) {
-        sidebarState.activeSegmentKey = null;
+        if (sidebarState) {
+          sidebarState.activeSegmentKey = null;
+        }
         this.hideSkipButton();
         if (Date.now() > this.popupLockUntil) {
           this.hideInsightPopup();
@@ -574,7 +692,9 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
 
       const activeSegment = this.getActiveSegment(currentTime);
       if (!activeSegment) {
-        sidebarState.activeSegmentKey = null;
+        if (sidebarState) {
+          sidebarState.activeSegmentKey = null;
+        }
         this.hideSkipButton();
         if (Date.now() > this.popupLockUntil) {
           this.hideInsightPopup();
@@ -582,7 +702,9 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         return;
       }
 
-      sidebarState.activeSegmentKey = this.getSegmentKey(activeSegment);
+      if (sidebarState) {
+        sidebarState.activeSegmentKey = this.getSegmentKey(activeSegment);
+      }
 
       if (activeSegment.action === 'popup') {
         this.hideSkipButton();
