@@ -30,7 +30,9 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS user_points (
     user_id INTEGER PRIMARY KEY,
     total_points INTEGER DEFAULT 0,
-    tier TEXT DEFAULT 'bronze'
+    tier TEXT DEFAULT 'bronze',
+    daily_upload_count INTEGER DEFAULT 0,
+    last_upload_date DATE DEFAULT CURRENT_DATE
   );
   
   CREATE TABLE IF NOT EXISTS videos (
@@ -47,7 +49,8 @@ db.exec(`
     end_time REAL,
     ad_type TEXT,
     contributor_id INTEGER,
-    is_active BOOLEAN DEFAULT 1
+    is_active BOOLEAN DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 `);
 
