@@ -1,0 +1,28 @@
+{
+  "name": "bilibili-ad-skipper-server",
+  "version": "1.0.0",
+  "description": "广告跳过众包服务",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "ali-oss": "^6.18.1",
+    "axios": "^1.7.9",
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^9.6.0",
+    "cors": "^2.8.6",
+    "dotenv": "^16.4.0",
+    "express": "^4.22.1",
+    "jsonwebtoken": "^9.0.3",
+    "openai": "^4.83.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}

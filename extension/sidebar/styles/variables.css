@@ -1,0 +1,48 @@
+:root {
+  --vm-sidebar-width: 380px;
+  --vm-top-offset: 64px;
+  --vm-bg-primary: rgba(255, 255, 255, 0.85);
+  --vm-bg-secondary: #f8f9fa;
+  --vm-bg-glass: rgba(255, 255, 255, 0.85);
+  --vm-blur-amount: 20px;
+  --vm-text-primary: #333333;
+  --vm-text-secondary: #666666;
+  --vm-color-primary: #FB7299;
+  --vm-color-highlight: #1976d2;
+  --vm-color-skip: #c2185b;
+  --vm-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+  --vm-transition-base: 0.3s ease-in-out;
+  --vm-shadow-left: -4px 0 20px rgba(0, 0, 0, 0.08);
+  --vm-border-subtle: 1px solid rgba(0, 0, 0, 0.08);
+
+  /* Danger / Warning colors */
+  --vm-color-danger: #ef4444;
+  --vm-color-danger-hover: #dc2626;
+  --vm-color-danger-light: rgba(239, 68, 68, 0.1);
+  --vm-color-danger-border: rgba(239, 68, 68, 0.15);
+
+  /* Crystal Glass Design System */
+  /* 主色调 - 水晶玻璃 */
+  --vm-glass-bg: rgba(255, 255, 255, 0.72);
+  --vm-glass-bg-deep: rgba(255, 255, 255, 0.85);
+  --vm-glass-border: rgba(255, 255, 255, 0.6);
+  --vm-glass-shine: rgba(255, 255, 255, 0.9);
+
+  /* 渐变 - 微妙的粉色 */
+  --vm-gradient-soft: linear-gradient(135deg, rgba(251, 114, 153, 0.03) 0%, rgba(255, 255, 255, 0.1) 100%);
+  --vm-gradient-card: linear-gradient(145deg, rgba(255, 255, 255, 0.95) 0%, rgba(255, 245, 248, 0.85) 100%);
+  --vm-gradient-accent: linear-gradient(135deg, #FB7299 0%, #FF8FA3 100%);
+  --vm-gradient-header: linear-gradient(180deg, rgba(255, 255, 255, 0.9) 0%, rgba(255, 255, 255, 0.7) 100%);
+  --vm-gradient-border: linear-gradient(180deg, rgba(251, 114, 153, 0.2) 0%, rgba(251, 114, 153, 0.05) 100%);
+
+  /* 光影 */
+  --vm-shadow-soft: 0 8px 32px rgba(251, 114, 153, 0.08);
+  --vm-shadow-glow: 0 0 40px rgba(251, 114, 153, 0.1);
+  --vm-shadow-inner: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  --vm-shadow-card: 0 4px 20px rgba(251, 114, 153, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  --vm-shadow-button: 0 2px 8px rgba(251, 114, 153, 0.1);
+
+  /* 边框渐变 */
+  --vm-border-glow: 1px solid rgba(251, 114, 153, 0.15);
+  --vm-border-shine: 1px solid rgba(255, 255, 255, 0.5);
+}
