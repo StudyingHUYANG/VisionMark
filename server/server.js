@@ -1,63 +1,65 @@
+// 加载环境变量
 require('dotenv').config();
+
+const { authenticateToken } = require('./middlewares/auth.js');
 const express = require('express');
 const Database = require('better-sqlite3');
 const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const path = require('path');
+const config = require('./config.js');
 
 const app = express();
-app.use(cors());
+const JWT_SECRET = config.JWT_SECRET;
+
+app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
 
-// 初始化SQLite数据库（单文件，零配置）
-const dbPath = path.join(__dirname, 'database', 'app.db');
-const db = new Database(dbPath);
+const db = new Database(path.join(__dirname, 'database', 'app.db'));
 db.pragma('journal_mode = WAL');
 
-// 初始化表结构
-function initDB() {
-  // 视频表
-  db.exec(`CREATE TABLE IF NOT EXISTS videos (
+// 初始化表（注意单引号）
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    bvid TEXT NOT NULL,
-    cid INTEGER NOT NULL,
-    page INTEGER DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(bvid, cid, page)
-  )`);
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL
+  );
   
-  // 广告段表
-  db.exec(`CREATE TABLE IF NOT EXISTS ad_segments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    video_id INTEGER,
-    start_time REAL NOT NULL,
-    end_time REAL NOT NULL,
-    ad_type TEXT CHECK(ad_type IN ('hard_ad','soft_ad','product_placement','intro_ad','mid_ad')),
-    confidence_score REAL DEFAULT 0.8,
-    upvotes INTEGER DEFAULT 3,
-    downvotes INTEGER DEFAULT 0,
-    contributor_id INTEGER DEFAULT 1,
-    is_active BOOLEAN DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(video_id) REFERENCES videos(id)
-  )`);
-  
-  // 用户表
-  db.exec(`CREATE TABLE IF NOT EXISTS user_points (
+  CREATE TABLE IF NOT EXISTS user_points (
     user_id INTEGER PRIMARY KEY,
     total_points INTEGER DEFAULT 0,
-    tier TEXT DEFAULT 'gold',
-    daily_upload_count INTEGER DEFAULT 0,
-    last_upload_date DATE DEFAULT CURRENT_DATE
-  )`);
+    tier TEXT DEFAULT 'bronze'
+  );
   
-  // 插入测试用户
-  const stmt = db.prepare("INSERT OR IGNORE INTO user_points (user_id, total_points, tier) VALUES (1, 999, 'platinum')");
-  stmt.run();
+  CREATE TABLE IF NOT EXISTS videos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bvid TEXT NOT NULL,
+    cid INTEGER,
+    page INTEGER DEFAULT 1
+  );
   
-  console.log('[DB] SQLite数据库初始化完成:', dbPath);
-}
+  CREATE TABLE IF NOT EXISTS ad_segments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id INTEGER,
+    start_time REAL,
+    end_time REAL,
+    ad_type TEXT,
+    contributor_id INTEGER,
+    is_active BOOLEAN DEFAULT 1
+  );
+`);
 
-initDB();
+// 创建测试账号
+const admin = db.prepare("SELECT * FROM users WHERE username = ?").get('admin');
+if (!admin) {
+  const hash = bcrypt.hashSync('admin', 10);
+  const u = db.prepare("INSERT INTO users (username, password_hash) VALUES (?, ?)").run('admin', hash);
+  // 关键：使用单引号 'platinum' 而不是双引号
+  db.prepare("INSERT INTO user_points (user_id, total_points, tier) VALUES (?, 999, 'platinum')").run(u.lastInsertRowid);
+  console.log('[Auth] 测试账号: admin/admin');
+}
 
 // Wilson Score计算
 function wilsonScore(up, down) {
@@ -229,57 +231,112 @@ app.get('/api/v1/segments/:id/votes', (req, res) => {
   }
 });
 
-// 获取用户统计
-app.get('/api/v1/user/stats', (req, res) => {
-  try {
-    const user = db.prepare('SELECT * FROM user_points WHERE user_id = ?').get(req.userId);
-    res.json(user || { tier: 'bronze', points: 0 });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// 上报跳过事件
-app.post('/api/v1/segments/:id/skip', (req, res) => {
-  res.json({ success: true });
-});
-
-// 健康检查接口 - 符合项目规范要求
-app.get('/api/v1/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    service: 'VisionMark Backend'
-  });
-});
-
-// 认证路由 - 符合项目规范要求
-// 实际应使用JWT，开发阶段使用模拟用户
+// 登录API
 app.post('/api/v1/auth/login', (req, res) => {
-  // 模拟登录成功，返回测试token
-  const mockToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.mock-token-for-development';
+  const { username, password } = req.body;
+  const user = db.prepare("SELECT * FROM users WHERE username = ?").get(username);
+  
+  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+    return res.status(401).json({ error: '用户名或密码错误' });
+  }
+  
+  const token = jwt.sign({ userId: user.id, username }, JWT_SECRET, { expiresIn: '7d' });
+  const points = db.prepare("SELECT * FROM user_points WHERE user_id = ?").get(user.id);
+  
   res.json({
-    token: mockToken,
-    user: {
-      id: 1,
-      tier: 'platinum'
-    }
+    token,
+    username,
+    points: points ? points.total_points : 0,
+    tier: points ? points.tier : 'bronze'
   });
 });
 
+// 注册API
 app.post('/api/v1/auth/register', (req, res) => {
-  // 模拟注册成功
-  res.status(201).json({
-    message: 'User registered successfully',
-    user: {
-      id: 1,
-      tier: 'gold'
-    }
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: '必填' });
+
+  const existing = db.prepare("SELECT id FROM users WHERE username = ?").get(username);
+  if (existing) return res.status(409).json({ error: '已存在' });
+
+  const hash = bcrypt.hashSync(password, 10);
+  const result = db.prepare("INSERT INTO users (username, password_hash) VALUES (?, ?)").run(username, hash);
+  db.prepare("INSERT INTO user_points (user_id) VALUES (?)").run(result.lastInsertRowid);
+
+  res.json({ message: '注册成功' });
+});
+
+// 获取当前用户信息API
+app.get('/api/v1/auth/me', authenticateToken, (req, res) => {
+  const points = db.prepare("SELECT * FROM user_points WHERE user_id = ?").get(req.user.userId);
+  res.json({
+    username: req.user.username,
+    userId: req.user.userId,
+    points: points ? points.total_points : 0,
+    tier: points ? points.tier : 'bronze'
   });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`[Server] 服务运行在 http://localhost:${PORT}`);
-  console.log('[Server] 按 Ctrl+C 停止服务');
+// 其他API
+app.get('/api/v1/segments', (req, res) => {
+  const { bvid } = req.query;
+  if (!bvid) return res.json({ segments: [] });
+  const rows = db.prepare("SELECT s.* FROM ad_segments s JOIN videos v ON s.video_id = v.id WHERE v.bvid = ?").all(bvid);
+  res.json({ segments: rows });
 });
+
+app.post('/api/v1/segments', authenticateToken, (req, res) => {
+  const { bvid, cid, start_time, end_time, ad_type } = req.body;
+  const userId = req.user.userId;
+  
+  let video = db.prepare("SELECT id FROM videos WHERE bvid = ?").get(bvid);
+  if (!video) {
+    const r = db.prepare("INSERT INTO videos (bvid, cid) VALUES (?, ?)").run(bvid, cid || null);
+    video = { id: r.lastInsertRowid };
+  }
+  
+  const result = db.prepare("INSERT INTO ad_segments (video_id, start_time, end_time, ad_type, contributor_id, is_active) VALUES (?, ?, ?, ?, ?, 1)").run(video.id, start_time, end_time, ad_type, userId);
+  
+  // Award points
+  db.prepare("UPDATE user_points SET total_points = total_points + 10 WHERE user_id = ?").run(userId);
+
+  res.json({ id: result.lastInsertRowid, message: '提交成功' });
+});
+
+app.get('/api/v1/health', (req, res) => res.json({ ok: true }));
+
+// 引入路由文件
+const statsRouter = require('./routes/stats.js');
+const segmentsRouter = require('./routes/segments.js');
+const videoAnalysisRouter = require('./routes/videoAnalysis.js');
+
+// 注册路由
+app.use('/api/v1/stats', statsRouter);
+app.use('/api/v1/segments', segmentsRouter); // 补充批量/删除接口，和原有segments接口合并
+app.use('/video-analysis', videoAnalysisRouter); // AI视频分析路由
+
+// Get user's all segments
+app.get('/api/v1/segments/user', authenticateToken, (req, res) => {
+  const userId = req.user.userId;
+
+  const rows = db.prepare(`
+    SELECT
+      s.id, s.start_time, s.end_time, s.ad_type,
+      v.bvid, v.page,
+      datetime(s.created_at, 'localtime') as created_at
+    FROM ad_segments s
+    JOIN videos v ON s.video_id = v.id
+    WHERE s.contributor_id = ?
+    ORDER BY s.created_at DESC
+  `).all(userId);
+
+  res.json({ segments: rows });
+});
+
+// 使用配置文件的端口
+app.listen(config.PORT, '0.0.0.0', () => {
+  console.log('[Server] http://localhost:' + config.PORT);
+  console.log('[Auth] admin/admin 登录');
+});
+
+

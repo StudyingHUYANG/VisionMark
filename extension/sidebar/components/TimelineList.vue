@@ -20,10 +20,11 @@
 </template>
 
 <script setup>
+import { watch } from 'vue';
 import TimelineItem from './TimelineItem.vue';
 import SkeletonLoader from './SkeletonLoader.vue';
 
-defineProps({
+const props = defineProps({
   segments: {
     type: Array,
     default: () => []
@@ -39,6 +40,14 @@ defineProps({
 });
 
 defineEmits(['seek', 'delete']);
+
+// 监听 segments 变化
+watch(() => props.segments, (newVal) => {
+  console.log('[TimelineList] segments prop changed:', newVal?.length || 0);
+  if (newVal && newVal.length > 0) {
+    console.log('[TimelineList] segments data:', newVal);
+  }
+}, { immediate: true, deep: true });
 
 function getSegmentKey(segment) {
   return String(segment.id ?? `${segment.start_time}-${segment.end_time}`);

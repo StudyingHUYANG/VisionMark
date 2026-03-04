@@ -10,6 +10,9 @@ const sidebarState = reactive({
   bvid: null,
   cid: null,
   aiSummary: '',
+  aiTitle: '',
+  knowledgePoints: [],
+  hotWords: [],
   segments: [],
   activeSegmentKey: null,
   currentTime: 0
@@ -29,6 +32,9 @@ export function createSidebar(container) {
         bvid: sidebarState.bvid,
         segmentCount: sidebarState.segments.length,
         summary: sidebarState.aiSummary,
+        aiTitle: sidebarState.aiTitle,
+        knowledgePoints: sidebarState.knowledgePoints,
+        hotWords: sidebarState.hotWords,
         segments: sidebarState.segments,
         activeKey: sidebarState.activeSegmentKey,
         loading: sidebarState.isLoading,
@@ -68,6 +74,9 @@ export function createSidebar(container) {
       if (data.bvid !== undefined) sidebarState.bvid = data.bvid;
       if (data.cid !== undefined) sidebarState.cid = data.cid;
       if (data.aiSummary !== undefined) sidebarState.aiSummary = data.aiSummary;
+      if (data.aiTitle !== undefined) sidebarState.aiTitle = data.aiTitle;
+      if (data.knowledgePoints !== undefined) sidebarState.knowledgePoints = data.knowledgePoints;
+      if (data.hotWords !== undefined) sidebarState.hotWords = data.hotWords;
       if (data.segments !== undefined) sidebarState.segments = data.segments;
       if (data.isLoading !== undefined) sidebarState.isLoading = data.isLoading;
       if (data.loadError !== undefined) sidebarState.loadError = data.loadError;

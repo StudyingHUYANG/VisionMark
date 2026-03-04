@@ -31,6 +31,9 @@
       <p v-if="segment.action === 'popup'" class="vm-timeline-item__desc">
         {{ segment.content || '该片段暂无文案' }}
       </p>
+      <p v-else-if="segment.is_ai_segment" class="vm-timeline-item__desc">
+        {{ segment.content || '视频片段' }}
+      </p>
       <p v-else class="vm-timeline-item__desc vm-timeline-item__desc--skip">
         该片段将在自动模式下快进
       </p>
@@ -59,6 +62,9 @@ const tagType = computed(() => {
 });
 
 const tagText = computed(() => {
+  if (props.segment.is_ai_segment) {
+    return props.segment.action === 'popup' ? '高能' : '片段';
+  }
   return props.segment.action === 'popup' ? '重点' : '跳过';
 });
 
