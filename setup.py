@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 
 # ========== 配置区域 ==========
-PROJECT_DIR = Path(r"E:\BiliVideoEvaluation\ChromeExtention")
+PROJECT_DIR = Path(__file__).parent / "project_data"
 # ==============================
 
 class Colors:
@@ -90,7 +90,7 @@ def generate_extension_files():
   "version": "1.0.0",
   "description": "社区驱动的B站广告自动跳过插件",
   "permissions": ["storage", "activeTab"],
-  "host_permissions": ["https://www.bilibili.com/*", "http://localhost:3000/*"],
+  "host_permissions": ["https://www.bilibili.com/*", "http://localhost:8080/*"],
   "action": {
     "default_popup": "popup/popup.html",
     "default_icon": {
@@ -111,7 +111,7 @@ def generate_extension_files():
     
     # constants.js
     constants = '''// 配置文件 - 本地开发环境
-const API_BASE = 'http://localhost:3000/api/v1';
+const API_BASE = 'http://localhost:8080/api/v1';
 const CONFIG = {
   CHECK_INTERVAL: 200,
   CONFIDENCE_THRESHOLD: 0.7,
@@ -336,7 +336,7 @@ const STORAGE_KEYS = {
         border-radius:4px;z-index:99999;font-size:14px;transition:opacity 0.3s;\`;
       t.textContent = msg;
       document.body.appendChild(t);
-      setTimeout(() => { t.style.opacity='0'; setTimeout(()=>t.remove(),300); }, 3000);
+      setTimeout(() => { t.style.opacity='0'; setTimeout(()=>t.remove(),300); }, 8080);
     }
   }
 
@@ -446,7 +446,7 @@ setTimeout(() => {
   <button class="btn" onclick="alert('在视频页面按 Alt+A 标注广告')">如何标注?</button>
   <script>
     // 简单演示数据，实际应从API获取
-    fetch('http://localhost:3000/api/v1/user/stats')
+    fetch('http://localhost:8080/api/v1/user/stats')
       .then(r => r.json())
       .then(d => {
         document.getElementById('tier').textContent = d.tier || 'Bronze';
@@ -491,7 +491,7 @@ def generate_server_files():
     write_file("server/package.json", pkg)
     
     # .env 配置文件
-    env = '''PORT=3000
+    env = '''PORT=8080
 NODE_ENV=development
 # 如需切换到PostgreSQL，取消下面注释并注释掉SQLite配置
 # DATABASE_URL=postgresql://postgres:123456@localhost:5432/bilibili_ad_skipper
@@ -652,7 +652,7 @@ app.post('/api/v1/segments/:id/skip', (req, res) => {
   res.json({ success: true });
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`[Server] 服务运行在 http://localhost:${PORT}`);
   console.log('[Server] 按 Ctrl+C 停止服务');
@@ -686,9 +686,9 @@ echo ===================================
 echo.
 
 :: 检查端口占用
-netstat -an | find "3000" | find "LISTENING" >nul
+netstat -an | find "8080" | find "LISTENING" >nul
 if %errorlevel% == 0 (
-    echo [警告] 端口3000已被占用，可能已有服务在运行
+    echo [警告] 端口8080已被占用，可能已有服务在运行
     echo.
 )
 
@@ -732,8 +732,8 @@ def main():
     print("=" * 40)
     
     # 检查后端是否已运行
-    if check_port(3000):
-        print("✓ 后端服务已在运行 (端口3000)")
+    if check_port(8080):
+        print("✓ 后端服务已在运行 (端口8080)")
     else:
         print("⚙️  启动后端服务...")
         subprocess.Popen(
@@ -744,7 +744,7 @@ def main():
         print("⏳ 等待服务启动...")
         time.sleep(3)
         
-        if check_port(3000):
+        if check_port(8080):
             print("✓ 后端启动成功")
         else:
             print("✗ 后端启动失败，请检查错误")
@@ -856,7 +856,7 @@ def main():
     print("2. 在Chrome中加载 extension 文件夹")
     print()
     print("遇到问题？检查:")
-    print(f"- 后端是否运行: http://localhost:3000")
+    print(f"- 后端是否运行: http://localhost:8080")
     print(f"- 数据库位置: {PROJECT_DIR}\\\\server\\\\database\\\\app.db")
 
 if __name__ == "__main__":

@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { width: 300px; padding: 15px; font-family: sans-serif; background: #1e1e2e; color: #fff; }
+    h1 { font-size: 16px; color: #FB7299; margin: 0 0 10px 0; }
+    .stat { display: flex; justify-content: space-between; margin: 8px 0; font-size: 14px; }
+    .btn { width: 100%; background: #FB7299; color: #fff; border: none; padding: 10px; border-radius: 4px; cursor: pointer; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>🚫 B站广告跳过</h1>
+  <div class="stat"><span>用户等级:</span> <span id="tier" style="color:#ffd700">Gold</span></div>
+  <div class="stat"><span>今日剩余:</span> <span id="limit">∞</span></div>
+  <div class="stat"><span>我的积分:</span> <span id="points">1,250</span></div>
+  <button class="btn" onclick="alert('在视频页面按 Alt+A 标注广告')">如何标注?</button>
+  <script>
+    // 简单演示数据，实际应从API获取
+    fetch('http://localhost:3000/api/v1/user/stats')
+      .then(r => r.json())
+      .then(d => {
+        document.getElementById('tier').textContent = d.tier || 'Bronze';
+        document.getElementById('points').textContent = d.points || 0;
+      })
+      .catch(() => {});
+  </script>
+</body>
+</html>
