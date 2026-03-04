@@ -88,7 +88,12 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
 
         const bvid = this.player.currentBvid;
         if (bvid) {
-          this.loadSegments(bvid).then(() => {
+          this.loadSegments(bvid).then(async () => {
+            // 如果没有片段数据，自动触发AI分析
+            if (this.segments.length === 0) {
+              console.log("[AdSkipper] 没有广告段数据，尝试自动分析视频...");
+              await this.analyzeVideo(bvid);
+            }
             window.adSkipper = this;
           });
         }
@@ -399,6 +404,57 @@ import { createSidebar, sidebarState } from '../sidebar/index.js';
         ad_type: segment.ad_type || (action === 'skip' ? 'hard_ad' : 'mid_ad'),
         hasActionField: typeof segment.action === 'string'
       };
+    }
+
+    async analyzeVideo(bvid) {
+      try {
+        const token = await this.getToken();
+        if (!token) {
+          console.log("[AdSkipper] 未登录，跳过视频分析");
+          return;
+        }
+
+        console.log("[AdSkipper] 开始分析视频:", bvid);
+
+        const url = API_BASE + "/video-analysis/analyze";
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + token
+          },
+          body: JSON.stringify({ bvid })
+        });
+
+        const result = await res.json();
+
+        if (!res.ok) {
+          console.error("[AdSkipper] 分析失败:", result.message || result.error);
+          return;
+        }
+
+        if (result.success && result.data) {
+          console.log("[AdSkipper] ✅ 分析成功");
+          console.log("[AdSkipper] title:", result.data.title);
+          console.log("[AdSkipper] summary:", result.data.summary);
+          console.log("[AdSkipper] ad_segments:", result.data.ad_segments?.length || 0);
+          console.log("[AdSkipper] knowledge_points:", result.data.knowledge_points?.length || 0);
+          console.log("[AdSkipper] hot_words:", result.data.hot_words?.length || 0);
+
+          // 更新侧边栏显示
+          sidebarState.aiSummary = result.data.summary || '暂无总结';
+          sidebarState.bvid = bvid;
+          sidebarState.cid = this.player.currentCid || null;
+
+          // 如果分析出广告段，重新加载
+          if (result.data.ad_segments && result.data.ad_segments.length > 0) {
+            console.log("[AdSkipper] 发现", result.data.ad_segments.length, "个广告段，重新加载...");
+            setTimeout(() => this.loadSegments(bvid), 500);
+          }
+        }
+      } catch (error) {
+        console.error("[AdSkipper] 分析视频出错:", error);
+      }
     }
 
     getSegmentKey(segment, indexFallback = 0) {
