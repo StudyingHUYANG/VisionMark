@@ -1,4 +1,9 @@
 @echo off
+cd /d "%~dp0"
+echo 正在启动 VisionMark 服务...
+echo 启动 Express 服务器...
+node server/server.js
+pause
 chcp 65001 >nul
 echo ===================================
 echo   B站广告跳过插件 - 开发环境启动器

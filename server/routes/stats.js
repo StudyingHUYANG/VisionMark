@@ -236,4 +236,109 @@ router.get('/leaderboard/videos', (req, res) => {
   }
 });
 
+// 9. 每日新增标注趋势API - GET /api/v1/stats/trends/daily
+router.get('/trends/daily', (req, res) => {
+  try {
+    // 查询最近30天的每日新增标注数量
+    const dailyTrends = db.prepare(`
+      SELECT 
+        date(created_at) as date,
+        COUNT(*) as annotation_count
+      FROM ad_segments
+      WHERE created_at >= datetime('now', '-30 days')
+      GROUP BY date(created_at)
+      ORDER BY date(created_at) ASC
+    `).all();
+
+    // 确保返回连续的30天数据（填充缺失日期为0）
+    const result = [];
+    const today = new Date();
+    const startDate = new Date(today);
+    startDate.setDate(today.getDate() - 29); // 最近30天包括今天
+
+    for (let i = 0; i < 30; i++) {
+      const currentDate = new Date(startDate);
+      currentDate.setDate(startDate.getDate() + i);
+      const dateString = currentDate.toISOString().split('T')[0];
+      
+      const existingData = dailyTrends.find(item => item.date === dateString);
+      result.push({
+        date: dateString,
+        annotation_count: existingData ? existingData.annotation_count : 0
+      });
+    }
+
+    res.status(200).json({ 
+      code: 200, 
+      msg: 'success', 
+      data: result
+    });
+  } catch (err) {
+    res.status(500).json({ code: 500, msg: '查询失败', error: err.message });
+  }
+});
+
+// 10. 广告类型分布API - GET /api/v1/stats/distribution/types
+router.get('/distribution/types', (req, res) => {
+  try {
+    // 查询各种广告类型的分布情况
+    const typeDistribution = db.prepare(`
+      SELECT 
+        ad_type,
+        COUNT(*) as count
+      FROM ad_segments
+      WHERE ad_type IS NOT NULL
+      GROUP BY ad_type
+      ORDER BY count DESC
+    `).all();
+
+    res.status(200).json({ 
+      code: 200, 
+      msg: 'success', 
+      data: typeDistribution.map(item => ({
+        ad_type: item.ad_type,
+        count: item.count
+      }))
+    });
+  } catch (err) {
+    res.status(500).json({ code: 500, msg: '查询失败', error: err.message });
+  }
+});
+
+// 11. 活跃用户统计API - GET /api/v1/stats/users/active
+router.get('/users/active', (req, res) => {
+  try {
+    // 查询最近30天内有活动的用户（创建过标注的用户）
+    const activeUsers = db.prepare(`
+      SELECT 
+        u.id,
+        u.username,
+        up.total_points,
+        COUNT(s.id) as recent_contributions,
+        MAX(date(s.created_at)) as last_activity_date
+      FROM users u
+      JOIN user_points up ON u.id = up.user_id
+      JOIN ad_segments s ON u.id = s.contributor_id
+      WHERE s.created_at >= datetime('now', '-30 days')
+      GROUP BY u.id, u.username, up.total_points
+      ORDER BY recent_contributions DESC, up.total_points DESC
+      LIMIT 50
+    `).all();
+
+    res.status(200).json({ 
+      code: 200, 
+      msg: 'success', 
+      data: activeUsers.map(user => ({
+        user_id: user.id,
+        username: user.username,
+        total_points: user.total_points,
+        recent_contributions: user.recent_contributions,
+        last_activity_date: user.last_activity_date
+      }))
+    });
+  } catch (err) {
+    res.status(500).json({ code: 500, msg: '查询失败', error: err.message });
+  }
+});
+
 module.exports = router;
