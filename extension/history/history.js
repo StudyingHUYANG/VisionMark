@@ -28,7 +28,7 @@ const typeLabels = {
 };
 
 function createNetworkUnavailableError() {
-  const error = new Error('Failed to fetch');
+  const error = new Error('网络不可用，请稍后重试');
   error.code = NETWORK_ERROR_CODE;
   return error;
 }

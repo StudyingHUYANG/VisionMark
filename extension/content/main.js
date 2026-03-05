@@ -1,4 +1,4 @@
-(function () {
+﻿(function () {
   'use strict';
 
   if (window.adSkipper) return;
@@ -9,14 +9,23 @@
   // API 基础路径
   const API_BASE = window.API_BASE || 'http://localhost:8080/api/v1';
   const VIDEO_ANALYSIS_BASE = window.LOCAL_CONFIG?.API_BASE || 'http://localhost:8080';
+  const MOCK_ANALYSIS = Boolean(window.LOCAL_CONFIG?.MOCK_ANALYSIS);
+  const MOCK_ANALYSIS_SCENARIO = String(window.LOCAL_CONFIG?.MOCK_ANALYSIS_SCENARIO || 'default');
+  const parsedMockDelay = Number(window.LOCAL_CONFIG?.MOCK_ANALYSIS_DELAY_MS);
+  const MOCK_ANALYSIS_DELAY_MS = Number.isFinite(parsedMockDelay) && parsedMockDelay >= 0
+    ? parsedMockDelay
+    : 400;
+  const DANMU_TRIGGER_WINDOW_SEC = 0.3;
+  const DANMU_REWIND_RESET_SEC = 1.0;
+  const DANMU_MAX_CONCURRENT = 3;
 
   // 广告类型标签映射
   const typeLabels = {
     'hard_ad': '硬广',
     'soft_ad': '软广',
-    'product_placement': '植入',
-    'intro_ad': '片头',
-    'mid_ad': '中段'
+    'product_placement': '植入广告',
+    'intro_ad': '片头广告',
+    'mid_ad': '中段广告'
   };
 
   class AdSkipperCore {
@@ -51,6 +60,12 @@
       };
       this.networkCooldownMs = 30000;
       this.networkTimeoutMs = 6000;
+      this.analysisBvid = null;
+      this.knowledgeDanmuQueue = [];
+      this.triggeredDanmuIds = new Set();
+      this.knowledgeDanmuLayer = null;
+      this.lastDanmuCurrentTime = 0;
+      this.nextDanmuLane = 0;
 
 
     }
@@ -88,7 +103,7 @@
         // Vue 侧边栏初始化
         // ==========================
         this.initSidebar().then(() => {
-          console.log("[AdSkipper] Sidebar 初始化完成");
+          console.log('[AdSkipper] Sidebar initialized.');
         }).catch(err => {
           console.error("[AdSkipper] Sidebar 初始化失败:", err);
         });
@@ -155,10 +170,7 @@
     async initSidebar() {
       if (this.sidebarController) return;
 
-      // 动态导入 sidebar 模块
       const { createSidebar, sidebarState: importedSidebarState } = await import('../sidebar/index.js');
-
-      // 将导入的 sidebarState 赋值给局部变量
       sidebarState = importedSidebarState;
 
       const existingRoot = document.getElementById('vm-sidebar-root');
@@ -171,7 +183,7 @@
       root.id = 'vm-sidebar-root';
       document.body.appendChild(root);
 
-      console.log("[AdSkipper Sidebar] 初始化侧边栏...");
+      console.log('[AdSkipper Sidebar] Initializing sidebar...');
       this.sidebarController = createSidebar(root);
     }
 
@@ -211,7 +223,7 @@
           }
         `;
         document.head.appendChild(style);
-        console.log("[AdSkipper] AI按钮样式已添加");
+        console.log('[AdSkipper] AI button style injected.');
       }
 
       if (document.getElementById('visionmark-ai-fab')) {
@@ -224,42 +236,49 @@
       button.id = 'visionmark-ai-fab';
       button.type = 'button';
       button.textContent = 'AI';
-      button.title = 'AI video summary';
-      button.setAttribute('aria-label', 'AI video summary');
+      button.title = '视频总结';
+      button.setAttribute('aria-label', '视频总结');
       button.onclick = (event) => {
         event.stopPropagation();
-        this.toggleSidebar();
+        this.toggleSidebar().catch((error) => {
+          console.error('[AdSkipper] Toggle sidebar failed:', error);
+          this.showToast('视频总结面板加载失败', 'error');
+        });
       };
 
       document.body.appendChild(button);
-      console.log("[AdSkipper] ✅ AI按钮已创建并添加到body");
+      console.log("[AdSkipper] AI按钮已创建并添加到body");
 
       // 验证按钮是否真的在DOM中并检查位置
       setTimeout(() => {
         const btn = document.getElementById('visionmark-ai-fab');
         if (btn) {
           const rect = btn.getBoundingClientRect();
-          console.log("[AdSkipper] ✅ 验证：AI按钮在DOM中");
-          console.log("[AdSkipper] 📍 位置信息:");
-          console.log("  - 尺寸:", btn.offsetWidth, "x", btn.offsetHeight);
-          console.log("  - 屏幕位置:", rect.left, ",", rect.top);
+          console.log('[AdSkipper] AI button is present in DOM.');
+          console.log("[AdSkipper] 位置信息:");
+          console.log("  - 灏哄:", btn.offsetWidth, "x", btn.offsetHeight);
+          console.log("  - 灞忓箷浣嶇疆:", rect.left, ",", rect.top);
           console.log("  - right/top:", rect.right, ",", rect.bottom);
           console.log("  - 在视口内:", rect.top >= 0 && rect.left >= 0 && rect.bottom <= window.innerHeight && rect.right <= window.innerWidth);
           console.log("  - z-index:", window.getComputedStyle(btn).zIndex);
         } else {
-          console.error("[AdSkipper] ❌ 错误：AI按钮创建后未在DOM中找到！");
+          console.error("[AdSkipper] 错误：AI按钮创建后未在DOM中找到！");
         }
       }, 100);
     }
 
-    ensureSidebarReady() {
+    async ensureSidebarReady() {
       if (this.sidebarController) return true;
-      this.initSidebar();
+      try {
+        await this.initSidebar();
+      } catch (error) {
+        console.error('[AdSkipper] ensureSidebarReady failed:', error);
+      }
       return Boolean(this.sidebarController);
     }
 
-    showSidebar(options = {}) {
-      if (!this.ensureSidebarReady()) return;
+    async showSidebar(options = {}) {
+      if (!await this.ensureSidebarReady()) return;
 
       if (options.refresh && this.player.currentBvid) {
         this.loadSegments(this.player.currentBvid);
@@ -268,8 +287,8 @@
       this.sidebarController.show();
     }
 
-    toggleSidebar() {
-      if (!this.ensureSidebarReady()) return;
+    async toggleSidebar() {
+      if (!await this.ensureSidebarReady()) return;
       this.sidebarController.toggle();
     }
 
@@ -306,7 +325,7 @@
     }
 
     createNetworkUnavailableError() {
-      const error = new Error('Failed to fetch');
+      const error = new Error('网络不可用，请稍后重试');
       error.code = 'NETWORK_UNAVAILABLE';
       return error;
     }
@@ -369,6 +388,7 @@
 
     async loadSegments(bvid) {
       if (!bvid || this.isLoadingSegments) return;
+      const previousAnalysisBvid = this.analysisBvid;
       this.isLoadingSegments = true;
       if (sidebarState) {
         sidebarState.isLoading = true;
@@ -382,14 +402,14 @@
         const url = API_BASE + "/segments?bvid=" + bvid + "&page=" + this.getPage();
         const res = await this.safeFetch(url, {}, 'load segments');
         if (!res.ok) {
-          throw new Error("Failed to load segments: " + res.status);
+          throw new Error('加载片段失败：' + res.status);
         }
 
         const data = await res.json();
-        console.log("[AdSkipper] 📊 后端返回的数据结构:", Object.keys(data));
-        console.log("[AdSkipper] 📊 data.ai_title:", data.ai_title);
-        console.log("[AdSkipper] 📊 data.knowledge_points:", data.knowledge_points);
-        console.log("[AdSkipper] 📊 data.hot_words:", data.hot_words);
+        console.log("[AdSkipper] 后端返回的数据结构:", Object.keys(data));
+        console.log("[AdSkipper] data.ai_title:", data.ai_title);
+        console.log("[AdSkipper] data.knowledge_points:", data.knowledge_points);
+        console.log("[AdSkipper] data.hot_words:", data.hot_words);
 
         const normalizedSegments = (data.segments || [])
           .map((segment, index) => this.normalizeSegment(segment, index))
@@ -403,11 +423,17 @@
         });
         this.aiSummary = typeof data.ai_summary === 'string' ? data.ai_summary.trim() : '';
         this.currentSegmentIds = this.segments.map(seg => seg.id).filter(id => id);
+        this.analysisBvid = bvid;
+        if (Array.isArray(data.knowledge_points)) {
+          this.updateKnowledgeDanmuSource(data.knowledge_points, bvid);
+        } else if (previousAnalysisBvid && previousAnalysisBvid !== bvid) {
+          this.clearKnowledgeDanmuState();
+        }
         if (sidebarState) {
           sidebarState.bvid = bvid;
           sidebarState.cid = this.player.currentCid || null;
 
-          sidebarState.aiSummary = this.aiSummary || '暂无 AI 总结';
+          sidebarState.aiSummary = this.aiSummary || '暂无总结';
           // 确保其他AI分析信息也被保留（如果后端返回了这些字段）
           if (data.ai_title !== undefined) {
             sidebarState.aiTitle = data.ai_title || '';
@@ -421,7 +447,7 @@
           sidebarState.segments = this.segments;
           sidebarState.activeSegmentKey = null;
 
-          console.log("[AdSkipper] 📊 侧边栏状态更新后:");
+          console.log("[AdSkipper] 侧边栏状态更新后:");
           console.log("  - aiTitle:", sidebarState.aiTitle);
           console.log("  - aiSummary:", sidebarState.aiSummary?.substring(0, 50));
           console.log("  - knowledgePoints:", sidebarState.knowledgePoints);
@@ -442,8 +468,8 @@
           sidebarState.bvid = bvid;
           sidebarState.cid = this.player.currentCid || null;
           sidebarState.segments = [];
-          sidebarState.aiSummary = 'AI 总结加载失败';
-          sidebarState.loadError = error.message || 'load failed';
+          sidebarState.aiSummary = '总结加载失败';
+          sidebarState.loadError = error.message || '加载失败';
         }
       } finally {
         this.isLoadingSegments = false;
@@ -476,7 +502,328 @@
       };
     }
 
-    async analyzeVideo(bvid) {
+    parseTimestampToSeconds(value) {
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        return Math.max(0, value);
+      }
+      const raw = String(value ?? '').trim();
+      if (!raw) return null;
+
+      const bracketMatch = raw.match(/\[(\d{1,2}:\d{1,2}(?::\d{1,2})?)\]/);
+      const source = bracketMatch ? bracketMatch[1] : raw;
+
+      const hmsMatch = source.match(/(\d{1,2}):(\d{1,2}):(\d{1,2})/);
+      if (hmsMatch) {
+        const hours = Number(hmsMatch[1]);
+        const minutes = Number(hmsMatch[2]);
+        const seconds = Number(hmsMatch[3]);
+        if ([hours, minutes, seconds].every(Number.isFinite)) {
+          return Math.max(0, hours * 3600 + minutes * 60 + seconds);
+        }
+      }
+
+      const msMatch = source.match(/(\d{1,3}):(\d{1,2})/);
+      if (msMatch) {
+        const minutes = Number(msMatch[1]);
+        const seconds = Number(msMatch[2]);
+        if ([minutes, seconds].every(Number.isFinite)) {
+          return Math.max(0, minutes * 60 + seconds);
+        }
+      }
+
+      return null;
+    }
+
+    toKnowledgeDanmuText(point) {
+      if (typeof point === 'string') {
+        return point.trim();
+      }
+      if (!point || typeof point !== 'object') {
+        return '';
+      }
+      const term = typeof point.term === 'string' ? point.term.trim() : '';
+      const explanation = typeof point.explanation === 'string' ? point.explanation.trim() : '';
+      const text = term && explanation ? `${term}: ${explanation}` : (term || explanation);
+      if (!text) return '';
+      return text.length > 80 ? `${text.slice(0, 77)}...` : text;
+    }
+
+    updateKnowledgeDanmuSource(knowledgePoints, bvid) {
+      const source = Array.isArray(knowledgePoints) ? knowledgePoints : [];
+      this.knowledgeDanmuQueue = source
+        .map((point, index) => {
+          const seconds = this.parseTimestampToSeconds(
+            typeof point === 'object' ? (point.timestamp ?? point.time ?? point.start_time) : null
+          );
+          const text = this.toKnowledgeDanmuText(point);
+          if (!Number.isFinite(seconds) || !text) return null;
+          return {
+            id: `${bvid || 'unknown'}-${Math.round(seconds * 10)}-${index}`,
+            timeSec: seconds,
+            text
+          };
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.timeSec - b.timeSec);
+
+      this.analysisBvid = bvid || this.analysisBvid;
+      this.triggeredDanmuIds.clear();
+      this.lastDanmuCurrentTime = 0;
+      this.nextDanmuLane = 0;
+      this.clearKnowledgeDanmuNodes();
+    }
+
+    clearKnowledgeDanmuNodes() {
+      if (!this.knowledgeDanmuLayer) return;
+      const nodes = this.knowledgeDanmuLayer.querySelectorAll('.visionmark-knowledge-danmu');
+      nodes.forEach(node => node.remove());
+    }
+
+    clearKnowledgeDanmuState() {
+      this.knowledgeDanmuQueue = [];
+      this.triggeredDanmuIds.clear();
+      this.lastDanmuCurrentTime = 0;
+      this.nextDanmuLane = 0;
+      this.clearKnowledgeDanmuNodes();
+    }
+
+    ensureKnowledgeDanmuLayer() {
+      const container = document.querySelector('.bpx-player-video-wrap') ||
+        document.querySelector('.bpx-player-video-area') ||
+        document.querySelector('.bpx-player-container') ||
+        document.querySelector('#bilibili-player');
+      if (!container) return null;
+
+      if (getComputedStyle(container).position === 'static') {
+        container.style.position = 'relative';
+      }
+
+      if (!document.getElementById('visionmark-knowledge-danmu-style')) {
+        const style = document.createElement('style');
+        style.id = 'visionmark-knowledge-danmu-style';
+        style.textContent = `
+          #visionmark-knowledge-danmu-layer {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            overflow: hidden;
+            z-index: 99998;
+          }
+          .visionmark-knowledge-danmu {
+            position: absolute;
+            right: -20%;
+            max-width: min(58vw, 640px);
+            padding: 8px 14px;
+            border-radius: 999px;
+            border: 1px solid rgba(255, 255, 255, 0.42);
+            background: rgba(18, 24, 38, 0.9);
+            color: #ffffff;
+            font-size: 14px;
+            line-height: 1.35;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+            overflow: hidden;
+            box-shadow: 0 10px 26px rgba(0, 0, 0, 0.35);
+            animation: visionmarkDanmuFly 4.2s linear forwards;
+          }
+          @keyframes visionmarkDanmuFly {
+            0% { transform: translateX(0); opacity: 0; }
+            10% { opacity: 1; }
+            100% { transform: translateX(calc(-120vw - 640px)); opacity: 1; }
+          }
+        `;
+        document.head.appendChild(style);
+      }
+
+      let layer = container.querySelector('#visionmark-knowledge-danmu-layer');
+      if (!layer) {
+        layer = document.createElement('div');
+        layer.id = 'visionmark-knowledge-danmu-layer';
+        container.appendChild(layer);
+      }
+      this.knowledgeDanmuLayer = layer;
+      return layer;
+    }
+
+    renderKnowledgeDanmu(item) {
+      const layer = this.ensureKnowledgeDanmuLayer();
+      if (!layer) return;
+      if (layer.childElementCount >= DANMU_MAX_CONCURRENT) return;
+
+      const lanes = [14, 24, 34, 44, 54, 64];
+      const lane = lanes[this.nextDanmuLane % lanes.length];
+      this.nextDanmuLane += 1;
+
+      const node = document.createElement('div');
+      node.className = 'visionmark-knowledge-danmu';
+      node.style.top = `${lane}%`;
+      node.textContent = item.text;
+
+      const cleanup = () => node.remove();
+      node.addEventListener('animationend', cleanup, { once: true });
+      setTimeout(cleanup, 4500);
+      layer.appendChild(node);
+    }
+
+    handleKnowledgeDanmu(currentTime) {
+      if (!Number.isFinite(currentTime) || !this.knowledgeDanmuQueue.length) {
+        this.lastDanmuCurrentTime = currentTime;
+        return;
+      }
+      if (currentTime + DANMU_REWIND_RESET_SEC < this.lastDanmuCurrentTime) {
+        this.triggeredDanmuIds.clear();
+      }
+
+      let rendered = 0;
+      for (const item of this.knowledgeDanmuQueue) {
+        if (rendered >= 2) break;
+        if (this.triggeredDanmuIds.has(item.id)) continue;
+        const delta = currentTime - item.timeSec;
+        if (delta >= -DANMU_TRIGGER_WINDOW_SEC && delta <= DANMU_TRIGGER_WINDOW_SEC) {
+          this.triggeredDanmuIds.add(item.id);
+          this.renderKnowledgeDanmu(item);
+          rendered += 1;
+        }
+      }
+
+      this.lastDanmuCurrentTime = currentTime;
+    }
+
+    formatMockTimestamp(seconds) {
+      const sec = Math.max(0, Math.floor(Number(seconds) || 0));
+      const minutes = Math.floor(sec / 60);
+      const remainder = sec % 60;
+      return `${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`;
+    }
+
+    buildMockAnalysisData(bvid) {
+      const scenario = MOCK_ANALYSIS_SCENARIO.toLowerCase();
+      const dense = scenario === 'dense';
+      const segments = dense
+        ? [
+          { start_time: 8, end_time: 18, description: 'Opening sponsor segment', highlight: false, ad_type: 'soft_ad' },
+          { start_time: 36, end_time: 52, description: 'Core viewpoint explanation', highlight: true, ad_type: 'hard_ad' },
+          { start_time: 78, end_time: 90, description: 'Case breakdown segment', highlight: true, ad_type: 'hard_ad' },
+          { start_time: 122, end_time: 136, description: 'Mid-roll promotion', highlight: false, ad_type: 'soft_ad' }
+        ]
+        : [
+          { start_time: 12, end_time: 22, description: 'Opening sponsor segment', highlight: false, ad_type: 'soft_ad' },
+          { start_time: 46, end_time: 62, description: 'Main conclusion segment', highlight: true, ad_type: 'hard_ad' },
+          { start_time: 108, end_time: 120, description: 'Final recap segment', highlight: true, ad_type: 'hard_ad' }
+        ];
+
+      const knowledgeBase = dense
+        ? [
+          { t: 20, term: 'Problem Decomposition', explanation: 'Split complex tasks into actionable sub-problems.' },
+          { t: 41, term: 'Minimum Viable Plan', explanation: 'Validate direction with the smallest closed loop.' },
+          { t: 66, term: 'Feedback Loop', explanation: 'Use short feedback cycles to correct execution quickly.' },
+          { t: 95, term: 'Constraints', explanation: 'Time and resources define what is feasible.' },
+          { t: 128, term: 'Retrospective', explanation: 'Review outcomes and extract reusable patterns.' }
+        ]
+        : [
+          { t: 24, term: 'Objective Function', explanation: 'Define success metrics before choosing methods.' },
+          { t: 58, term: 'Path Dependence', explanation: 'Past decisions constrain today\'s option space.' },
+          { t: 112, term: 'Marginal Return', explanation: 'Extra investment often has diminishing returns.' }
+        ];
+
+      const knowledge_points = knowledgeBase.map(item => ({
+        term: item.term,
+        explanation: item.explanation,
+        timestamp: this.formatMockTimestamp(item.t)
+      }));
+
+      const hot_words = knowledgeBase.slice(0, 3).map(item => ({
+        word: item.term,
+        meaning: item.explanation,
+        timestamp: this.formatMockTimestamp(item.t)
+      }));
+
+      return {
+        success: true,
+        data: {
+          bvid,
+          title: `Local mock analysis - ${bvid}`,
+          tags: ['local-mock', 'AI', 'VisionMark'],
+          summary: 'Local mock analysis result used for testing sidebar and knowledge danmu rendering.',
+          transcript: '',
+          ad_segments: segments,
+          knowledge_points,
+          hot_words,
+          analyzed_at: new Date().toISOString()
+        }
+      };
+    }
+
+    async requestAnalysis(bvid, token) {
+      if (MOCK_ANALYSIS) {
+        await new Promise(resolve => setTimeout(resolve, MOCK_ANALYSIS_DELAY_MS));
+        return this.buildMockAnalysisData(bvid);
+      }
+
+      const url = VIDEO_ANALYSIS_BASE + "/video-analysis/analyze";
+      const res = await this.safeFetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + token
+        },
+        body: JSON.stringify({ bvid })
+      }, 'analyze video');
+
+      let payload = null;
+      try {
+        payload = await res.json();
+      } catch (error) {
+        payload = null;
+      }
+
+      if (!res.ok) {
+        const message = payload?.message || payload?.error || `分析失败（${res.status}）`;
+        throw new Error(message);
+      }
+      return payload;
+    }
+
+    applyAnalysisData(bvid, data) {
+      const analysisData = data || {};
+      const rawSegments = Array.isArray(analysisData.ad_segments) ? analysisData.ad_segments : [];
+      const aiSegments = rawSegments
+        .map((segment, index) => this.normalizeSegment({
+          id: `ai-${bvid}-${index}`,
+          start_time: Number(segment.start_time ?? segment.start ?? 0),
+          end_time: Number(segment.end_time ?? segment.end ?? 0),
+          action: segment.highlight ? 'popup' : 'skip',
+          content: typeof segment.description === 'string' ? segment.description : '',
+          ad_type: segment.ad_type || (segment.highlight ? 'hard_ad' : 'soft_ad'),
+          is_ai_segment: true
+        }, index))
+        .filter(segment => Number.isFinite(segment.start_time) && Number.isFinite(segment.end_time) && segment.end_time > segment.start_time);
+
+      const knowledgePoints = Array.isArray(analysisData.knowledge_points) ? analysisData.knowledge_points : [];
+      const hotWords = Array.isArray(analysisData.hot_words) ? analysisData.hot_words : [];
+
+      this.analysisBvid = bvid;
+      this.aiSummary = typeof analysisData.summary === 'string' ? analysisData.summary.trim() : '';
+      this.segments = aiSegments;
+      this.allSegments = aiSegments;
+      this.currentSegmentIds = [];
+      this.lastPopupSegmentKey = null;
+      this.updateKnowledgeDanmuSource(knowledgePoints, bvid);
+      this.addSegmentMarkers();
+
+      if (sidebarState) {
+        sidebarState.aiSummary = this.aiSummary || '暂无总结';
+        sidebarState.aiTitle = analysisData.title || '';
+        sidebarState.knowledgePoints = knowledgePoints;
+        sidebarState.hotWords = hotWords;
+        sidebarState.bvid = bvid;
+        sidebarState.cid = this.player.currentCid || null;
+        sidebarState.segments = aiSegments;
+        sidebarState.activeSegmentKey = null;
+      }
+    }
+
+    async analyzeVideoLegacy(bvid) {
       try {
         const token = await this.getToken();
         if (!token) {
@@ -514,7 +861,7 @@
         }
 
         if (result.success && result.data) {
-          console.log("[AdSkipper] ✅ 分析成功");
+          console.log("[AdSkipper] 分析成功");
           console.log("[AdSkipper] title:", result.data.title);
           console.log("[AdSkipper] summary:", result.data.summary);
           console.log("[AdSkipper] ad_segments:", result.data.ad_segments?.length || 0);
@@ -554,7 +901,7 @@
               sidebarState.segments = [];
             }
 
-            console.log("[AdSkipper] ✅ 侧边栏数据已更新:");
+            console.log("[AdSkipper] 侧边栏数据已更新:");
             console.log("  - aiTitle:", sidebarState.aiTitle);
             console.log("  - aiSummary:", sidebarState.aiSummary ? sidebarState.aiSummary.substring(0, 50) + '...' : '');
             console.log("  - knowledgePoints:", sidebarState.knowledgePoints.length);
@@ -566,7 +913,41 @@
         console.error("[AdSkipper] 分析视频出错:", error);
         if (sidebarState) {
           sidebarState.isLoading = false;
-          sidebarState.loadError = '分析失败：' + error.message;
+          sidebarState.loadError = '分析失败: ' + error.message;
+        }
+      }
+    }
+
+    async analyzeVideo(bvid) {
+      try {
+        let token = '';
+        if (!MOCK_ANALYSIS) {
+          token = await this.getToken();
+          if (!token) {
+            console.log('[AdSkipper] 未登录，跳过视频分析');
+            return;
+          }
+        }
+
+        if (sidebarState) {
+          sidebarState.isLoading = true;
+          sidebarState.loadError = null;
+        }
+
+        const result = await this.requestAnalysis(bvid, token);
+        if (!result?.success || !result?.data) {
+          throw new Error('分析结果无效');
+        }
+
+        this.applyAnalysisData(bvid, result.data);
+        if (sidebarState) {
+          sidebarState.isLoading = false;
+        }
+      } catch (error) {
+        console.error('[AdSkipper] Analyze video error:', error);
+        if (sidebarState) {
+          sidebarState.isLoading = false;
+          sidebarState.loadError = '分析失败: ' + error.message;
         }
       }
     }
@@ -602,11 +983,11 @@
 
       const start = Number.isFinite(segment.start_time) ? segment.start_time.toFixed(1) : '-';
       const end = Number.isFinite(segment.end_time) ? segment.end_time.toFixed(1) : '-';
-      const content = segment.content || '该片段暂无解读文案';
+      const content = segment.content || 'No description available for this segment.';
 
       popup.innerHTML = `
         <div style="font-size: 11px; letter-spacing: .4px; color: #74b7ff; margin-bottom: 6px;">
-          AI HIGHLIGHT ${start}s - ${end}s
+          重点片段 ${start}s - ${end}s
         </div>
         <div style="white-space: pre-wrap;">${content}</div>
       `;
@@ -649,7 +1030,7 @@
 
       this.lastPopupSegmentKey = key;
       this.showInsightPopup(segment);
-      this.showToast('AI 知识点提醒', 'info');
+      this.showToast('知识点提醒', 'info');
     }
 
     handleSkipSegment(segment) {
@@ -667,8 +1048,13 @@
       }
     }
 
-    // 更新后的 checkSkip 方法
+    // 鏇存柊鍚庣殑 checkSkip 鏂规硶
     checkSkip(currentTime) {
+      if (this.analysisBvid && this.player.currentBvid && this.analysisBvid !== this.player.currentBvid) {
+        this.clearKnowledgeDanmuState();
+        this.analysisBvid = this.player.currentBvid;
+      }
+
       if (sidebarState) {
         sidebarState.currentTime = currentTime;
         if (this.player.currentBvid) {
@@ -678,6 +1064,8 @@
           sidebarState.cid = this.player.currentCid;
         }
       }
+
+      this.handleKnowledgeDanmu(currentTime);
 
       if (!this.segments.length) {
         if (sidebarState) {
@@ -899,9 +1287,9 @@
       const types = [
         { val: 'hard_ad', text: '硬广' },
         { val: 'soft_ad', text: '软广' },
-        { val: 'product_placement', text: '植入' },
-        { val: 'intro_ad', text: '片头' },
-        { val: 'mid_ad', text: '中段' }
+        { val: 'product_placement', text: '植入广告' },
+        { val: 'intro_ad', text: '片头广告' },
+        { val: 'mid_ad', text: '中段广告' }
       ];
       types.forEach((item) => {
         const option = document.createElement('option');
@@ -957,7 +1345,7 @@
 
         const targetId = self.currentSegmentIds[self.currentSegmentIds.length - 1];
         // Use native confirm for control panel popover (dark theme UI)
-        const confirmed = confirm(`确定删除最近标注 ID: ${targetId} ?`);
+        const confirmed = confirm(`确定要删除最近标注（ID：${targetId}）吗？`);
         if (!confirmed) return;
 
         btnDelete.textContent = '删除中...';
@@ -1156,7 +1544,7 @@
       }, 'submit annotation');
 
       if (!res.ok) {
-        let errorMsg = 'Submit failed';
+        let errorMsg = '提交失败';
         try {
           const data = await res.json();
           errorMsg = data.error || errorMsg;
@@ -1238,7 +1626,7 @@
         box-shadow: 0 4px 16px rgba(0,0,0,0.3);
         animation: slideDown 0.4s ease-out;
       `;
-      toast.innerHTML = `✓ Auto skipped ${duration}s`;
+      toast.innerHTML = `✓ 已自动跳过 ${duration}s`;
 
       // Progress bar
       const progress = document.createElement('div');
@@ -1301,7 +1689,7 @@
       const self = this;
 
       // 3. 精准挂载容器选择，优先挂到视频画面容器，避免控制栏
-      // 优先级：.bpx-player-video-wrap > .bpx-player-video-area > fallback
+      // 浼樺厛绾э細.bpx-player-video-wrap > .bpx-player-video-area > fallback
       let playerContainer = document.querySelector('.bpx-player-video-wrap') ||
         document.querySelector('.bpx-player-video-area') ||
         document.querySelector('.bpx-player-container') ||
@@ -1392,7 +1780,7 @@
       btn.onclick = () => {
         self.player.skipTo(ad.end_time);
         self.lastSkipTime = Date.now();
-        self.showToast('Skipped ' + (ad.end_time - ad.start_time).toFixed(1) + 's', 'success');
+        self.showToast('已跳过 ' + (ad.end_time - ad.start_time).toFixed(1) + ' 秒', 'success');
         self.hideSkipButton();
       };
 
@@ -1466,7 +1854,8 @@
         const titleContent = segment.action === 'popup' && segment.content
           ? ` | ${segment.content.slice(0, 36)}`
           : '';
-        marker.title = `${segment.start_time.toFixed(1)}s - ${segment.end_time.toFixed(1)}s | ${segment.action}${titleContent}`;
+        const actionText = segment.action === 'popup' ? '重点' : '跳过';
+        marker.title = `${segment.start_time.toFixed(1)}s - ${segment.end_time.toFixed(1)}s | ${actionText}${titleContent}`;
 
         progressSlide.appendChild(marker);
       });
@@ -1479,5 +1868,6 @@
 
   new AdSkipperCore().init();
 })();
+
 
 

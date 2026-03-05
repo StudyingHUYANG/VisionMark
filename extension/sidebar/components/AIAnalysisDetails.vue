@@ -25,7 +25,7 @@
       <ul class="vm-analysis-list">
         <li v-for="(point, index) in knowledgePoints" :key="index" class="vm-analysis-list__item">
           <span class="vm-analysis-list__bullet">{{ index + 1 }}</span>
-          <span class="vm-analysis-list__text">{{ point }}</span>
+          <span class="vm-analysis-list__text">{{ formatKnowledgePoint(point) }}</span>
         </li>
       </ul>
     </div>
@@ -46,7 +46,7 @@
           class="vm-analysis-tag"
           :style="{ fontSize: `${Math.max(12, 16 - index * 0.5)}px` }"
         >
-          {{ word }}
+          {{ formatHotWord(word) }}
         </span>
       </div>
     </div>
@@ -54,8 +54,6 @@
 </template>
 
 <script setup>
-import { computed } from 'vue';
-
 const props = defineProps({
   title: {
     type: String,
@@ -71,11 +69,33 @@ const props = defineProps({
   }
 });
 
-// 调试日志
-console.log('[AIAnalysisDetails] 组件已渲染');
-console.log('[AIAnalysisDetails] title:', props.title);
-console.log('[AIAnalysisDetails] knowledgePoints:', props.knowledgePoints);
-console.log('[AIAnalysisDetails] hotWords:', props.hotWords);
+function normalizeText(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function formatKnowledgePoint(point) {
+  if (typeof point === 'string') return point;
+  if (!point || typeof point !== 'object') return '';
+
+  const timestamp = normalizeText(point.timestamp);
+  const term = normalizeText(point.term || point.title || point.word);
+  const explanation = normalizeText(point.explanation || point.description || point.desc);
+  const content = term && explanation ? `${term}：${explanation}` : (term || explanation);
+  if (!content) return '';
+
+  const base = timestamp ? `[${timestamp}] ${content}` : content;
+  return base.length > 120 ? `${base.slice(0, 117)}...` : base;
+}
+
+function formatHotWord(word) {
+  if (typeof word === 'string') return word;
+  if (!word || typeof word !== 'object') return '';
+
+  const label = normalizeText(word.word || word.term || word.name);
+  const timestamp = normalizeText(word.timestamp);
+  if (!label) return '';
+  return timestamp ? `${label} ${timestamp}` : label;
+}
 </script>
 
 <style scoped>

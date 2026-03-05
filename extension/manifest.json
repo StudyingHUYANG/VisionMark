@@ -35,10 +35,11 @@
         "content/config.local.js",
         "content/constants.js",
         "content/player.js",
-        "content/main.js"
+        "dist/main.js"
       ],
       "css": [
-        "content/content.css"
+        "content/content.css",
+        "dist/visionmark.css"
       ],
       "run_at": "document_idle"
     }

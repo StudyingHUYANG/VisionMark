@@ -8,5 +8,10 @@ window.LOCAL_CONFIG = {
   API_BASE: 'http://localhost:8080',
 
   // API 版本
-  API_VERSION: 'api/v1'
+  API_VERSION: 'api/v1',
+
+  // Frontend-only mock switches for AI analysis
+  MOCK_ANALYSIS: true,
+  MOCK_ANALYSIS_DELAY_MS: 400,
+  MOCK_ANALYSIS_SCENARIO: 'default'
 };
