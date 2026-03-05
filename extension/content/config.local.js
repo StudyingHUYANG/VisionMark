@@ -11,7 +11,7 @@ window.LOCAL_CONFIG = {
   API_VERSION: 'api/v1',
 
   // Frontend-only mock switches for AI analysis
-  MOCK_ANALYSIS: true,
+  MOCK_ANALYSIS: flase,
   MOCK_ANALYSIS_DELAY_MS: 400,
   MOCK_ANALYSIS_SCENARIO: 'dense'
 };
