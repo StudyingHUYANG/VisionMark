@@ -1,5 +1,5 @@
 <template>
-  <div v-if="loading || error || summary" class="vm-summary" :class="{ 'vm-summary--loading': loading }">
+  <div class="vm-summary" :class="{ 'vm-summary--loading': loading }">
     <template v-if="loading">
       <SkeletonLoader variant="card" :lines="3" />
     </template>
@@ -14,15 +14,16 @@
       </div>
     </template>
     <template v-else>
-      <p class="vm-summary__text">{{ summary }}</p>
+      <p class="vm-summary__text">{{ displaySummary }}</p>
     </template>
   </div>
 </template>
 
 <script setup>
+import { computed } from 'vue';
 import SkeletonLoader from './SkeletonLoader.vue';
 
-defineProps({
+const props = defineProps({
   summary: {
     type: String,
     default: ''
@@ -35,6 +36,10 @@ defineProps({
     type: String,
     default: null
   }
+});
+
+const displaySummary = computed(() => {
+  return props.summary || '暂无总结';
 });
 </script>
 

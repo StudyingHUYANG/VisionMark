@@ -21,7 +21,7 @@ const userInfoCache = {
 };
 
 function createNetworkUnavailableError() {
-  const error = new Error('Failed to fetch');
+  const error = new Error('网络不可用，请稍后重试');
   error.code = NETWORK_ERROR_CODE;
   return error;
 }
@@ -40,14 +40,14 @@ function markNetworkOffline(error) {
   networkState.offlineUntil = Date.now() + NETWORK_COOLDOWN_MS;
   networkState.wasOffline = true;
   if (!networkState.hasLoggedOffline) {
-    console.warn('[Popup] Backend unreachable, pausing requests for 30s.', error);
+    console.warn('[Popup] 后端不可达，暂停请求 30 秒。', error);
     networkState.hasLoggedOffline = true;
   }
 }
 
 function markNetworkOnline() {
   if (networkState.wasOffline) {
-    console.info('[Popup] Backend connection restored.');
+    console.info('[Popup] 后端连接已恢复');
   }
   networkState.offlineUntil = 0;
   networkState.hasLoggedOffline = false;
@@ -86,6 +86,25 @@ function resetUserInfoCache() {
   userInfoCache.data = null;
   userInfoCache.updatedAt = 0;
   userInfoCache.pending = null;
+}
+
+function formatTierLabel(tier) {
+  const rawTier = String(tier || '').trim();
+  if (!rawTier) return '青铜会员';
+
+  const normalized = rawTier.toLowerCase();
+  const tierMap = {
+    bronze: '青铜会员',
+    silver: '白银会员',
+    gold: '黄金会员',
+    platinum: '铂金会员',
+    diamond: '钻石会员',
+    admin: '管理员'
+  };
+
+  if (tierMap[normalized]) return tierMap[normalized];
+  if (/[\u4e00-\u9fa5]/.test(rawTier)) return rawTier;
+  return '普通会员';
 }
 
 // 统一的API请求函数
@@ -179,7 +198,7 @@ async function showUserPanel(user) {
 
   document.getElementById('display-username').textContent = user.username;
   document.getElementById('display-points').textContent = user.points || 0;
-  document.getElementById('display-tier').textContent = (user.tier || 'Bronze').toUpperCase();
+  document.getElementById('display-tier').textContent = formatTierLabel(user.tier);
   
   // 确保登录后面板使用最新跳过模式状态
   loadSkipModeSetting();
@@ -250,7 +269,7 @@ async function refreshUserInfo() {
     localStorage.setItem('adskipper_user', JSON.stringify(user));
     // 更新显示
     document.getElementById('display-points').textContent = user.points || 0;
-    document.getElementById('display-tier').textContent = (user.tier || 'Bronze').toUpperCase();
+    document.getElementById('display-tier').textContent = formatTierLabel(user.tier);
     console.log('[Popup] 积分已刷新:', user.points);
     
     // 同时刷新标注数量

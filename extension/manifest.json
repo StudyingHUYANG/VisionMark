@@ -38,8 +38,8 @@
         "dist/main.js"
       ],
       "css": [
-        "dist/visionmark.css",
-        "content/content.css"
+        "content/content.css",
+        "dist/visionmark.css"
       ],
       "run_at": "document_idle"
     }
@@ -49,8 +49,7 @@
       "resources": [
         "history/history.html",
         "history/history.js",
-        "content/config.local.js",
-        "sidebar/**"
+        "content/config.local.js"
       ],
       "matches": ["<all_urls>"]
     }

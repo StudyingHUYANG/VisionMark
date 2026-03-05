@@ -25,17 +25,7 @@
       <ul class="vm-analysis-list">
         <li v-for="(point, index) in knowledgePoints" :key="index" class="vm-analysis-list__item">
           <span class="vm-analysis-list__bullet">{{ index + 1 }}</span>
-          <div class="vm-analysis-list__content">
-            <div class="vm-analysis-list__title">
-              {{ typeof point === 'object' ? point.term : point }}
-              <span v-if="typeof point === 'object' && point.timestamp" class="vm-analysis-list__time">
-                {{ point.timestamp }}
-              </span>
-            </div>
-            <p v-if="typeof point === 'object' && point.explanation" class="vm-analysis-list__desc">
-              {{ point.explanation }}
-            </p>
-          </div>
+          <span class="vm-analysis-list__text">{{ formatKnowledgePoint(point) }}</span>
         </li>
       </ul>
     </div>
@@ -54,9 +44,9 @@
           v-for="(word, index) in hotWords"
           :key="index"
           class="vm-analysis-tag"
-          :title="typeof word === 'object' && word.meaning ? word.meaning : ''"
+          :style="{ fontSize: `${Math.max(12, 16 - index * 0.5)}px` }"
         >
-          {{ typeof word === 'object' ? word.word : word }}
+          {{ formatHotWord(word) }}
         </span>
       </div>
     </div>
@@ -78,6 +68,34 @@ const props = defineProps({
     default: () => []
   }
 });
+
+function normalizeText(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function formatKnowledgePoint(point) {
+  if (typeof point === 'string') return point;
+  if (!point || typeof point !== 'object') return '';
+
+  const timestamp = normalizeText(point.timestamp);
+  const term = normalizeText(point.term || point.title || point.word);
+  const explanation = normalizeText(point.explanation || point.description || point.desc);
+  const content = term && explanation ? `${term}：${explanation}` : (term || explanation);
+  if (!content) return '';
+
+  const base = timestamp ? `[${timestamp}] ${content}` : content;
+  return base.length > 120 ? `${base.slice(0, 117)}...` : base;
+}
+
+function formatHotWord(word) {
+  if (typeof word === 'string') return word;
+  if (!word || typeof word !== 'object') return '';
+
+  const label = normalizeText(word.word || word.term || word.name);
+  const timestamp = normalizeText(word.timestamp);
+  if (!label) return '';
+  return timestamp ? `${label} ${timestamp}` : label;
+}
 </script>
 
 <style scoped>
@@ -160,7 +178,7 @@ const props = defineProps({
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  padding: 10px 0;
+  padding: 8px 0;
   border-bottom: 1px solid rgba(251, 114, 153, 0.08);
 }
 
@@ -186,39 +204,6 @@ const props = defineProps({
   font-size: 11px;
   font-weight: 600;
   margin-top: 1px;
-}
-
-.vm-analysis-list__content {
-  flex: 1;
-  min-width: 0;
-}
-
-.vm-analysis-list__title {
-  font-size: 13px;
-  line-height: 1.5;
-  color: var(--vm-text-primary);
-  font-weight: 600;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 4px;
-}
-
-.vm-analysis-list__time {
-  font-size: 10px;
-  padding: 1px 6px;
-  background: rgba(251, 114, 153, 0.1);
-  color: var(--vm-color-primary, #FB7299);
-  border-radius: 8px;
-  font-weight: 500;
-  font-family: "SF Mono", "Consolas", monospace;
-}
-
-.vm-analysis-list__desc {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--vm-text-secondary, #666);
 }
 
 .vm-analysis-list__text {
