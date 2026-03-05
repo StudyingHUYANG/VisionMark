@@ -1,4 +1,6 @@
-﻿(function () {
+import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.js';
+
+(function () {
   'use strict';
 
   if (window.adSkipper) return;
@@ -9,12 +11,7 @@
   // API 基础路径
   const API_BASE = window.API_BASE || 'http://localhost:8080/api/v1';
   const VIDEO_ANALYSIS_BASE = window.LOCAL_CONFIG?.API_BASE || 'http://localhost:8080';
-  const MOCK_ANALYSIS = Boolean(window.LOCAL_CONFIG?.MOCK_ANALYSIS);
-  const MOCK_ANALYSIS_SCENARIO = String(window.LOCAL_CONFIG?.MOCK_ANALYSIS_SCENARIO || 'default');
-  const parsedMockDelay = Number(window.LOCAL_CONFIG?.MOCK_ANALYSIS_DELAY_MS);
-  const MOCK_ANALYSIS_DELAY_MS = Number.isFinite(parsedMockDelay) && parsedMockDelay >= 0
-    ? parsedMockDelay
-    : 400;
+  const MOCK_ANALYSIS = getMockAnalysisConfig(window.LOCAL_CONFIG).enabled;
   const DANMU_TRIGGER_WINDOW_SEC = 0.3;
   const DANMU_REWIND_RESET_SEC = 1.0;
   const DANMU_MAX_CONCURRENT = 3;
@@ -78,7 +75,7 @@
         // 检查登录状态
         chrome.storage.local.get(['adskipper_token'], (storage) => {
           const token = storage.adskipper_token;
-          console.log('[AdSkipper] Login status:', token ? 'logged in' : 'not logged in');
+          console.log('[AdSkipper] 登录状态:', token ? '已登录' : '未登录');
         });
 
         // 加载跳过模式设置
@@ -103,7 +100,7 @@
         // Vue 侧边栏初始化
         // ==========================
         this.initSidebar().then(() => {
-          console.log('[AdSkipper] Sidebar initialized.');
+          console.log('[AdSkipper] 侧边栏初始化完成');
         }).catch(err => {
           console.error("[AdSkipper] Sidebar 初始化失败:", err);
         });
@@ -183,7 +180,7 @@
       root.id = 'vm-sidebar-root';
       document.body.appendChild(root);
 
-      console.log('[AdSkipper Sidebar] Initializing sidebar...');
+      console.log('[AdSkipper Sidebar] 正在初始化侧边栏...');
       this.sidebarController = createSidebar(root);
     }
 
@@ -241,7 +238,7 @@
       button.onclick = (event) => {
         event.stopPropagation();
         this.toggleSidebar().catch((error) => {
-          console.error('[AdSkipper] Toggle sidebar failed:', error);
+          console.error('[AdSkipper] 切换侧边栏失败:', error);
           this.showToast('视频总结面板加载失败', 'error');
         });
       };
@@ -344,14 +341,14 @@
       this.networkState.offlineUntil = Date.now() + this.networkCooldownMs;
       this.networkState.wasOffline = true;
       if (!this.networkState.hasLoggedOffline) {
-        console.warn(`[AdSkipper] Backend unreachable during ${context}, pausing requests for 30s.`, error);
+        console.warn(`[AdSkipper] 后端在 ${context} 时不可达，暂停请求 30 秒。`, error);
         this.networkState.hasLoggedOffline = true;
       }
     }
 
     markNetworkOnline() {
       if (this.networkState.wasOffline) {
-        console.info('[AdSkipper] Backend connection restored.');
+        console.info('[AdSkipper] 后端连接已恢复');
       }
       this.networkState.offlineUntil = 0;
       this.networkState.hasLoggedOffline = false;
@@ -459,7 +456,7 @@
         this.addSegmentMarkers();
       } catch (error) {
         if (error.code !== 'NETWORK_UNAVAILABLE') {
-          console.error('[AdSkipper] Load segments failed:', error);
+          console.error('[AdSkipper] 加载片段失败:', error);
         }
         this.segments = [];
         this.allSegments = [];
@@ -689,75 +686,11 @@
       this.lastDanmuCurrentTime = currentTime;
     }
 
-    formatMockTimestamp(seconds) {
-      const sec = Math.max(0, Math.floor(Number(seconds) || 0));
-      const minutes = Math.floor(sec / 60);
-      const remainder = sec % 60;
-      return `${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`;
-    }
-
-    buildMockAnalysisData(bvid) {
-      const scenario = MOCK_ANALYSIS_SCENARIO.toLowerCase();
-      const dense = scenario === 'dense';
-      const segments = dense
-        ? [
-          { start_time: 8, end_time: 18, description: 'Opening sponsor segment', highlight: false, ad_type: 'soft_ad' },
-          { start_time: 36, end_time: 52, description: 'Core viewpoint explanation', highlight: true, ad_type: 'hard_ad' },
-          { start_time: 78, end_time: 90, description: 'Case breakdown segment', highlight: true, ad_type: 'hard_ad' },
-          { start_time: 122, end_time: 136, description: 'Mid-roll promotion', highlight: false, ad_type: 'soft_ad' }
-        ]
-        : [
-          { start_time: 12, end_time: 22, description: 'Opening sponsor segment', highlight: false, ad_type: 'soft_ad' },
-          { start_time: 46, end_time: 62, description: 'Main conclusion segment', highlight: true, ad_type: 'hard_ad' },
-          { start_time: 108, end_time: 120, description: 'Final recap segment', highlight: true, ad_type: 'hard_ad' }
-        ];
-
-      const knowledgeBase = dense
-        ? [
-          { t: 20, term: 'Problem Decomposition', explanation: 'Split complex tasks into actionable sub-problems.' },
-          { t: 41, term: 'Minimum Viable Plan', explanation: 'Validate direction with the smallest closed loop.' },
-          { t: 66, term: 'Feedback Loop', explanation: 'Use short feedback cycles to correct execution quickly.' },
-          { t: 95, term: 'Constraints', explanation: 'Time and resources define what is feasible.' },
-          { t: 128, term: 'Retrospective', explanation: 'Review outcomes and extract reusable patterns.' }
-        ]
-        : [
-          { t: 24, term: 'Objective Function', explanation: 'Define success metrics before choosing methods.' },
-          { t: 58, term: 'Path Dependence', explanation: 'Past decisions constrain today\'s option space.' },
-          { t: 112, term: 'Marginal Return', explanation: 'Extra investment often has diminishing returns.' }
-        ];
-
-      const knowledge_points = knowledgeBase.map(item => ({
-        term: item.term,
-        explanation: item.explanation,
-        timestamp: this.formatMockTimestamp(item.t)
-      }));
-
-      const hot_words = knowledgeBase.slice(0, 3).map(item => ({
-        word: item.term,
-        meaning: item.explanation,
-        timestamp: this.formatMockTimestamp(item.t)
-      }));
-
-      return {
-        success: true,
-        data: {
-          bvid,
-          title: `Local mock analysis - ${bvid}`,
-          tags: ['local-mock', 'AI', 'VisionMark'],
-          summary: 'Local mock analysis result used for testing sidebar and knowledge danmu rendering.',
-          transcript: '',
-          ad_segments: segments,
-          knowledge_points,
-          hot_words,
-          analyzed_at: new Date().toISOString()
-        }
-      };
-    }
 
     async requestAnalysis(bvid, token) {
-      if (MOCK_ANALYSIS) {
-        await new Promise(resolve => setTimeout(resolve, MOCK_ANALYSIS_DELAY_MS));
-        return this.buildMockAnalysisData(bvid);
+      const mockResult = await resolveMockAnalysisData(bvid, window.LOCAL_CONFIG);
+      if (mockResult) {
+        return mockResult;
       }
 
       const url = VIDEO_ANALYSIS_BASE + "/video-analysis/analyze";
@@ -944,7 +877,7 @@
           sidebarState.isLoading = false;
         }
       } catch (error) {
-        console.error('[AdSkipper] Analyze video error:', error);
+        console.error('[AdSkipper] 视频分析异常:', error);
         if (sidebarState) {
           sidebarState.isLoading = false;
           sidebarState.loadError = '分析失败: ' + error.message;
@@ -1522,20 +1455,20 @@
         ad_type: type
       };
 
-      console.log('[AdSkipper] Submit annotation:', body);
+      console.log('[AdSkipper] 提交标注:', body);
       const storage = await new Promise(r => chrome.storage.local.get(['adskipper_token'], r));
       const token = storage.adskipper_token;
-      console.log('[AdSkipper] Token status:', token ? 'present' : 'missing');
+      console.log('[AdSkipper] 令牌状态:', token ? '存在' : '缺失');
 
       const headers = { "Content-Type": "application/json" };
       if (token) {
         headers['Authorization'] = 'Bearer ' + token;
-        console.log('[AdSkipper] Authorization Header:', 'Bearer ' + token.substring(0, 20) + '...');
+        console.log('[AdSkipper] 认证头:', 'Bearer ' + token.substring(0, 20) + '...');
       } else {
-        console.warn('[AdSkipper] Warning: request sent without token');
+        console.warn('[AdSkipper] 警告：请求未携带令牌');
       }
 
-      console.log('[AdSkipper] Request headers:', headers);
+      console.log('[AdSkipper] 请求头:', headers);
 
       const res = await this.safeFetch(API_BASE + "/segments", {
         method: "POST",
@@ -1548,9 +1481,9 @@
         try {
           const data = await res.json();
           errorMsg = data.error || errorMsg;
-          console.error('[AdSkipper] Server error:', data);
+          console.error('[AdSkipper] 服务器错误:', data);
         } catch (e) {
-          console.error('[AdSkipper] Failed to parse response:', res.status, res.statusText);
+          console.error('[AdSkipper] 解析响应失败:', res.status, res.statusText);
         }
         throw new Error(errorMsg);
       }
@@ -1696,7 +1629,7 @@
         document.querySelector('#bilibili-player');
 
       if (!playerContainer) {
-        console.log('[AdSkipper] Video container not found');
+        console.log('[AdSkipper] 未找到视频容器');
         return;
       }
 

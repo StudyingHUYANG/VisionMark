@@ -47,14 +47,14 @@ function markNetworkOffline(error) {
   networkState.offlineUntil = Date.now() + NETWORK_COOLDOWN_MS;
   networkState.wasOffline = true;
   if (!networkState.hasLoggedOffline) {
-    console.warn('[History] Backend unreachable, pausing requests for 30s.', error);
+    console.warn('[History] 后端不可达，暂停请求 30 秒。', error);
     networkState.hasLoggedOffline = true;
   }
 }
 
 function markNetworkOnline() {
   if (networkState.wasOffline) {
-    console.info('[History] Backend connection restored.');
+    console.info('[History] 后端连接已恢复');
   }
   networkState.offlineUntil = 0;
   networkState.hasLoggedOffline = false;
