@@ -112,12 +112,7 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
 
         const bvid = this.player.currentBvid;
         if (bvid) {
-          this.loadSegments(bvid).then(async () => {
-            // 如果没有片段数据，自动触发AI分析
-            if (this.segments.length === 0) {
-              console.log("[AdSkipper] 没有广告段数据，尝试自动分析视频...");
-              await this.analyzeVideo(bvid);
-            }
+          this.refreshAnalysisForBvid(bvid).then(() => {
             window.adSkipper = this;
           });
         }
@@ -150,7 +145,7 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
 
       window.addEventListener('visionmark:refresh-ai', () => {
         if (this.player.currentBvid) {
-          this.loadSegments(this.player.currentBvid);
+          this.refreshAnalysisForBvid(this.player.currentBvid, { forceAnalyze: true });
         }
       });
 
@@ -274,11 +269,20 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
       return Boolean(this.sidebarController);
     }
 
+    async refreshAnalysisForBvid(bvid, options = {}) {
+      if (!bvid) return;
+      await this.loadSegments(bvid);
+      const shouldAnalyze = Boolean(options.forceAnalyze) || this.segments.length === 0 || !this.aiSummary;
+      if (shouldAnalyze) {
+        await this.analyzeVideo(bvid);
+      }
+    }
+
     async showSidebar(options = {}) {
       if (!await this.ensureSidebarReady()) return;
 
       if (options.refresh && this.player.currentBvid) {
-        this.loadSegments(this.player.currentBvid);
+        await this.refreshAnalysisForBvid(this.player.currentBvid, { forceAnalyze: true });
       }
 
       this.sidebarController.show();
