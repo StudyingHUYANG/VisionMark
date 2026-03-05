@@ -46,7 +46,7 @@
 defineProps({
   title: {
     type: String,
-    default: 'AI 视频总结'
+    default: '视频总结'
   },
   bvid: {
     type: String,

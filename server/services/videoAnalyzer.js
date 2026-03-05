@@ -20,12 +20,23 @@ const openaiClient = new OpenAI({
 // 阿里云OSS配置 - 用于上传音频文件
 const OSS = require('ali-oss');
 
-const ossClient = new OSS({
-  region: process.env.OSS_REGION || 'oss-cn-beijing',
-  accessKeyId: process.env.OSS_ACCESS_KEY_ID,
-  accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET,
-  bucket: process.env.OSS_BUCKET
-});
+const hasOssConfig = Boolean(
+  process.env.OSS_ACCESS_KEY_ID &&
+  process.env.OSS_ACCESS_KEY_SECRET &&
+  process.env.OSS_BUCKET
+);
+
+let ossClient = null;
+if (hasOssConfig) {
+  ossClient = new OSS({
+    region: process.env.OSS_REGION || 'oss-cn-beijing',
+    accessKeyId: process.env.OSS_ACCESS_KEY_ID,
+    accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET,
+    bucket: process.env.OSS_BUCKET
+  });
+} else {
+  console.warn('[VideoAnalyzer] OSS config missing, audio transcription upload will be skipped.');
+}
 
 // 时间格式化辅助函数
 function formatTime(seconds) {
@@ -206,6 +217,11 @@ class VideoAnalyzer {
     console.log('[VideoAnalyzer] 开始语音识别...');
 
     try {
+      if (!ossClient) {
+        console.warn('[VideoAnalyzer] OSS client unavailable, skip transcription.');
+        return null;
+      }
+
       // 检查文件大小
       const stats = fs.statSync(audioPath);
       const fileSizeMB = stats.size / (1024 * 1024);
