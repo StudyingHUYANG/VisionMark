@@ -20,18 +20,26 @@ const openaiClient = new OpenAI({
 // 阿里云OSS配置 - 用于上传音频文件
 const OSS = require('ali-oss');
 
-const ossClient = new OSS({
-  region: process.env.OSS_REGION || 'oss-cn-beijing',
-  accessKeyId: process.env.OSS_ACCESS_KEY_ID,
-  accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET,
-  bucket: process.env.OSS_BUCKET
-});
+let ossClient = null;
+
+// 只有在提供了必要配置时才初始化 OSS 客户端
+if (process.env.OSS_ACCESS_KEY_ID && process.env.OSS_ACCESS_KEY_SECRET && process.env.OSS_BUCKET) {
+  ossClient = new OSS({
+    region: process.env.OSS_REGION || 'oss-cn-beijing',
+    accessKeyId: process.env.OSS_ACCESS_KEY_ID,
+    accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET,
+    bucket: process.env.OSS_BUCKET
+  });
+} else {
+  console.log('[VideoAnalyzer] OSS 配置未提供，跳过 OSS 功能（开发模式）');
+}
 
 // 时间格式化辅助函数
 function formatTime(seconds) {
-  const mins = Math.floor(seconds / 60);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
   const secs = Math.floor(seconds % 60);
-  return `${mins}:${secs.toString().padStart(2, '0')}`;
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 }
 
 class VideoAnalyzer {
@@ -635,7 +643,7 @@ ${transcript || '无语音内容'}
 
         // 尝试解析JSON
         try {
-          // 提取JSON部分（AI可能返回markdown格式的json）
+          // 提取JSON部分（AI可能返回``json\n``）
           const jsonMatch = aiResponse.match(/```json\n([\s\S]*?)\n```/) ||
                            aiResponse.match(/\{[\s\S]*\}/);
 

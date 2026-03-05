@@ -3,7 +3,7 @@
 
 module.exports = {
   // 服务器端口
-  PORT: 8080,
+  PORT: 3000,
 
   // API 版本
   API_VERSION: 'api/v1',
