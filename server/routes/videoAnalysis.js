@@ -65,17 +65,27 @@ router.post('/analyze', authenticateToken, async (req, res) => {
 });
 
 /**
- * 将时间格式 MM:SS 转换为秒数
+ * 将时间格式 MM:SS 或 HH:MM:SS 转换为秒数
  */
 function parseTimeToSeconds(timeStr) {
   if (!timeStr) return 0;
   if (typeof timeStr === 'number') return timeStr;
 
-  const parts = timeStr.split(':');
+  // 处理可能包含的中文冒号
+  const normalizedTime = timeStr.replace(/：/g, ':');
+  const parts = normalizedTime.split(':').map(p => parseFloat(p));
+  
+  // HH:MM:SS
+  if (parts.length === 3) {
+    return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  }
+  // MM:SS
   if (parts.length === 2) {
-    const mins = parseInt(parts[0]);
-    const secs = parseInt(parts[1]);
-    return mins * 60 + secs;
+    return parts[0] * 60 + parts[1];
+  }
+  // SS
+  if (parts.length === 1) {
+    return parts[0];
   }
   return 0;
 }
@@ -178,21 +188,5 @@ router.post('/extract-keyframes', authenticateToken, async (req, res) => {
     });
   }
 });
-
-/**
- * 将时间格式 MM:SS 转换为秒数
- */
-function parseTimeToSeconds(timeStr) {
-  if (!timeStr) return 0;
-  if (typeof timeStr === 'number') return timeStr;
-
-  const parts = timeStr.split(':');
-  if (parts.length === 2) {
-    const mins = parseInt(parts[0]);
-    const secs = parseInt(parts[1]);
-    return mins * 60 + secs;
-  }
-  return 0;
-}
 
 module.exports = router;
