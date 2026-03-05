@@ -22,10 +22,10 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
   const DANMU_SPEED_MAX_PX_PER_SEC = 1200;
   const DANMU_SPEED_TUNE_FACTOR = 0.78;
   const DANMU_REMOVE_BUFFER_PX = 32;
-  const DANMU_LANE_MIN_PERCENT = 8;
-  const DANMU_LANE_MAX_PERCENT = 42;
-  const DANMU_LANE_STEP_PERCENT = 6;
-  const DANMU_DEFAULT_LANES = [12, 20, 28, 36];
+  const DANMU_LANE_MIN_PERCENT = 6;
+  const DANMU_LANE_MAX_PERCENT = 25;
+  const DANMU_LANE_STEP_PERCENT = 4;
+  const DANMU_DEFAULT_LANES = [8, 14, 20, 24];
   const DANMU_NATIVE_NODE_SELECTORS = [
     '.bpx-player-dm-wrap .bili-dm',
     '.bpx-player-dm-wrap [class*="dm"][class*="item"]',
@@ -652,9 +652,9 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
           .visionmark-knowledge-danmu {
             position: absolute;
             max-width: min(58vw, 640px);
-            padding: 5px 10px;
+            padding: 3px 8px;
 
-            border-radius: 8px;
+            border-radius: 6px;
 
             /* 轻度毛玻璃效果 */
             background: rgba(255, 255, 255, 0.12);
@@ -663,9 +663,9 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
 
             border: 1px solid rgba(255, 255, 255, 0.18);
 
-            /* B站品牌粉色字体 */
-            color: #fb7299 !important;
-            font-size: 20px;
+            /* 加深粉红字体 */
+            color: #d64473 !important;
+            font-size: 26px;
             line-height: 1.5;
 
             /* 使用 Noto Sans SC 字体（思源黑体） */
@@ -2004,6 +2004,5 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
 
   new AdSkipperCore().init();
 })();
-
 
 

@@ -32,7 +32,7 @@ export function buildMockAnalysisData(bvid, scenario = 'default') {
   const knowledgeBase = dense
     ? [
       { t: 20, term: '问题拆解', explanation: '将复杂任务拆分为可执行的子问题。' },
-      { t: 41, term: '最小可行方案', explanation: '用最小闭环验证方向是否正确。' },
+      { t: 41, term: '测试', explanation: '1111111嗡嗡嗡嗡嗡嗡嗡嗡嗡测试一下' },
       { t: 66, term: '反馈闭环', explanation: '通过短反馈循环快速修正执行。' },
       { t: 95, term: '约束条件', explanation: '时间和资源决定了可行边界。' },
       { t: 128, term: '复盘', explanation: '回顾结果并提炼可复用模式。' }
