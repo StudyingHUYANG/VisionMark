@@ -2,9 +2,9 @@
   <div class="ai-assistant-vue-root">
     <!-- Vue 渲染测试 UI -->
     <div class="test-panel">
-      <h3>Vue 3 微前端助手</h3>
+      <h3>微前端助手</h3>
       <p>当前播放时间: <strong>{{ videoState.currentTime.toFixed(2) }}s</strong></p>
-      <p>当前 BVID: {{ videoState.bvid || '未获取' }}</p>
+      <p>当前视频 BV 号: {{ videoState.bvid || '未获取' }}</p>
       <p>
         广告段数: {{ videoState.segments.length }}
       </p>

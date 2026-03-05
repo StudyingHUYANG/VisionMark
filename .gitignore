@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+package.json.tmp
 
 # Database
 *.db-shm
@@ -8,7 +9,32 @@ node_modules/
 
 # Environment variables
 .env
+.env.*
+server/.env
 
 # System files
 .DS_Store
 Thumbs.db
+
+# Build artifacts
+dist/
+extension/dist/
+*.crx
+
+# Logs
+*.log
+npm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# Backup and temporary files
+.backup/
+*.bak
+*.swp
+*.patch
+downloads/

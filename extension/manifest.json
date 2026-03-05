@@ -38,8 +38,8 @@
         "dist/main.js"
       ],
       "css": [
-        "dist/visionmark.css",
-        "content/content.css"
+        "content/content.css",
+        "dist/visionmark.css"
       ],
       "run_at": "document_idle"
     }

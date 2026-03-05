@@ -39,7 +39,7 @@ const props = defineProps({
 });
 
 const displaySummary = computed(() => {
-  return props.summary || '暂无 AI 总结';
+  return props.summary || '暂无总结';
 });
 </script>
 

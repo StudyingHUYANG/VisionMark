@@ -18,6 +18,13 @@
         :error="error"
       />
 
+      <AIAnalysisDetails
+        v-if="!loading && !error"
+        :title="aiTitle"
+        :knowledge-points="knowledgePoints"
+        :hot-words="hotWords"
+      />
+
       <TimelineList
         :segments="segments"
         :active-key="activeKey"
@@ -38,9 +45,10 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue';
+import { ref, computed, watch } from 'vue';
 import SidebarHeader from './SidebarHeader.vue';
 import SummaryCard from './SummaryCard.vue';
+import AIAnalysisDetails from './AIAnalysisDetails.vue';
 import TimelineList from './TimelineList.vue';
 import ConfirmDialog from './ConfirmDialog.vue';
 
@@ -59,7 +67,7 @@ const props = defineProps({
   },
   title: {
     type: String,
-    default: 'AI 视频总结'
+    default: '视频总结'
   },
   bvid: {
     type: String,
@@ -72,6 +80,18 @@ const props = defineProps({
   summary: {
     type: String,
     default: ''
+  },
+  aiTitle: {
+    type: String,
+    default: ''
+  },
+  knowledgePoints: {
+    type: Array,
+    default: () => []
+  },
+  hotWords: {
+    type: Array,
+    default: () => []
   },
   segments: {
     type: Array,
@@ -90,6 +110,34 @@ const props = defineProps({
     default: null
   }
 });
+
+// 监听数据变化，输出调试信息
+watch(() => props.aiTitle, (newVal) => {
+  console.log('[SidebarContainer] aiTitle changed:', newVal);
+}, { immediate: true });
+
+watch(() => props.knowledgePoints, (newVal) => {
+  console.log('[SidebarContainer] knowledgePoints changed:', newVal?.length || 0);
+}, { immediate: true });
+
+watch(() => props.hotWords, (newVal) => {
+  console.log('[SidebarContainer] hotWords changed:', newVal?.length || 0);
+}, { immediate: true });
+
+watch(() => props.segments, (newVal) => {
+  console.log('[SidebarContainer] segments changed:', newVal?.length || 0);
+  if (newVal && newVal.length > 0) {
+    console.log('[SidebarContainer] segments data:', newVal);
+  }
+}, { immediate: true, deep: true });
+
+watch(() => props.loading, (newVal) => {
+  console.log('[SidebarContainer] loading changed:', newVal);
+}, { immediate: true });
+
+watch(() => props.error, (newVal) => {
+  console.log('[SidebarContainer] error changed:', newVal);
+}, { immediate: true });
 
 const emit = defineEmits(['update:visible', 'seek', 'refresh', 'delete']);
 
