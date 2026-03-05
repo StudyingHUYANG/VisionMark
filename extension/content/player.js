@@ -71,9 +71,14 @@ class BilibiliPlayerController {
 
   getState() {
     const duration = this.video && Number.isFinite(this.video.duration) ? this.video.duration : 0;
+    const playbackRate = this.video && Number.isFinite(this.video.playbackRate) && this.video.playbackRate > 0
+      ? this.video.playbackRate
+      : 1;
     return {
       currentTime: this.video ? this.video.currentTime : 0,
       duration,
+      paused: this.video ? Boolean(this.video.paused) : true,
+      playbackRate,
       bvid: this.currentBvid,
       cid: this.currentCid
     };
@@ -81,4 +86,3 @@ class BilibiliPlayerController {
 }
 
 window.BilibiliPlayerController = BilibiliPlayerController;
-

@@ -15,6 +15,22 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
   const DANMU_TRIGGER_WINDOW_SEC = 0.3;
   const DANMU_REWIND_RESET_SEC = 1.0;
   const DANMU_MAX_CONCURRENT = 3;
+  const DANMU_BASE_DURATION_SEC = 7.5;
+  const DANMU_FALLBACK_TRACK_PX = 640;
+  const DANMU_NATIVE_SAMPLE_MS = 300;
+  const DANMU_SPEED_MIN_PX_PER_SEC = 60;
+  const DANMU_SPEED_MAX_PX_PER_SEC = 1200;
+  const DANMU_SPEED_TUNE_FACTOR = 0.78;
+  const DANMU_REMOVE_BUFFER_PX = 32;
+  const DANMU_LANE_MIN_PERCENT = 8;
+  const DANMU_LANE_MAX_PERCENT = 42;
+  const DANMU_LANE_STEP_PERCENT = 6;
+  const DANMU_DEFAULT_LANES = [12, 20, 28, 36];
+  const DANMU_NATIVE_NODE_SELECTORS = [
+    '.bpx-player-dm-wrap .bili-dm',
+    '.bpx-player-dm-wrap [class*="dm"][class*="item"]',
+    '.bilibili-player-video-danmaku [class*="danmaku"]'
+  ];
 
   // 广告类型标签映射
   const typeLabels = {
@@ -33,8 +49,6 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
       this.allSegments = [];
       this.aiSummary = '';
       this.lastSkipTime = 0;
-      this.lastPopupSegmentKey = null;
-      this.popupLockUntil = 0;
       this.pendingStart = null;
       this.pendingEnd = null;
       this.pendingType = 'hard_ad';
@@ -63,6 +77,12 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
       this.knowledgeDanmuLayer = null;
       this.lastDanmuCurrentTime = 0;
       this.nextDanmuLane = 0;
+      this.activeKnowledgeDanmus = [];
+      this.knowledgeDanmuRafId = null;
+      this.lastDanmuFrameTs = 0;
+      this.nativeDanmuSpeedPxPerSec = 0;
+      this.lastNativeSpeedSampleTs = 0;
+      this.nativeDanmuTrackSample = null;
 
 
     }
@@ -575,6 +595,13 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
     }
 
     clearKnowledgeDanmuNodes() {
+      this.stopKnowledgeDanmuLoop();
+      this.activeKnowledgeDanmus.forEach(item => {
+        if (item?.node?.remove) {
+          item.node.remove();
+        }
+      });
+      this.activeKnowledgeDanmus = [];
       if (!this.knowledgeDanmuLayer) return;
       const nodes = this.knowledgeDanmuLayer.querySelectorAll('.visionmark-knowledge-danmu');
       nodes.forEach(node => node.remove());
@@ -585,6 +612,9 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
       this.triggeredDanmuIds.clear();
       this.lastDanmuCurrentTime = 0;
       this.nextDanmuLane = 0;
+      this.nativeDanmuSpeedPxPerSec = 0;
+      this.lastNativeSpeedSampleTs = 0;
+      this.nativeDanmuTrackSample = null;
       this.clearKnowledgeDanmuNodes();
     }
 
@@ -597,6 +627,15 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
 
       if (getComputedStyle(container).position === 'static') {
         container.style.position = 'relative';
+      }
+
+      // 加载 Noto Sans SC 字体（思源黑体 - 现代中性）
+      if (!document.getElementById('visionmark-font-noto-sans')) {
+        const fontLink = document.createElement('link');
+        fontLink.id = 'visionmark-font-noto-sans';
+        fontLink.href = 'https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400&display=swap';
+        fontLink.rel = 'stylesheet';
+        document.head.appendChild(fontLink);
       }
 
       if (!document.getElementById('visionmark-knowledge-danmu-style')) {
@@ -612,25 +651,36 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
           }
           .visionmark-knowledge-danmu {
             position: absolute;
-            right: -20%;
             max-width: min(58vw, 640px);
-            padding: 8px 14px;
-            border-radius: 999px;
-            border: 1px solid rgba(255, 255, 255, 0.42);
-            background: rgba(18, 24, 38, 0.9);
-            color: #ffffff;
-            font-size: 14px;
-            line-height: 1.35;
+            padding: 5px 10px;
+
+            border-radius: 8px;
+
+            /* 轻度毛玻璃效果 */
+            background: rgba(255, 255, 255, 0.12);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+
+            border: 1px solid rgba(255, 255, 255, 0.18);
+
+            /* B站品牌粉色字体 */
+            color: #fb7299 !important;
+            font-size: 20px;
+            line-height: 1.5;
+
+            /* 使用 Noto Sans SC 字体（思源黑体） */
+            font-family: "Noto Sans SC", sans-serif !important;
+            font-weight: 400;
+
             white-space: nowrap;
             text-overflow: ellipsis;
             overflow: hidden;
-            box-shadow: 0 10px 26px rgba(0, 0, 0, 0.35);
-            animation: visionmarkDanmuFly 4.2s linear forwards;
-          }
-          @keyframes visionmarkDanmuFly {
-            0% { transform: translateX(0); opacity: 0; }
-            10% { opacity: 1; }
-            100% { transform: translateX(calc(-120vw - 640px)); opacity: 1; }
+
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+
+            left: 0;
+            transform: translate3d(0, 0, 0);
+            will-change: transform;
           }
         `;
         document.head.appendChild(style);
@@ -646,12 +696,218 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
       return layer;
     }
 
+    pickNativeDanmuNode() {
+      const nodes = this.getVisibleNativeDanmuNodes();
+      if (nodes.length) return nodes[0];
+      return null;
+    }
+
+    getVisibleNativeDanmuNodes() {
+      const result = [];
+      const seen = new Set();
+      for (const selector of DANMU_NATIVE_NODE_SELECTORS) {
+        const nodes = document.querySelectorAll(selector);
+        for (const node of nodes) {
+          if (!(node instanceof HTMLElement)) continue;
+          if (seen.has(node)) continue;
+          const rect = node.getBoundingClientRect();
+          if (rect.width < 8 || rect.height < 8) continue;
+          if (rect.bottom <= 0 || rect.top >= window.innerHeight) continue;
+          if (rect.right <= 0 || rect.left >= window.innerWidth) continue;
+          seen.add(node);
+          result.push(node);
+        }
+      }
+      return result;
+    }
+
+    getKnowledgeDanmuLanes() {
+      const fallback = DANMU_DEFAULT_LANES.slice(0, 3);
+      if (!this.knowledgeDanmuLayer) return fallback;
+
+      const layerRect = this.knowledgeDanmuLayer.getBoundingClientRect();
+      if (!Number.isFinite(layerRect.height) || layerRect.height <= 0) return fallback;
+
+      const nativeNodes = this.getVisibleNativeDanmuNodes();
+      if (!nativeNodes.length) return fallback;
+
+      const laneSet = new Set();
+      for (const node of nativeNodes.slice(0, 24)) {
+        const rect = node.getBoundingClientRect();
+        const relativeY = ((rect.top + rect.height / 2) - layerRect.top) / layerRect.height * 100;
+        if (!Number.isFinite(relativeY)) continue;
+        const clamped = Math.min(Math.max(relativeY, DANMU_LANE_MIN_PERCENT), DANMU_LANE_MAX_PERCENT);
+        const bucket = Math.round(clamped / DANMU_LANE_STEP_PERCENT) * DANMU_LANE_STEP_PERCENT;
+        laneSet.add(bucket);
+      }
+
+      const nativeLanes = Array.from(laneSet)
+        .filter(value => Number.isFinite(value))
+        .sort((a, b) => a - b);
+
+      const preferredLaneCount = nativeNodes.length <= 3 ? 3 : 4;
+      const merged = [...nativeLanes, ...DANMU_DEFAULT_LANES]
+        .filter((value, index, arr) => arr.indexOf(value) === index)
+        .filter(value => value >= DANMU_LANE_MIN_PERCENT && value <= DANMU_LANE_MAX_PERCENT)
+        .sort((a, b) => a - b);
+
+      const lanes = merged.slice(0, preferredLaneCount);
+      return lanes.length ? lanes : fallback;
+    }
+
+    sampleNativeDanmuSpeed(now = performance.now()) {
+      if (now - this.lastNativeSpeedSampleTs < DANMU_NATIVE_SAMPLE_MS) {
+        return;
+      }
+      this.lastNativeSpeedSampleTs = now;
+
+      const node = this.pickNativeDanmuNode();
+      if (!node) {
+        this.nativeDanmuTrackSample = null;
+        return;
+      }
+
+      const rect = node.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      if (!Number.isFinite(centerX)) {
+        return;
+      }
+
+      const previous = this.nativeDanmuTrackSample;
+      if (previous && previous.node === node) {
+        const dtSec = (now - previous.ts) / 1000;
+        const dx = previous.x - centerX;
+        if (dtSec > 0 && dx > 0) {
+          const scaleX = this.getKnowledgeDanmuLayerScaleX();
+          const speed = (dx / dtSec) / scaleX;
+          if (speed >= DANMU_SPEED_MIN_PX_PER_SEC && speed <= DANMU_SPEED_MAX_PX_PER_SEC) {
+            this.nativeDanmuSpeedPxPerSec = this.nativeDanmuSpeedPxPerSec > 0
+              ? this.nativeDanmuSpeedPxPerSec * 0.7 + speed * 0.3
+              : speed;
+          }
+        }
+      }
+
+      this.nativeDanmuTrackSample = { node, x: centerX, ts: now };
+    }
+
+    getKnowledgeDanmuLayerScaleX() {
+      if (!this.knowledgeDanmuLayer) return 1;
+      const localWidth = this.knowledgeDanmuLayer.clientWidth;
+      const rectWidth = this.knowledgeDanmuLayer.getBoundingClientRect().width;
+      if (!Number.isFinite(localWidth) || localWidth <= 0) return 1;
+      if (!Number.isFinite(rectWidth) || rectWidth <= 0) return 1;
+      const scaleX = rectWidth / localWidth;
+      if (!Number.isFinite(scaleX) || scaleX <= 0) return 1;
+      return Math.min(Math.max(scaleX, 0.5), 3);
+    }
+
+    getFallbackDanmuSpeedPxPerSec(layerWidth) {
+      const safeLocalWidth = Number.isFinite(layerWidth) && layerWidth > 0
+        ? layerWidth
+        : (this.knowledgeDanmuLayer?.clientWidth || window.innerWidth || 1280);
+      const scaleX = this.getKnowledgeDanmuLayerScaleX();
+      const viewportWidth = safeLocalWidth * scaleX;
+      return ((viewportWidth + DANMU_FALLBACK_TRACK_PX) / DANMU_BASE_DURATION_SEC) / scaleX;
+    }
+
+    getKnowledgeDanmuSpeedPxPerSec(layerWidth) {
+      let speed = this.getFallbackDanmuSpeedPxPerSec(layerWidth);
+      if (
+        Number.isFinite(this.nativeDanmuSpeedPxPerSec) &&
+        this.nativeDanmuSpeedPxPerSec >= DANMU_SPEED_MIN_PX_PER_SEC &&
+        this.nativeDanmuSpeedPxPerSec <= DANMU_SPEED_MAX_PX_PER_SEC
+      ) {
+        speed = this.nativeDanmuSpeedPxPerSec;
+      }
+      return speed * DANMU_SPEED_TUNE_FACTOR;
+    }
+
+    startKnowledgeDanmuLoop() {
+      if (this.knowledgeDanmuRafId !== null) return;
+      this.lastDanmuFrameTs = 0;
+      this.knowledgeDanmuRafId = requestAnimationFrame((ts) => this.tickKnowledgeDanmu(ts));
+    }
+
+    stopKnowledgeDanmuLoop() {
+      if (this.knowledgeDanmuRafId !== null) {
+        cancelAnimationFrame(this.knowledgeDanmuRafId);
+        this.knowledgeDanmuRafId = null;
+      }
+      this.lastDanmuFrameTs = 0;
+    }
+
+    syncKnowledgeDanmuAnimationState() {
+      if (!this.activeKnowledgeDanmus.length) {
+        this.stopKnowledgeDanmuLoop();
+        return;
+      }
+      const state = this.player.getState();
+      if (state.paused) {
+        this.stopKnowledgeDanmuLoop();
+        return;
+      }
+      this.startKnowledgeDanmuLoop();
+    }
+
+    tickKnowledgeDanmu(frameTs) {
+      this.knowledgeDanmuRafId = null;
+      if (!this.knowledgeDanmuLayer) {
+        this.activeKnowledgeDanmus = [];
+        return;
+      }
+
+      this.activeKnowledgeDanmus = this.activeKnowledgeDanmus.filter(item => item?.node?.isConnected);
+      if (!this.activeKnowledgeDanmus.length) {
+        this.stopKnowledgeDanmuLoop();
+        return;
+      }
+
+      const state = this.player.getState();
+      if (state.paused) {
+        this.stopKnowledgeDanmuLoop();
+        return;
+      }
+
+      const currentTs = Number.isFinite(frameTs) ? frameTs : performance.now();
+      if (!this.lastDanmuFrameTs) {
+        this.lastDanmuFrameTs = currentTs;
+      }
+      const deltaSec = Math.min(Math.max((currentTs - this.lastDanmuFrameTs) / 1000, 0), 0.1);
+      this.lastDanmuFrameTs = currentTs;
+
+      this.sampleNativeDanmuSpeed(currentTs);
+      const layerWidth = this.knowledgeDanmuLayer.clientWidth || window.innerWidth || 1280;
+      const speed = this.getKnowledgeDanmuSpeedPxPerSec(layerWidth);
+      const remaining = [];
+
+      for (const item of this.activeKnowledgeDanmus) {
+        item.x -= speed * deltaSec;
+        if (item.node && item.node.style) {
+          item.node.style.transform = `translate3d(${item.x}px, 0, 0)`;
+        }
+        if (item.x + item.width < -DANMU_REMOVE_BUFFER_PX) {
+          item.node.remove();
+          continue;
+        }
+        remaining.push(item);
+      }
+
+      this.activeKnowledgeDanmus = remaining;
+      if (!this.activeKnowledgeDanmus.length) {
+        this.stopKnowledgeDanmuLoop();
+        return;
+      }
+
+      this.knowledgeDanmuRafId = requestAnimationFrame((ts) => this.tickKnowledgeDanmu(ts));
+    }
+
     renderKnowledgeDanmu(item) {
       const layer = this.ensureKnowledgeDanmuLayer();
       if (!layer) return;
-      if (layer.childElementCount >= DANMU_MAX_CONCURRENT) return;
+      if (this.activeKnowledgeDanmus.length >= DANMU_MAX_CONCURRENT) return;
 
-      const lanes = [14, 24, 34, 44, 54, 64];
+      const lanes = this.getKnowledgeDanmuLanes();
       const lane = lanes[this.nextDanmuLane % lanes.length];
       this.nextDanmuLane += 1;
 
@@ -659,18 +915,31 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
       node.className = 'visionmark-knowledge-danmu';
       node.style.top = `${lane}%`;
       node.textContent = item.text;
-
-      const cleanup = () => node.remove();
-      node.addEventListener('animationend', cleanup, { once: true });
-      setTimeout(cleanup, 4500);
       layer.appendChild(node);
+
+      const layerWidth = layer.clientWidth || window.innerWidth || 1280;
+      const width = node.getBoundingClientRect().width || 240;
+      const startX = layerWidth + 24;
+      node.style.transform = `translate3d(${startX}px, 0, 0)`;
+
+      this.activeKnowledgeDanmus.push({
+        id: item.id,
+        node,
+        x: startX,
+        width
+      });
+
+      this.sampleNativeDanmuSpeed();
+      this.syncKnowledgeDanmuAnimationState();
     }
 
     handleKnowledgeDanmu(currentTime) {
       if (!Number.isFinite(currentTime) || !this.knowledgeDanmuQueue.length) {
         this.lastDanmuCurrentTime = currentTime;
+        this.syncKnowledgeDanmuAnimationState();
         return;
       }
+      this.sampleNativeDanmuSpeed();
       if (currentTime + DANMU_REWIND_RESET_SEC < this.lastDanmuCurrentTime) {
         this.triggeredDanmuIds.clear();
       }
@@ -688,6 +957,7 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
       }
 
       this.lastDanmuCurrentTime = currentTime;
+      this.syncKnowledgeDanmuAnimationState();
     }
 
 
@@ -744,7 +1014,6 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
       this.segments = aiSegments;
       this.allSegments = aiSegments;
       this.currentSegmentIds = [];
-      this.lastPopupSegmentKey = null;
       this.updateKnowledgeDanmuSource(knowledgePoints, bvid);
       this.addSegmentMarkers();
 
@@ -893,53 +1162,6 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
       return String(segment.id ?? `${segment.start_time}-${segment.end_time}-${indexFallback}`);
     }
 
-    showInsightPopup(segment) {
-      const popupId = 'visionmark-insight-popup';
-      const oldPopup = document.getElementById(popupId);
-      if (oldPopup) oldPopup.remove();
-
-      const popup = document.createElement('div');
-      popup.id = popupId;
-      popup.style.cssText = `
-        position: fixed;
-        right: 24px;
-        bottom: 96px;
-        width: min(360px, 78vw);
-        max-height: 42vh;
-        overflow-y: auto;
-        background: rgba(16, 21, 34, 0.96);
-        border: 1px solid rgba(71, 167, 255, 0.55);
-        border-radius: 12px;
-        box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
-        color: #eaf4ff;
-        z-index: 999999;
-        padding: 12px 14px;
-        line-height: 1.55;
-        font-size: 13px;
-      `;
-
-      const start = Number.isFinite(segment.start_time) ? segment.start_time.toFixed(1) : '-';
-      const end = Number.isFinite(segment.end_time) ? segment.end_time.toFixed(1) : '-';
-      const content = segment.content || 'No description available for this segment.';
-
-      popup.innerHTML = `
-        <div style="font-size: 11px; letter-spacing: .4px; color: #74b7ff; margin-bottom: 6px;">
-          重点片段 ${start}s - ${end}s
-        </div>
-        <div style="white-space: pre-wrap;">${content}</div>
-      `;
-
-      document.body.appendChild(popup);
-      this.popupLockUntil = Date.now() + 3200;
-    }
-
-    hideInsightPopup() {
-      const popup = document.getElementById('visionmark-insight-popup');
-      if (popup) popup.remove();
-      this.lastPopupSegmentKey = null;
-      this.popupLockUntil = 0;
-    }
-
     seekToSegmentStart(segment) {
       if (!segment) return;
       const targetTime = Number(segment.start_time);
@@ -956,18 +1178,6 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
 
     getActiveSegment(currentTime) {
       return this.segments.find(segment => currentTime >= segment.start_time && currentTime < segment.end_time - 0.2);
-    }
-
-    handlePopupSegment(segment) {
-      if (!segment || segment.action !== 'popup') return;
-
-      const key = this.getSegmentKey(segment);
-      if (this.lastPopupSegmentKey === key) return;
-      if (Date.now() < this.popupLockUntil) return;
-
-      this.lastPopupSegmentKey = key;
-      this.showInsightPopup(segment);
-      this.showToast('知识点提醒', 'info');
     }
 
     handleSkipSegment(segment) {
@@ -1009,9 +1219,6 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
           sidebarState.activeSegmentKey = null;
         }
         this.hideSkipButton();
-        if (Date.now() > this.popupLockUntil) {
-          this.hideInsightPopup();
-        }
         return;
       }
 
@@ -1021,9 +1228,6 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
           sidebarState.activeSegmentKey = null;
         }
         this.hideSkipButton();
-        if (Date.now() > this.popupLockUntil) {
-          this.hideInsightPopup();
-        }
         return;
       }
 
@@ -1033,12 +1237,7 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
 
       if (activeSegment.action === 'popup') {
         this.hideSkipButton();
-        this.handlePopupSegment(activeSegment);
         return;
-      }
-
-      if (Date.now() > this.popupLockUntil) {
-        this.hideInsightPopup();
       }
 
       if (Date.now() - this.lastSkipTime < 500) {

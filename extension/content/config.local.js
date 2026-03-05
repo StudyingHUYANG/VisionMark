@@ -13,5 +13,5 @@ window.LOCAL_CONFIG = {
   // Frontend-only mock switches for AI analysis
   MOCK_ANALYSIS: true,
   MOCK_ANALYSIS_DELAY_MS: 400,
-  MOCK_ANALYSIS_SCENARIO: 'default'
+  MOCK_ANALYSIS_SCENARIO: 'dense'
 };
