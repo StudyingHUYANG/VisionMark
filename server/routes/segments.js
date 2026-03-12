@@ -18,7 +18,7 @@ router.delete('/:id', authenticateToken, checkContributor, (req, res) => {
   try {
     // 级联删除：先删除标注（表中无投票记录，暂只删标注）
     const result = db.prepare(`
-      DELETE FROM ad_segments WHERE id = ?
+      DELETE FROM segments WHERE id = ?
     `).run(segmentId);
 
     if (result.changes === 0) {
@@ -45,8 +45,8 @@ router.post('/batch', (req, res) => {
     const placeholders = bvids.map(() => '?').join(',');
     const segments = db.prepare(`
       SELECT 
-        s.id, s.start_time, s.end_time, s.ad_type, s.contributor_id, v.bvid
-      FROM ad_segments s
+        s.id, s.start_time, s.end_time, s.type, s.contributor_id, v.bvid
+      FROM segments s
       JOIN videos v ON s.video_id = v.id
       WHERE v.bvid IN (${placeholders})
     `).all(...bvids);
