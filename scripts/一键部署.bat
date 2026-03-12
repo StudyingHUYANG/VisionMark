@@ -49,8 +49,23 @@ if errorlevel 1 (
 echo ✅ FFmpeg 已安装
 echo.
 
+REM 安装根目录依赖（构建工具）
+echo [4/8] 安装构建工具（Vite, Vue等）...
+cd /d "%~dp0"
+if not exist node_modules (
+    call npm install
+    if errorlevel 1 (
+        echo ❌ 构建工具安装失败
+        pause
+        exit /b 1
+    )
+) else (
+    echo ✅ 构建工具已安装
+)
+echo.
+
 REM 安装服务器依赖
-echo [4/7] 安装服务器依赖...
+echo [5/8] 安装服务器依赖...
 cd /d "%~dp0server"
 if not exist node_modules (
     call npm install
@@ -65,7 +80,7 @@ if not exist node_modules (
 echo.
 
 REM 安装 Python 依赖（AI分析需要）
-echo [5/7] 安装 Python 依赖（AI分析所需）...
+echo [6/8] 安装 Python 依赖（AI分析所需）...
 echo 检查 requirements.txt...
 if exist "%~dp0requirements.txt" (
     echo 正在安装 Python 依赖包...
@@ -94,7 +109,7 @@ if exist "%~dp0requirements.txt" (
 echo.
 
 REM 检查环境变量
-echo [6/7] 检查环境变量...
+echo [7/8] 检查环境变量...
 if not exist .env (
     echo ❌ 缺少 .env 文件
     echo 请先配置 .env 文件（参考 .env.example）
@@ -105,7 +120,7 @@ echo ✅ 环境变量已配置
 echo.
 
 REM 启动服务
-echo [7/7] 启动服务...
+echo [8/8] 启动服务...
 echo.
 echo ========================================
 echo       正在启动 VisionMark 服务
