@@ -1,23 +1,50 @@
-import { createApp } from 'vue';
-import App from './App.vue';
-import { videoState } from './store.js';
-
 (function () {
+  'use strict';
+
   if (window.adSkipper) return;
+
+  // Sidebar state (will be initialized when sidebar loads)
+  let sidebarState = null;
+
+  // API 基础路径
+  const API_BASE = window.API_BASE || 'http://localhost:8080/api/v1';
+  const VIDEO_ANALYSIS_BASE = window.LOCAL_CONFIG?.API_BASE || 'http://localhost:8080';
+  const DANMU_TRIGGER_WINDOW_SEC = 0.3;
+  const DANMU_REWIND_RESET_SEC = 1.0;
+  const DANMU_MAX_CONCURRENT = 3;
+  const DANMU_BASE_DURATION_SEC = 7.5;
+  const DANMU_FALLBACK_TRACK_PX = 640;
+  const DANMU_NATIVE_SAMPLE_MS = 300;
+  const DANMU_SPEED_MIN_PX_PER_SEC = 60;
+  const DANMU_SPEED_MAX_PX_PER_SEC = 1200;
+  const DANMU_SPEED_TUNE_FACTOR = 0.78;
+  const DANMU_REMOVE_BUFFER_PX = 32;
+  const DANMU_LANE_MIN_PERCENT = 6;
+  const DANMU_LANE_MAX_PERCENT = 25;
+  const DANMU_LANE_STEP_PERCENT = 4;
+  const DANMU_DEFAULT_LANES = [8, 14, 20, 24];
+  const DANMU_NATIVE_NODE_SELECTORS = [
+    '.bpx-player-dm-wrap .bili-dm',
+    '.bpx-player-dm-wrap [class*="dm"][class*="item"]',
+    '.bilibili-player-video-danmaku [class*="danmaku"]'
+  ];
 
   // 广告类型标签映射
   const typeLabels = {
     'hard_ad': '硬广',
     'soft_ad': '软广',
-    'product_placement': '植入',
-    'intro_ad': '片头',
-    'mid_ad': '中段'
+    'product_placement': '植入广告',
+    'intro_ad': '片头广告',
+    'mid_ad': '中段广告'
   };
 
   class AdSkipperCore {
     constructor() {
       this.player = new BilibiliPlayerController();
+      this.sidebarController = null;
       this.segments = [];
+      this.allSegments = [];
+      this.aiSummary = '';
       this.lastSkipTime = 0;
       this.pendingStart = null;
       this.pendingEnd = null;
@@ -25,14 +52,34 @@ import { videoState } from './store.js';
       // 手动跳过功能
       this.skipMode = 'auto';
       this.skipButton = null;
-      // 新增日志控制变量
+      // 日志控制变量
       this.noSegmentLogPrinted = false;
       this.coolDownLogPrinted = false;
       this.matchProcessLogPrinted = false;
       this.noAdMatchLogPrinted = false;
 
-      // 存储当前视频的标注ID（用于删除）
+      // 存储当前视频的标注 ID（用于删除）
       this.currentSegmentIds = [];
+      this.isLoadingSegments = false;
+      this.networkState = {
+        offlineUntil: 0,
+        hasLoggedOffline: false,
+        wasOffline: false
+      };
+      this.networkCooldownMs = 30000;
+      this.networkTimeoutMs = 6000;
+      this.analysisBvid = null;
+      this.knowledgeDanmuQueue = [];
+      this.triggeredDanmuIds = new Set();
+      this.knowledgeDanmuLayer = null;
+      this.lastDanmuCurrentTime = 0;
+      this.nextDanmuLane = 0;
+      this.activeKnowledgeDanmus = [];
+      this.knowledgeDanmuRafId = null;
+      this.lastDanmuFrameTs = 0;
+      this.nativeDanmuSpeedPxPerSec = 0;
+      this.lastNativeSpeedSampleTs = 0;
+      this.nativeDanmuTrackSample = null;
 
 
     }
@@ -45,7 +92,7 @@ import { videoState } from './store.js';
         // 检查登录状态
         chrome.storage.local.get(['adskipper_token'], (storage) => {
           const token = storage.adskipper_token;
-          console.log("[AdSkipper] 登录状态:", token ? "已登录" : "未登录");
+          console.log('[AdSkipper] 登录状态:', token ? '已登录' : '未登录');
         });
 
         // 加载跳过模式设置
@@ -67,16 +114,22 @@ import { videoState } from './store.js';
         });
 
         // ==========================
-        // Vue 3 微前端挂载点初始化
+        // Vue 侧边栏初始化
         // ==========================
-        this.initVueApp();
+        this.initSidebar().then(() => {
+          console.log('[AdSkipper] 侧边栏初始化完成');
+        }).catch(err => {
+          console.error("[AdSkipper] Sidebar 初始化失败:", err);
+        });
+
+        this.initAiFloatingButton();
 
         this.player.onTimeUpdate = (t) => this.checkSkip(t);
         this.startInjectionObserver();
 
         const bvid = this.player.currentBvid;
         if (bvid) {
-          this.loadSegments(bvid).then(() => {
+          this.refreshAnalysisForBvid(bvid).then(() => {
             window.adSkipper = this;
           });
         }
@@ -88,37 +141,192 @@ import { videoState } from './store.js';
         if (wrapper && !wrapper.contains(e.target)) {
           this.togglePopover(false);
         }
+
       });
 
       // ESC key listener
       document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') this.togglePopover(false);
-      });
-
-      // Listen for messages from popup
-      chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-        if (message.action === 'showSegmentMarkers') {
-          this.handleShowMarkers();
-          sendResponse({ success: true });
+        if (e.key === 'Escape') {
+          this.togglePopover(false);
+          if (this.sidebarController) {
+            this.sidebarController.hide();
+          }
         }
       });
 
-      // 调试：将实例暴露到全局，方便控制台调试
+      window.addEventListener('visionmark:seek', (event) => {
+        const time = Number(event?.detail?.time);
+        if (!Number.isFinite(time)) return;
+        this.player.skipTo(Math.max(time, 0));
+      });
+
+      window.addEventListener('visionmark:refresh-ai', () => {
+        if (this.player.currentBvid) {
+          this.refreshAnalysisForBvid(this.player.currentBvid, { forceAnalyze: true });
+        }
+      });
+
+      window.addEventListener('visionmark:delete-segment', (event) => {
+        const segmentId = Number(event?.detail?.segmentId);
+        this.handleSidebarDelete(segmentId);
+      });
+
+      // 调试：将实例暴露到全局，便于控制台调试
       window.adSkipperDebug = this;
       console.log('[AdSkipper] 调试模式已启用，使用: adSkipperDebug.addSegmentMarkers() 手动添加标记');
     }
 
-    initVueApp() {
-      // 检查是否已经存在
-      if (document.getElementById('ai-assistant-root')) return;
+    async initSidebar() {
+      if (this.sidebarController) return;
 
-      const vueRoot = document.createElement('div');
-      vueRoot.id = 'ai-assistant-root';
-      document.body.appendChild(vueRoot);
+      const { createSidebar, sidebarState: importedSidebarState } = await import('../sidebar/index.js');
+      sidebarState = importedSidebarState;
 
-      console.log("[AdSkipper Vue] 开始通过 createApp 挂载根组件 App.vue...");
-      const app = createApp(App);
-      app.mount('#ai-assistant-root');
+      const existingRoot = document.getElementById('vm-sidebar-root');
+      if (existingRoot) {
+        this.sidebarController = createSidebar(existingRoot);
+        return;
+      }
+
+      const root = document.createElement('div');
+      root.id = 'vm-sidebar-root';
+      document.body.appendChild(root);
+
+      console.log('[AdSkipper Sidebar] 正在初始化侧边栏...');
+      this.sidebarController = createSidebar(root);
+    }
+
+    initAiFloatingButton() {
+      console.log("[AdSkipper] 创建AI浮动按钮...");
+
+      if (!document.getElementById('visionmark-ai-fab-style')) {
+        console.log("[AdSkipper] 添加AI按钮样式...");
+        const style = document.createElement('style');
+        style.id = 'visionmark-ai-fab-style';
+        style.textContent = `
+          #visionmark-ai-fab {
+            position: fixed !important;
+            left: 20px !important;
+            top: 100px !important;
+            z-index: 2147483647 !important;
+            min-width: 46px;
+            height: 46px;
+            border: none;
+            border-radius: 999px;
+            background: linear-gradient(135deg, #FB7299, #ff8e9f);
+            color: #fff;
+            font-size: 14px;
+            font-weight: 700;
+            letter-spacing: 0.4px;
+            cursor: pointer;
+            box-shadow: 0 10px 28px rgba(251, 114, 153, 0.45);
+            transition: transform 0.18s ease, box-shadow 0.18s ease;
+            padding: 0 16px;
+            display: block !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+          }
+          #visionmark-ai-fab:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 14px 34px rgba(251, 114, 153, 0.55);
+          }
+        `;
+        document.head.appendChild(style);
+        console.log('[AdSkipper] AI button style injected.');
+      }
+
+      if (document.getElementById('visionmark-ai-fab')) {
+        console.log("[AdSkipper] AI按钮已存在，跳过创建");
+        return;
+      }
+
+      console.log("[AdSkipper] 创建AI按钮DOM元素...");
+      const button = document.createElement('button');
+      button.id = 'visionmark-ai-fab';
+      button.type = 'button';
+      button.textContent = 'AI';
+      button.title = '视频总结';
+      button.setAttribute('aria-label', '视频总结');
+      button.onclick = (event) => {
+        event.stopPropagation();
+        this.toggleSidebar().catch((error) => {
+          console.error('[AdSkipper] 切换侧边栏失败:', error);
+          this.showToast('视频总结面板加载失败', 'error');
+        });
+      };
+
+      document.body.appendChild(button);
+      console.log("[AdSkipper] AI按钮已创建并添加到body");
+
+      // 验证按钮是否真的在DOM中并检查位置
+      setTimeout(() => {
+        const btn = document.getElementById('visionmark-ai-fab');
+        if (btn) {
+          const rect = btn.getBoundingClientRect();
+          console.log('[AdSkipper] AI button is present in DOM.');
+          console.log("[AdSkipper] 位置信息:");
+          console.log("  - 灏哄:", btn.offsetWidth, "x", btn.offsetHeight);
+          console.log("  - 灞忓箷浣嶇疆:", rect.left, ",", rect.top);
+          console.log("  - right/top:", rect.right, ",", rect.bottom);
+          console.log("  - 在视口内:", rect.top >= 0 && rect.left >= 0 && rect.bottom <= window.innerHeight && rect.right <= window.innerWidth);
+          console.log("  - z-index:", window.getComputedStyle(btn).zIndex);
+        } else {
+          console.error("[AdSkipper] 错误：AI按钮创建后未在DOM中找到！");
+        }
+      }, 100);
+    }
+
+    async ensureSidebarReady() {
+      if (this.sidebarController) return true;
+      try {
+        await this.initSidebar();
+      } catch (error) {
+        console.error('[AdSkipper] ensureSidebarReady failed:', error);
+      }
+      return Boolean(this.sidebarController);
+    }
+
+    async refreshAnalysisForBvid(bvid, options = {}) {
+      if (!bvid) return;
+      await this.loadSegments(bvid);
+      const shouldAnalyze = Boolean(options.forceAnalyze) || this.segments.length === 0 || !this.aiSummary;
+      if (shouldAnalyze) {
+        await this.analyzeVideo(bvid);
+      }
+    }
+
+    async showSidebar(options = {}) {
+      if (!await this.ensureSidebarReady()) return;
+
+      if (options.refresh && this.player.currentBvid) {
+        await this.refreshAnalysisForBvid(this.player.currentBvid, { forceAnalyze: true });
+      }
+
+      this.sidebarController.show();
+    }
+
+    async toggleSidebar() {
+      if (!await this.ensureSidebarReady()) return;
+      this.sidebarController.toggle();
+    }
+
+    async handleSidebarDelete(segmentId) {
+      if (!Number.isFinite(segmentId) || segmentId <= 0) {
+        this.showToast('当前片段不支持删除', 'info');
+        return;
+      }
+
+      // Confirmation is now handled by Vue ConfirmDialog component
+      // This method is called after user confirms deletion
+      try {
+        await this.deleteAnnotation(segmentId);
+        if (this.player.currentBvid) {
+          await this.loadSegments(this.player.currentBvid);
+        }
+        this.showToast('删除成功', 'success');
+      } catch (error) {
+        this.showToast('删除失败: ' + error.message, 'error');
+      }
     }
 
     getPage() {
@@ -134,122 +342,1002 @@ import { videoState } from './store.js';
       });
     }
 
-    async loadSegments(bvid) {
+    createNetworkUnavailableError() {
+      const error = new Error('网络不可用，请稍后重试');
+      error.code = 'NETWORK_UNAVAILABLE';
+      return error;
+    }
+
+    isNetworkFailure(error) {
+      if (!error) return false;
+      if (error.name === 'AbortError') return true;
+      const message = String(error.message || '').toLowerCase();
+      if (message.includes('failed to fetch') || message.includes('networkerror') || message.includes('load failed')) {
+        return true;
+      }
+      return error instanceof TypeError;
+    }
+
+    markNetworkOffline(context, error) {
+      this.networkState.offlineUntil = Date.now() + this.networkCooldownMs;
+      this.networkState.wasOffline = true;
+      if (!this.networkState.hasLoggedOffline) {
+        console.warn(`[AdSkipper] 后端在 ${context} 时不可达，暂停请求 30 秒。`, error);
+        this.networkState.hasLoggedOffline = true;
+      }
+    }
+
+    markNetworkOnline() {
+      if (this.networkState.wasOffline) {
+        console.info('[AdSkipper] 后端连接已恢复');
+      }
+      this.networkState.offlineUntil = 0;
+      this.networkState.hasLoggedOffline = false;
+      this.networkState.wasOffline = false;
+    }
+
+    async safeFetch(url, options = {}, context = 'request') {
+      const now = Date.now();
+
+      // 检查网络冷却状态
+      if (now < this.networkState.offlineUntil) {
+        const remainingSec = Math.ceil((this.networkState.offlineUntil - now) / 1000);
+        console.warn(`[AdSkipper] safeFetch: 网络冷却中，还需等待 ${remainingSec} 秒`);
+        throw this.createNetworkUnavailableError();
+      }
+
+      console.log(`[AdSkipper] safeFetch: 开始请求 ${context}`);
+      console.log(`[AdSkipper] safeFetch: URL = ${url}`);
+      console.log(`[AdSkipper] safeFetch: 超时设置 = ${this.networkTimeoutMs}ms`);
+
+      const controller = options.signal ? null : new AbortController();
+      const timeoutId = setTimeout(() => {
+        if (controller) {
+          console.warn(`[AdSkipper] safeFetch: 请求超时 (${this.networkTimeoutMs}ms)`);
+          controller.abort();
+        }
+      }, this.networkTimeoutMs);
+
       try {
-        // Get skip type preferences
+        const response = await fetch(url, {
+          ...options,
+          signal: options.signal || (controller ? controller.signal : undefined)
+        });
+        clearTimeout(timeoutId);
+        this.markNetworkOnline();
+        console.log(`[AdSkipper] safeFetch: 请求成功，状态 = ${response.status}`);
+        return response;
+      } catch (error) {
+        clearTimeout(timeoutId);
+        console.error(`[AdSkipper] safeFetch: 请求失败`, error);
+        if (this.isNetworkFailure(error)) {
+          this.markNetworkOffline(context, error);
+          throw this.createNetworkUnavailableError();
+        }
+        throw error;
+      }
+    }
+
+    async loadSegments(bvid) {
+      if (!bvid || this.isLoadingSegments) return;
+      const previousAnalysisBvid = this.analysisBvid;
+      this.isLoadingSegments = true;
+      if (sidebarState) {
+        sidebarState.isLoading = true;
+        sidebarState.loadError = null;
+      }
+
+      try {
         const storage = await new Promise(r => chrome.storage.local.get(['skip_types'], r));
         const skipTypes = storage.skip_types || ['hard_ad', 'soft_ad', 'product_placement'];
 
         const url = API_BASE + "/segments?bvid=" + bvid + "&page=" + this.getPage();
-        const res = await fetch(url);
+        const res = await this.safeFetch(url, {}, 'load segments');
+        if (!res.ok) {
+          throw new Error('加载片段失败：' + res.status);
+        }
+
         const data = await res.json();
+        console.log("[AdSkipper] 后端返回的数据结构:", Object.keys(data));
+        console.log("[AdSkipper] data.ai_title:", data.ai_title);
+        console.log("[AdSkipper] data.knowledge_points:", data.knowledge_points);
+        console.log("[AdSkipper] data.hot_words:", data.hot_words);
 
-        this.segments = data.segments || [];
-        // 保存标注ID用于删除
+        const normalizedSegments = (data.segments || [])
+          .map((segment, index) => this.normalizeSegment(segment, index))
+          .filter(segment => Number.isFinite(segment.start_time) && Number.isFinite(segment.end_time) && segment.end_time > segment.start_time);
+
+        this.allSegments = normalizedSegments;
+        this.segments = normalizedSegments.filter(segment => {
+          if (segment.action === 'popup') return true;
+          if (segment.hasActionField) return true;
+          return skipTypes.includes(segment.ad_type || 'hard_ad');
+        });
+        this.aiSummary = typeof data.ai_summary === 'string' ? data.ai_summary.trim() : '';
         this.currentSegmentIds = this.segments.map(seg => seg.id).filter(id => id);
-        console.log("[AdSkipper] 加载", this.segments.length, "个广告段，ID列表:", this.currentSegmentIds);
+        this.analysisBvid = bvid;
+        if (Array.isArray(data.knowledge_points)) {
+          this.updateKnowledgeDanmuSource(data.knowledge_points, bvid);
+        } else if (previousAnalysisBvid && previousAnalysisBvid !== bvid) {
+          this.clearKnowledgeDanmuState();
+        }
+        if (sidebarState) {
+          sidebarState.bvid = bvid;
+          sidebarState.cid = this.player.currentCid || null;
 
-        // Filter by user preferences
-        this.segments = (data.segments || []).filter(seg =>
-          skipTypes.includes(seg.ad_type || 'hard_ad')
-        );
+          sidebarState.aiSummary = this.aiSummary || '暂无总结';
+          // 确保其他AI分析信息也被保留（如果后端返回了这些字段）
+          if (data.ai_title !== undefined) {
+            sidebarState.aiTitle = data.ai_title || '';
+          }
+          if (data.knowledge_points !== undefined) {
+            sidebarState.knowledgePoints = data.knowledge_points || [];
+          }
+          if (data.hot_words !== undefined) {
+            sidebarState.hotWords = data.hot_words || [];
+          }
+          sidebarState.segments = this.segments;
+          sidebarState.activeSegmentKey = null;
 
-        // 保存标注ID用于删除
-        this.currentSegmentIds = this.segments.map(seg => seg.id).filter(id => id);
-        console.log("[AdSkipper] 加载", this.segments.length, "个广告段（已过滤），ID列表:", this.currentSegmentIds);
+          console.log("[AdSkipper] 侧边栏状态更新后:");
+          console.log("  - aiTitle:", sidebarState.aiTitle);
+          console.log("  - aiSummary:", sidebarState.aiSummary?.substring(0, 50));
+          console.log("  - knowledgePoints:", sidebarState.knowledgePoints);
+          console.log("  - hotWords:", sidebarState.hotWords);
+          console.log("  - isLoading:", sidebarState.isLoading);
+          console.log("  - loadError:", sidebarState.loadError);
+        }
 
-        // 同步给 Vue 状态管理
-        videoState.segments = this.segments;
-
-        // 在进度条上添加标注标记
         this.addSegmentMarkers();
-      } catch (e) {
-        console.error("加载失败:", e);
+      } catch (error) {
+        if (error.code !== 'NETWORK_UNAVAILABLE') {
+          console.error('[AdSkipper] 加载片段失败:', error);
+        }
+        this.segments = [];
+        this.allSegments = [];
+        this.currentSegmentIds = [];
+        if (sidebarState) {
+          sidebarState.bvid = bvid;
+          sidebarState.cid = this.player.currentCid || null;
+          sidebarState.segments = [];
+          sidebarState.aiSummary = '总结加载失败';
+          sidebarState.loadError = error.message || '加载失败';
+        }
+      } finally {
+        this.isLoadingSegments = false;
+        if (sidebarState) {
+          sidebarState.isLoading = false;
+        }
       }
     }
 
-    // 替换后的 checkSkip 方法
-    checkSkip(currentTime) {
-      // 每当你获取到播放器的 currentTime，都会触发更新 Vue 所绑定的响应式大盘
-      videoState.currentTime = currentTime;
-      if (this.player.currentBvid) {
-        videoState.bvid = this.player.currentBvid;
+    normalizeSegment(segment, index) {
+      const start = Number(segment.start ?? segment.start_time ?? 0);
+      const end = Number(segment.end ?? segment.end_time ?? 0);
+      const candidateAction = typeof segment.action === 'string' ? segment.action.toLowerCase() : '';
+      const action = candidateAction === 'popup' || candidateAction === 'skip' ? candidateAction : 'skip';
+
+      const rawContent = typeof segment.content === 'string' ? segment.content.trim() : null;
+      const content = action === 'popup' ? (rawContent || null) : null;
+
+      return {
+        ...segment,
+        id: segment.id ?? `${start}-${end}-${index}`,
+        start,
+        end,
+        start_time: start,
+        end_time: end,
+        action,
+        content,
+        ad_type: segment.ad_type || (action === 'skip' ? 'hard_ad' : 'mid_ad'),
+        hasActionField: typeof segment.action === 'string'
+      };
+    }
+
+    parseTimestampToSeconds(value) {
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        return Math.max(0, value);
       }
-      if (this.player.currentCid) {
-        videoState.cid = this.player.currentCid;
-      }
+      const raw = String(value ?? '').trim();
+      if (!raw) return null;
 
+      const bracketMatch = raw.match(/\[(\d{1,2}:\d{1,2}(?::\d{1,2})?)\]/);
+      const source = bracketMatch ? bracketMatch[1] : raw;
 
-
-
-      // 单条播放时间日志（不刷屏，页面右上角显示）
-      const logElementId = 'ad-skipper-play-time';
-      let logElement = document.getElementById(logElementId);
-
-      if (!logElement) {
-        logElement = document.createElement('div');
-        logElement.id = logElementId;
-        logElement.style.cssText = 'position:fixed;top:10px;right:10px;background:rgba(0,0,0,0.8);color:#fff;padding:8px 12px;border-radius:4px;font-size:14px;z-index:999999;';
-        document.body.appendChild(logElement);
-      }
-      const modeText = this.skipMode === 'auto' ? '[自动]' : '[手动]';
-      logElement.textContent = `${modeText} 时间: ${currentTime.toFixed(2)}s | 广告段: ${this.segments.length}`;
-
-      if (!this.segments.length || Date.now() - this.lastSkipTime < 500) {
-        if (!this.segments.length && !this.noSegmentLogPrinted) {
-          console.log("[AdSkipper] 跳过判断：无广告段数据（后续不再重复提示）");
-          this.noSegmentLogPrinted = true;
-        } else if (Date.now() - this.lastSkipTime < 500 && !this.coolDownLogPrinted) {
-          console.log(`[AdSkipper] 跳过判断：500ms冷却期内（上次跳过：${this.lastSkipTime}，当前：${Date.now()}）`);
-          this.coolDownLogPrinted = true;
+      const hmsMatch = source.match(/(\d{1,2}):(\d{1,2}):(\d{1,2})/);
+      if (hmsMatch) {
+        const hours = Number(hmsMatch[1]);
+        const minutes = Number(hmsMatch[2]);
+        const seconds = Number(hmsMatch[3]);
+        if ([hours, minutes, seconds].every(Number.isFinite)) {
+          return Math.max(0, hours * 3600 + minutes * 60 + seconds);
         }
+      }
+
+      const msMatch = source.match(/(\d{1,3}):(\d{1,2})/);
+      if (msMatch) {
+        const minutes = Number(msMatch[1]);
+        const seconds = Number(msMatch[2]);
+        if ([minutes, seconds].every(Number.isFinite)) {
+          return Math.max(0, minutes * 60 + seconds);
+        }
+      }
+
+      return null;
+    }
+
+    toKnowledgeDanmuText(point) {
+      if (typeof point === 'string') {
+        return point.trim();
+      }
+      if (!point || typeof point !== 'object') {
+        return '';
+      }
+
+      // 处理知识点（knowledge_points）
+      const term = typeof point.term === 'string' ? point.term.trim() : '';
+      const explanation = typeof point.explanation === 'string' ? point.explanation.trim() : '';
+      // 处理热词（hot_words）
+      const word = typeof point.word === 'string' ? point.word.trim() : '';
+      const meaning = typeof point.meaning === 'string' ? point.meaning.trim() : '';
+
+      // 知识点格式：术语: 解释
+      // 热词格式：[热词] 解释
+      let text = '';
+      if (term && explanation) {
+        text = `${term}: ${explanation}`;
+      } else if (word && meaning) {
+        text = `[${word}] ${meaning}`;
+      } else {
+        text = term || explanation || word || meaning;
+      }
+
+      if (!text) return '';
+      // 不再截断文本，显示完整内容
+      return text;
+    }
+
+    updateKnowledgeDanmuSource(knowledgePoints, bvid) {
+      const source = Array.isArray(knowledgePoints) ? knowledgePoints : [];
+      this.knowledgeDanmuQueue = source
+        .map((point, index) => {
+          const seconds = this.parseTimestampToSeconds(
+            typeof point === 'object' ? (point.timestamp ?? point.time ?? point.start_time) : null
+          );
+          const text = this.toKnowledgeDanmuText(point);
+          if (!Number.isFinite(seconds) || !text) return null;
+
+          // 判断是热词还是知识点
+          const isHotWord = typeof point === 'object' && point.word && point.meaning;
+          const type = isHotWord ? 'hot-word' : 'knowledge-point';
+
+          return {
+            id: `${bvid || 'unknown'}-${Math.round(seconds * 10)}-${index}`,
+            timeSec: seconds,
+            text,
+            type // 添加类型标识
+          };
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.timeSec - b.timeSec);
+
+      this.analysisBvid = bvid || this.analysisBvid;
+      this.triggeredDanmuIds.clear();
+      this.lastDanmuCurrentTime = 0;
+      this.nextDanmuLane = 0;
+      this.clearKnowledgeDanmuNodes();
+    }
+
+    clearKnowledgeDanmuNodes() {
+      this.stopKnowledgeDanmuLoop();
+      this.activeKnowledgeDanmus.forEach(item => {
+        if (item?.node?.remove) {
+          item.node.remove();
+        }
+      });
+      this.activeKnowledgeDanmus = [];
+      if (!this.knowledgeDanmuLayer) return;
+      const nodes = this.knowledgeDanmuLayer.querySelectorAll('.visionmark-knowledge-danmu');
+      nodes.forEach(node => node.remove());
+    }
+
+    clearKnowledgeDanmuState() {
+      this.knowledgeDanmuQueue = [];
+      this.triggeredDanmuIds.clear();
+      this.lastDanmuCurrentTime = 0;
+      this.nextDanmuLane = 0;
+      this.nativeDanmuSpeedPxPerSec = 0;
+      this.lastNativeSpeedSampleTs = 0;
+      this.nativeDanmuTrackSample = null;
+      this.clearKnowledgeDanmuNodes();
+    }
+
+    ensureKnowledgeDanmuLayer() {
+      const container = document.querySelector('.bpx-player-video-wrap') ||
+        document.querySelector('.bpx-player-video-area') ||
+        document.querySelector('.bpx-player-container') ||
+        document.querySelector('#bilibili-player');
+      if (!container) return null;
+
+      if (getComputedStyle(container).position === 'static') {
+        container.style.position = 'relative';
+      }
+
+      // 加载 Noto Sans SC 字体（思源黑体 - 现代中性）
+      if (!document.getElementById('visionmark-font-noto-sans')) {
+        const fontLink = document.createElement('link');
+        fontLink.id = 'visionmark-font-noto-sans';
+        fontLink.href = 'https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400&display=swap';
+        fontLink.rel = 'stylesheet';
+        document.head.appendChild(fontLink);
+      }
+
+      if (!document.getElementById('visionmark-knowledge-danmu-style')) {
+        const style = document.createElement('style');
+        style.id = 'visionmark-knowledge-danmu-style';
+        style.textContent = `
+          #visionmark-knowledge-danmu-layer {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            overflow: hidden;
+            z-index: 99998;
+          }
+          .visionmark-knowledge-danmu {
+            position: absolute;
+            max-width: min(75vw, 900px);
+            min-width: 200px;
+            padding: 8px 16px;
+
+            /* 无背景 - 完全透明 */
+            background: transparent !important;
+            border: none !important;
+
+            /* 增强文字效果 - 更醒目 */
+            color: #ffffff !important;
+            font-size: 22px;
+            line-height: 1.6;
+            letter-spacing: 0.5px;
+
+            /* 使用 Noto Sans SC 字体 */
+            font-family: "Noto Sans SC", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+            font-weight: 700;
+
+            /* 多层文字阴影 - 增强可读性 */
+            text-shadow:
+              0 2px 4px rgba(0, 0, 0, 0.8),
+              0 4px 8px rgba(0, 0, 0, 0.6),
+              0 0 20px rgba(0, 0, 0, 0.5),
+              0 0 40px rgba(0, 0, 0, 0.3);
+
+            /* 允许换行，显示完整内容 */
+            white-space: normal;
+            word-wrap: break-word;
+            word-break: break-word;
+
+            left: 0;
+            transform: translate3d(0, 0, 0);
+            will-change: transform;
+            transition: opacity 0.3s ease;
+          }
+
+          /* 知识点样式 - 蓝色光晕 */
+          .visionmark-knowledge-danmu.knowledge-point {
+            color: #66ccff !important;
+            text-shadow:
+              0 2px 4px rgba(0, 0, 0, 0.9),
+              0 4px 8px rgba(0, 0, 0, 0.7),
+              0 0 20px rgba(102, 204, 255, 0.6),
+              0 0 40px rgba(102, 204, 255, 0.4);
+          }
+
+          /* 热词样式 - 粉色光晕 */
+          .visionmark-knowledge-danmu.hot-word {
+            color: #ff99cc !important;
+            text-shadow:
+              0 2px 4px rgba(0, 0, 0, 0.9),
+              0 4px 8px rgba(0, 0, 0, 0.7),
+              0 0 20px rgba(255, 150, 180, 0.6),
+              0 0 40px rgba(255, 150, 180, 0.4);
+          }
+        `;
+        document.head.appendChild(style);
+      }
+
+      let layer = container.querySelector('#visionmark-knowledge-danmu-layer');
+      if (!layer) {
+        layer = document.createElement('div');
+        layer.id = 'visionmark-knowledge-danmu-layer';
+        container.appendChild(layer);
+      }
+      this.knowledgeDanmuLayer = layer;
+      return layer;
+    }
+
+    pickNativeDanmuNode() {
+      const nodes = this.getVisibleNativeDanmuNodes();
+      if (nodes.length) return nodes[0];
+      return null;
+    }
+
+    getVisibleNativeDanmuNodes() {
+      const result = [];
+      const seen = new Set();
+      for (const selector of DANMU_NATIVE_NODE_SELECTORS) {
+        const nodes = document.querySelectorAll(selector);
+        for (const node of nodes) {
+          if (!(node instanceof HTMLElement)) continue;
+          if (seen.has(node)) continue;
+          const rect = node.getBoundingClientRect();
+          if (rect.width < 8 || rect.height < 8) continue;
+          if (rect.bottom <= 0 || rect.top >= window.innerHeight) continue;
+          if (rect.right <= 0 || rect.left >= window.innerWidth) continue;
+          seen.add(node);
+          result.push(node);
+        }
+      }
+      return result;
+    }
+
+    getKnowledgeDanmuLanes() {
+      const fallback = DANMU_DEFAULT_LANES.slice(0, 3);
+      if (!this.knowledgeDanmuLayer) return fallback;
+
+      const layerRect = this.knowledgeDanmuLayer.getBoundingClientRect();
+      if (!Number.isFinite(layerRect.height) || layerRect.height <= 0) return fallback;
+
+      const nativeNodes = this.getVisibleNativeDanmuNodes();
+      if (!nativeNodes.length) return fallback;
+
+      const laneSet = new Set();
+      for (const node of nativeNodes.slice(0, 24)) {
+        const rect = node.getBoundingClientRect();
+        const relativeY = ((rect.top + rect.height / 2) - layerRect.top) / layerRect.height * 100;
+        if (!Number.isFinite(relativeY)) continue;
+        const clamped = Math.min(Math.max(relativeY, DANMU_LANE_MIN_PERCENT), DANMU_LANE_MAX_PERCENT);
+        const bucket = Math.round(clamped / DANMU_LANE_STEP_PERCENT) * DANMU_LANE_STEP_PERCENT;
+        laneSet.add(bucket);
+      }
+
+      const nativeLanes = Array.from(laneSet)
+        .filter(value => Number.isFinite(value))
+        .sort((a, b) => a - b);
+
+      const preferredLaneCount = nativeNodes.length <= 3 ? 3 : 4;
+      const merged = [...nativeLanes, ...DANMU_DEFAULT_LANES]
+        .filter((value, index, arr) => arr.indexOf(value) === index)
+        .filter(value => value >= DANMU_LANE_MIN_PERCENT && value <= DANMU_LANE_MAX_PERCENT)
+        .sort((a, b) => a - b);
+
+      const lanes = merged.slice(0, preferredLaneCount);
+      return lanes.length ? lanes : fallback;
+    }
+
+    sampleNativeDanmuSpeed(now = performance.now()) {
+      if (now - this.lastNativeSpeedSampleTs < DANMU_NATIVE_SAMPLE_MS) {
+        return;
+      }
+      this.lastNativeSpeedSampleTs = now;
+
+      const node = this.pickNativeDanmuNode();
+      if (!node) {
+        this.nativeDanmuTrackSample = null;
         return;
       }
 
-      this.noSegmentLogPrinted = false;
-      this.coolDownLogPrinted = false;
-
-      if (!this.matchProcessLogPrinted) {
-        console.log(`[AdSkipper] 正在匹配广告段（共${this.segments.length}个）...`);
-        this.segments.forEach((ad, idx) => {
-          console.log(`[AdSkipper] 广告段${idx + 1}：${ad.start_time.toFixed(2)}s - ${ad.end_time.toFixed(2)}s（类型：${ad.ad_type || 'hard_ad'}）`);
-        });
-        this.matchProcessLogPrinted = true;
+      const rect = node.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      if (!Number.isFinite(centerX)) {
+        return;
       }
 
-
-
-      if (!this.segments.length || Date.now() - this.lastSkipTime < 500) return;
-
-
-
-      const ad = this.segments.find(s =>
-        currentTime >= s.start_time && currentTime < s.end_time - 0.5
-      );
-
-      if (ad) {
-        console.log(`[AdSkipper] 匹配到广告段：${ad.start_time.toFixed(2)}s - ${ad.end_time.toFixed(2)}s，执行跳过`);
-        if (this.skipMode === 'auto') {
-          // 自动跳过模式
-          this.player.skipTo(ad.end_time);
-          this.lastSkipTime = Date.now();
-          this.showSkipNotification(ad);
-        } else {
-          // 手动模式：显示跳过按钮
-          if (!this.skipButton) {
-            this.showSkipButton(ad);
+      const previous = this.nativeDanmuTrackSample;
+      if (previous && previous.node === node) {
+        const dtSec = (now - previous.ts) / 1000;
+        const dx = previous.x - centerX;
+        if (dtSec > 0 && dx > 0) {
+          const scaleX = this.getKnowledgeDanmuLayerScaleX();
+          const speed = (dx / dtSec) / scaleX;
+          if (speed >= DANMU_SPEED_MIN_PX_PER_SEC && speed <= DANMU_SPEED_MAX_PX_PER_SEC) {
+            this.nativeDanmuSpeedPxPerSec = this.nativeDanmuSpeedPxPerSec > 0
+              ? this.nativeDanmuSpeedPxPerSec * 0.7 + speed * 0.3
+              : speed;
           }
         }
-        this.matchProcessLogPrinted = false;
-        this.noAdMatchLogPrinted = false;
-      } else {
-        // 离开广告段，隐藏按钮
-        this.hideSkipButton();
-        if (!this.noAdMatchLogPrinted) {
-          console.log("[AdSkipper] 未匹配到需要跳过的广告段（后续不再重复提示）");
-          this.noAdMatchLogPrinted = true;
+      }
+
+      this.nativeDanmuTrackSample = { node, x: centerX, ts: now };
+    }
+
+    getKnowledgeDanmuLayerScaleX() {
+      if (!this.knowledgeDanmuLayer) return 1;
+      const localWidth = this.knowledgeDanmuLayer.clientWidth;
+      const rectWidth = this.knowledgeDanmuLayer.getBoundingClientRect().width;
+      if (!Number.isFinite(localWidth) || localWidth <= 0) return 1;
+      if (!Number.isFinite(rectWidth) || rectWidth <= 0) return 1;
+      const scaleX = rectWidth / localWidth;
+      if (!Number.isFinite(scaleX) || scaleX <= 0) return 1;
+      return Math.min(Math.max(scaleX, 0.5), 3);
+    }
+
+    getFallbackDanmuSpeedPxPerSec(layerWidth) {
+      const safeLocalWidth = Number.isFinite(layerWidth) && layerWidth > 0
+        ? layerWidth
+        : (this.knowledgeDanmuLayer?.clientWidth || window.innerWidth || 1280);
+      const scaleX = this.getKnowledgeDanmuLayerScaleX();
+      const viewportWidth = safeLocalWidth * scaleX;
+      return ((viewportWidth + DANMU_FALLBACK_TRACK_PX) / DANMU_BASE_DURATION_SEC) / scaleX;
+    }
+
+    getKnowledgeDanmuSpeedPxPerSec(layerWidth) {
+      let speed = this.getFallbackDanmuSpeedPxPerSec(layerWidth);
+      if (
+        Number.isFinite(this.nativeDanmuSpeedPxPerSec) &&
+        this.nativeDanmuSpeedPxPerSec >= DANMU_SPEED_MIN_PX_PER_SEC &&
+        this.nativeDanmuSpeedPxPerSec <= DANMU_SPEED_MAX_PX_PER_SEC
+      ) {
+        speed = this.nativeDanmuSpeedPxPerSec;
+      }
+      return speed * DANMU_SPEED_TUNE_FACTOR;
+    }
+
+    startKnowledgeDanmuLoop() {
+      if (this.knowledgeDanmuRafId !== null) return;
+      this.lastDanmuFrameTs = 0;
+      this.knowledgeDanmuRafId = requestAnimationFrame((ts) => this.tickKnowledgeDanmu(ts));
+    }
+
+    stopKnowledgeDanmuLoop() {
+      if (this.knowledgeDanmuRafId !== null) {
+        cancelAnimationFrame(this.knowledgeDanmuRafId);
+        this.knowledgeDanmuRafId = null;
+      }
+      this.lastDanmuFrameTs = 0;
+    }
+
+    syncKnowledgeDanmuAnimationState() {
+      if (!this.activeKnowledgeDanmus.length) {
+        this.stopKnowledgeDanmuLoop();
+        return;
+      }
+      const state = this.player.getState();
+      if (state.paused) {
+        this.stopKnowledgeDanmuLoop();
+        return;
+      }
+      this.startKnowledgeDanmuLoop();
+    }
+
+    tickKnowledgeDanmu(frameTs) {
+      this.knowledgeDanmuRafId = null;
+      if (!this.knowledgeDanmuLayer) {
+        this.activeKnowledgeDanmus = [];
+        return;
+      }
+
+      this.activeKnowledgeDanmus = this.activeKnowledgeDanmus.filter(item => item?.node?.isConnected);
+      if (!this.activeKnowledgeDanmus.length) {
+        this.stopKnowledgeDanmuLoop();
+        return;
+      }
+
+      const state = this.player.getState();
+      if (state.paused) {
+        this.stopKnowledgeDanmuLoop();
+        return;
+      }
+
+      const currentTs = Number.isFinite(frameTs) ? frameTs : performance.now();
+      if (!this.lastDanmuFrameTs) {
+        this.lastDanmuFrameTs = currentTs;
+      }
+      const deltaSec = Math.min(Math.max((currentTs - this.lastDanmuFrameTs) / 1000, 0), 0.1);
+      this.lastDanmuFrameTs = currentTs;
+
+      this.sampleNativeDanmuSpeed(currentTs);
+      const layerWidth = this.knowledgeDanmuLayer.clientWidth || window.innerWidth || 1280;
+      const speed = this.getKnowledgeDanmuSpeedPxPerSec(layerWidth);
+      const remaining = [];
+
+      for (const item of this.activeKnowledgeDanmus) {
+        item.x -= speed * deltaSec;
+        if (item.node && item.node.style) {
+          item.node.style.transform = `translate3d(${item.x}px, 0, 0)`;
+        }
+        if (item.x + item.width < -DANMU_REMOVE_BUFFER_PX) {
+          item.node.remove();
+          continue;
+        }
+        remaining.push(item);
+      }
+
+      this.activeKnowledgeDanmus = remaining;
+      if (!this.activeKnowledgeDanmus.length) {
+        this.stopKnowledgeDanmuLoop();
+        return;
+      }
+
+      this.knowledgeDanmuRafId = requestAnimationFrame((ts) => this.tickKnowledgeDanmu(ts));
+    }
+
+    renderKnowledgeDanmu(item) {
+      const layer = this.ensureKnowledgeDanmuLayer();
+      if (!layer) return;
+      if (this.activeKnowledgeDanmus.length >= DANMU_MAX_CONCURRENT) return;
+
+      const lanes = this.getKnowledgeDanmuLanes();
+      const lane = lanes[this.nextDanmuLane % lanes.length];
+      this.nextDanmuLane += 1;
+
+      const node = document.createElement('div');
+      node.className = `visionmark-knowledge-danmu ${item.type || 'knowledge-point'}`;
+      node.style.top = `${lane}%`;
+      node.textContent = item.text;
+      layer.appendChild(node);
+
+      const layerWidth = layer.clientWidth || window.innerWidth || 1280;
+      const width = node.getBoundingClientRect().width || 240;
+      const startX = layerWidth + 24;
+      node.style.transform = `translate3d(${startX}px, 0, 0)`;
+
+      this.activeKnowledgeDanmus.push({
+        id: item.id,
+        node,
+        x: startX,
+        width
+      });
+
+      this.sampleNativeDanmuSpeed();
+      this.syncKnowledgeDanmuAnimationState();
+    }
+
+    handleKnowledgeDanmu(currentTime) {
+      if (!Number.isFinite(currentTime) || !this.knowledgeDanmuQueue.length) {
+        this.lastDanmuCurrentTime = currentTime;
+        this.syncKnowledgeDanmuAnimationState();
+        return;
+      }
+      this.sampleNativeDanmuSpeed();
+      if (currentTime + DANMU_REWIND_RESET_SEC < this.lastDanmuCurrentTime) {
+        this.triggeredDanmuIds.clear();
+      }
+
+      let rendered = 0;
+      for (const item of this.knowledgeDanmuQueue) {
+        if (rendered >= 2) break;
+        if (this.triggeredDanmuIds.has(item.id)) continue;
+        const delta = currentTime - item.timeSec;
+        if (delta >= -DANMU_TRIGGER_WINDOW_SEC && delta <= DANMU_TRIGGER_WINDOW_SEC) {
+          this.triggeredDanmuIds.add(item.id);
+          this.renderKnowledgeDanmu(item);
+          rendered += 1;
         }
       }
+
+      this.lastDanmuCurrentTime = currentTime;
+      this.syncKnowledgeDanmuAnimationState();
+    }
+
+
+    async requestAnalysis(bvid, token) {
+      const url = VIDEO_ANALYSIS_BASE + "/video-analysis/analyze";
+      console.log('[AdSkipper] 请求URL:', url);
+      console.log('[AdSkipper] 请求体:', JSON.stringify({ bvid }));
+      console.log('[AdSkipper] 注意：视频分析无超时限制，可能需要几分钟时间');
+
+      // 直接使用原生 fetch，不设置超时
+      // 视频分析需要很长时间（下载、提取、AI分析），不能有超时限制
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + token
+        },
+        body: JSON.stringify({ bvid })
+      });
+
+      console.log('[AdSkipper] 响应状态:', res.status, res.statusText);
+
+      let payload = null;
+      try {
+        payload = await res.json();
+        console.log('[AdSkipper] 响应数据:', payload);
+      } catch (error) {
+        console.error('[AdSkipper] 解析JSON失败:', error);
+        payload = null;
+      }
+
+      if (!res.ok) {
+        const message = payload?.message || payload?.error || `分析失败（${res.status}）`;
+        console.error('[AdSkipper] API错误:', message);
+        throw new Error(message);
+      }
+      return payload;
+    }
+
+    applyAnalysisData(bvid, data) {
+      const analysisData = data || {};
+      const rawSegments = Array.isArray(analysisData.ad_segments) ? analysisData.ad_segments : [];
+      const aiSegments = rawSegments
+        .map((segment, index) => this.normalizeSegment({
+          id: `ai-${bvid}-${index}`,
+          start_time: Number(segment.start_time ?? segment.start ?? 0),
+          end_time: Number(segment.end_time ?? segment.end ?? 0),
+          action: segment.highlight ? 'popup' : 'skip',
+          content: typeof segment.description === 'string' ? segment.description : '',
+          ad_type: segment.ad_type || (segment.highlight ? 'hard_ad' : 'soft_ad'),
+          is_ai_segment: true
+        }, index))
+        .filter(segment => Number.isFinite(segment.start_time) && Number.isFinite(segment.end_time) && segment.end_time > segment.start_time);
+
+      const knowledgePoints = Array.isArray(analysisData.knowledge_points) ? analysisData.knowledge_points : [];
+      const hotWords = Array.isArray(analysisData.hot_words) ? analysisData.hot_words : [];
+
+      // 去重：知识点和热词重复时，以知识点为主（优先显示知识点）
+      const knowledgePointTerms = new Set(knowledgePoints.map(kp => kp.term));
+      const filteredHotWords = hotWords.filter(hw => !knowledgePointTerms.has(hw.word));
+
+      // 合并知识点和过滤后的热词（知识点在前，热词在后）
+      const allDanmuItems = [...knowledgePoints, ...filteredHotWords];
+
+      console.log('[AdSkipper] 弹幕数据统计:');
+      console.log('  - 知识点:', knowledgePoints.length);
+      console.log('  - 原始热词:', hotWords.length);
+      console.log('  - 去重后热词:', filteredHotWords.length);
+      console.log('  - 总弹幕数:', allDanmuItems.length);
+
+      this.analysisBvid = bvid;
+      this.aiSummary = typeof analysisData.summary === 'string' ? analysisData.summary.trim() : '';
+      this.segments = aiSegments;
+      this.allSegments = aiSegments;
+      this.currentSegmentIds = [];
+      this.updateKnowledgeDanmuSource(allDanmuItems, bvid);
+      this.addSegmentMarkers();
+
+      if (sidebarState) {
+        sidebarState.aiSummary = this.aiSummary || '暂无总结';
+        sidebarState.aiTitle = analysisData.title || '';
+        sidebarState.knowledgePoints = knowledgePoints;
+        sidebarState.hotWords = hotWords;
+        sidebarState.bvid = bvid;
+        sidebarState.cid = this.player.currentCid || null;
+        sidebarState.segments = aiSegments;
+        sidebarState.activeSegmentKey = null;
+      }
+    }
+
+    async analyzeVideoLegacy(bvid) {
+      try {
+        const token = await this.getToken();
+        if (!token) {
+          console.log("[AdSkipper] 未登录，跳过视频分析");
+          return;
+        }
+
+        console.log("[AdSkipper] 开始分析视频:", bvid);
+
+        // 设置加载状态
+        if (sidebarState) {
+          sidebarState.isLoading = true;
+          sidebarState.loadError = null;
+        }
+
+        const url = VIDEO_ANALYSIS_BASE + "/video-analysis/analyze";
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + token
+          },
+          body: JSON.stringify({ bvid })
+        });
+
+        const result = await res.json();
+
+        if (!res.ok) {
+          console.error("[AdSkipper] 分析失败:", result.message || result.error);
+          if (sidebarState) {
+            sidebarState.isLoading = false;
+            sidebarState.loadError = result.message || result.error || '分析失败';
+          }
+          return;
+        }
+
+        if (result.success && result.data) {
+          console.log("[AdSkipper] 分析成功");
+          console.log("[AdSkipper] title:", result.data.title);
+          console.log("[AdSkipper] summary:", result.data.summary);
+          console.log("[AdSkipper] ad_segments:", result.data.ad_segments?.length || 0);
+          console.log("[AdSkipper] knowledge_points:", result.data.knowledge_points?.length || 0);
+          console.log("[AdSkipper] hot_words:", result.data.hot_words?.length || 0);
+
+          // 更新侧边栏显示
+          if (sidebarState) {
+            sidebarState.aiSummary = result.data.summary || '暂无总结';
+            sidebarState.aiTitle = result.data.title || '';
+            sidebarState.knowledgePoints = result.data.knowledge_points || [];
+            sidebarState.hotWords = result.data.hot_words || [];
+            sidebarState.bvid = bvid;
+            sidebarState.cid = this.player.currentCid || null;
+            sidebarState.isLoading = false; // 结束加载状态
+
+            // 处理 AI 分析的分段数据
+            if (result.data.ad_segments && result.data.ad_segments.length > 0) {
+              console.log("[AdSkipper] 发现", result.data.ad_segments.length, "个 AI 分析分段");
+
+              // 将 AI 分段转换为 TimelineItem 期望的格式
+              const aiSegments = result.data.ad_segments.map((seg, index) => ({
+                id: `ai-${bvid}-${index}`, // 生成唯一 ID
+                start_time: seg.start_time,
+                end_time: seg.end_time,
+                action: seg.highlight ? 'popup' : 'skip', // highlight 为 true 时为重点
+                content: seg.description || '',
+                ad_type: seg.ad_type || (seg.highlight ? 'hard_ad' : 'soft_ad'),
+                is_ai_segment: true // 标记为 AI 分析的片段
+              }));
+
+              // 将 AI 分段添加到侧边栏
+              sidebarState.segments = aiSegments;
+              console.log("[AdSkipper] AI 分段已添加到侧边栏:", aiSegments.length);
+            } else {
+              // 如果没有 AI 分段，清空分段列表
+              sidebarState.segments = [];
+            }
+
+            console.log("[AdSkipper] 侧边栏数据已更新:");
+            console.log("  - aiTitle:", sidebarState.aiTitle);
+            console.log("  - aiSummary:", sidebarState.aiSummary ? sidebarState.aiSummary.substring(0, 50) + '...' : '');
+            console.log("  - knowledgePoints:", sidebarState.knowledgePoints.length);
+            console.log("  - hotWords:", sidebarState.hotWords.length);
+            console.log("  - segments:", sidebarState.segments.length);
+          }
+        }
+      } catch (error) {
+        console.error("[AdSkipper] 分析视频出错:", error);
+        if (sidebarState) {
+          sidebarState.isLoading = false;
+          sidebarState.loadError = '分析失败: ' + error.message;
+        }
+      }
+    }
+
+    async analyzeVideo(bvid) {
+      try {
+        console.log('[AdSkipper] ========== 开始视频分析 ==========');
+        console.log('[AdSkipper] BV号:', bvid);
+        console.log('[AdSkipper] API地址:', VIDEO_ANALYSIS_BASE);
+
+        let token = '';
+        token = await this.getToken();
+        console.log('[AdSkipper] Token:', token ? '已获取（前10位: ' + token.substring(0, 10) + '...）' : '未获取');
+
+        if (!token) {
+          console.log('[AdSkipper] 未登录，跳过视频分析');
+          if (sidebarState) {
+            sidebarState.loadError = '请先登录后再使用AI分析功能';
+          }
+          return;
+        }
+
+        if (sidebarState) {
+          sidebarState.isLoading = true;
+          sidebarState.loadError = null;
+        }
+
+        console.log('[AdSkipper] 开始请求分析API...');
+        const result = await this.requestAnalysis(bvid, token);
+        console.log('[AdSkipper] API返回:', result);
+
+        if (!result?.success || !result?.data) {
+          throw new Error('分析结果无效');
+        }
+
+        this.applyAnalysisData(bvid, result.data);
+        if (sidebarState) {
+          sidebarState.isLoading = false;
+        }
+        console.log('[AdSkipper] ========== 视频分析完成 ==========');
+      } catch (error) {
+        console.error('[AdSkipper] 视频分析异常:', error);
+        console.error('[AdSkipper] 错误详情:', {
+          message: error.message,
+          code: error.code,
+          stack: error.stack
+        });
+        if (sidebarState) {
+          sidebarState.isLoading = false;
+          sidebarState.loadError = '分析失败: ' + error.message;
+        }
+      }
+    }
+
+    getSegmentKey(segment, indexFallback = 0) {
+      return String(segment.id ?? `${segment.start_time}-${segment.end_time}-${indexFallback}`);
+    }
+
+    seekToSegmentStart(segment) {
+      if (!segment) return;
+      const targetTime = Number(segment.start_time);
+      if (!Number.isFinite(targetTime)) return;
+      this.player.skipTo(Math.max(0, targetTime));
+    }
+
+    seekToSegmentEnd(segment) {
+      if (!segment) return;
+      const targetTime = Number(segment.end_time);
+      if (!Number.isFinite(targetTime)) return;
+      this.player.skipTo(Math.max(0, targetTime));
+    }
+
+    getActiveSegment(currentTime) {
+      return this.segments.find(segment => currentTime >= segment.start_time && currentTime < segment.end_time - 0.2);
+    }
+
+    handleSkipSegment(segment) {
+      if (!segment || segment.action !== 'skip') return;
+
+      if (this.skipMode === 'auto') {
+        this.seekToSegmentEnd(segment);
+        this.lastSkipTime = Date.now();
+        this.showSkipNotification(segment);
+        return;
+      }
+
+      if (!this.skipButton) {
+        this.showSkipButton(segment);
+      }
+    }
+
+    // 鏇存柊鍚庣殑 checkSkip 鏂规硶
+    checkSkip(currentTime) {
+      if (this.analysisBvid && this.player.currentBvid && this.analysisBvid !== this.player.currentBvid) {
+        this.clearKnowledgeDanmuState();
+        this.analysisBvid = this.player.currentBvid;
+      }
+
+      if (sidebarState) {
+        sidebarState.currentTime = currentTime;
+        if (this.player.currentBvid) {
+          sidebarState.bvid = this.player.currentBvid;
+        }
+        if (this.player.currentCid) {
+          sidebarState.cid = this.player.currentCid;
+        }
+      }
+
+      this.handleKnowledgeDanmu(currentTime);
+
+      if (!this.segments.length) {
+        if (sidebarState) {
+          sidebarState.activeSegmentKey = null;
+        }
+        this.hideSkipButton();
+        return;
+      }
+
+      const activeSegment = this.getActiveSegment(currentTime);
+      if (!activeSegment) {
+        if (sidebarState) {
+          sidebarState.activeSegmentKey = null;
+        }
+        this.hideSkipButton();
+        return;
+      }
+
+      if (sidebarState) {
+        sidebarState.activeSegmentKey = this.getSegmentKey(activeSegment);
+      }
+
+      if (activeSegment.action === 'popup') {
+        this.hideSkipButton();
+        return;
+      }
+
+      if (Date.now() - this.lastSkipTime < 500) {
+        return;
+      }
+
+      this.handleSkipSegment(activeSegment);
     }
 
     startInjectionObserver() {
@@ -283,9 +1371,7 @@ import { videoState } from './store.js';
 
     injectControlPanel(target) {
       const self = this;
-      console.log("[AdSkipper] 注入控制面板到:", target.className);
 
-      // 1. Inject Styles for Responsiveness
       if (!document.getElementById('adskipper-css')) {
         const style = document.createElement('style');
         style.id = 'adskipper-css';
@@ -293,62 +1379,18 @@ import { videoState } from './store.js';
           .adskipper-toggle-text { display: block; font-size: 13px; font-weight: 500; }
           .is-compact #adskipper-toggle { padding: 0 6px !important; justify-content: center; }
           #adskipper-toggle:hover { filter: brightness(1.1); }
-          /* 确认对话框样式 */
-          #adskipper-confirm-dialog {
-            position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            background: rgba(20, 20, 20, 0.98);
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255,255,255,0.1);
-            border-radius: 8px;
-            padding: 20px;
-            z-index: 999999;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.6);
-            color: #fff;
-            min-width: 300px;
-          }
-          #adskipper-confirm-dialog h3 {
-            margin: 0 0 15px 0;
-            font-size: 16px;
-            color: #FB7299;
-          }
-          #adskipper-confirm-dialog .btn-group {
-            display: flex;
-            gap: 10px;
-            justify-content: flex-end;
-            margin-top: 20px;
-          }
-          #adskipper-confirm-dialog button {
-            padding: 6px 16px;
-            border-radius: 4px;
-            border: none;
-            cursor: pointer;
-            font-size: 14px;
-          }
-          #adskipper-confirm-ok {
-            background: #FB7299;
-            color: white;
-          }
-          #adskipper-confirm-cancel {
-            background: #555;
-            color: white;
-          }
         `;
         document.head.appendChild(style);
       }
 
-      // 2. Wrapper
       const wrapper = document.createElement('div');
       wrapper.id = 'adskipper-wrapper';
       wrapper.style.cssText = 'position:relative;display:inline-flex;vertical-align:middle;height:100%;align-items:center;margin-right:12px;z-index:100;';
 
-      // 3. Toggle Button
       const toggleBtn = document.createElement('div');
       toggleBtn.id = 'adskipper-toggle';
-      toggleBtn.title = '广告标注控制';
-      toggleBtn.setAttribute('aria-label', '广告标注控制');
+      toggleBtn.title = '广告控制';
+      toggleBtn.setAttribute('aria-label', '广告控制');
       toggleBtn.style.cssText = `
         cursor: pointer;
         background-color: #FB7299;
@@ -364,14 +1406,12 @@ import { videoState } from './store.js';
         height: auto;
         min-height: 24px;
       `;
-      toggleBtn.innerHTML = `<span class="adskipper-toggle-text">广告控制</span>`;
-
-      toggleBtn.onclick = (e) => {
-        e.stopPropagation();
+      toggleBtn.innerHTML = '<span class="adskipper-toggle-text">广告控制</span>';
+      toggleBtn.onclick = (event) => {
+        event.stopPropagation();
         self.togglePopover();
       };
 
-      // 4. Popover Panel
       const popover = document.createElement('div');
       popover.id = 'adskipper-popover';
       popover.style.cssText = `
@@ -379,7 +1419,7 @@ import { videoState } from './store.js';
         position: absolute;
         bottom: 140%;
         left: 0;
-        margin-bottom: 0px;
+        margin-bottom: 0;
         z-index: 2147483647;
         background: rgba(20, 20, 20, 0.95);
         backdrop-filter: blur(10px);
@@ -393,24 +1433,20 @@ import { videoState } from './store.js';
         transform-origin: bottom left;
         transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
       `;
-      popover.onclick = (e) => e.stopPropagation();
+      popover.onclick = (event) => event.stopPropagation();
 
-      // --- Button Logic ---
-
-      // Helper: Create Row
       const createRow = () => {
         const row = document.createElement('div');
         row.style.cssText = 'display:flex;gap:8px;align-items:center;justify-content:space-between;';
         return row;
       };
 
-      // Helper: Create Button
-      function createBtn(id, icon, label, title, onClick) {
-        const btn = document.createElement('button');
-        btn.id = id;
-        btn.innerHTML = `<span style="font-size:1.2em;">${icon}</span> <span style="font-size:0.9em;">${label}</span>`;
-        btn.title = title;
-        btn.style.cssText = `
+      function createBtn(id, label, title, onClick) {
+        const button = document.createElement('button');
+        button.id = id;
+        button.textContent = label;
+        button.title = title;
+        button.style.cssText = `
           flex: 1;
           height: 32px;
           background: #333;
@@ -426,161 +1462,138 @@ import { videoState } from './store.js';
           padding: 0 8px;
           white-space: nowrap;
         `;
-        btn.onmouseenter = () => { if (!btn.disabled) { btn.style.background = '#444'; } };
-        btn.onmouseleave = () => {
-          if (btn.dataset.active === 'true') {
-            btn.style.background = '#FB7299';
-            btn.style.borderColor = '#FB7299';
-          } else {
-            btn.style.background = '#333';
+        button.onmouseenter = () => {
+          if (!button.disabled) {
+            button.style.background = '#444';
           }
         };
-        btn.onclick = onClick;
-        return btn;
+        button.onmouseleave = () => {
+          if (button.dataset.active === 'true') {
+            button.style.background = '#FB7299';
+            button.style.borderColor = '#FB7299';
+          } else {
+            button.style.background = '#333';
+          }
+        };
+        button.onclick = onClick;
+        return button;
       }
 
-      // Row 1: Start / End
       const row1 = createRow();
-
-      const btnStart = createBtn('adskipper-btn-start', '⛳', '开始', '标记广告开始', () => {
+      const btnStart = createBtn('adskipper-btn-start', '开始', '标记开始时间', () => {
         const current = self.player.getState().currentTime;
         self.pendingStart = current;
         btnStart.dataset.active = 'true';
         btnStart.style.background = '#FB7299';
         btnStart.style.borderColor = '#FB7299';
         self.updateButtonStates();
-        self.showToast("开始: " + current.toFixed(1) + "s", "info");
-        btnStart.animate([{ opacity: 1 }, { opacity: 0.5 }, { opacity: 1 }], { duration: 300 });
+        self.showToast('开始: ' + current.toFixed(1) + 's', 'info');
       });
 
-      const btnEnd = createBtn('adskipper-btn-end', '🏁', '结束', '标记广告结束', () => {
+      const btnEnd = createBtn('adskipper-btn-end', '结束', '标记结束时间', () => {
         const current = self.player.getState().currentTime;
-        if (self.pendingStart && current <= self.pendingStart) {
-          self.showToast("结束必须大于开始", "error");
+        if (self.pendingStart !== null && current <= self.pendingStart) {
+          self.showToast('结束时间必须大于开始时间', 'error');
           return;
         }
         self.pendingEnd = current;
         btnEnd.dataset.active = 'true';
         btnEnd.style.background = '#FB7299';
+        btnEnd.style.borderColor = '#FB7299';
         self.updateButtonStates();
-        self.showToast("结束: " + current.toFixed(1) + "s", "info");
-        btnEnd.animate([{ opacity: 1 }, { opacity: 0.5 }, { opacity: 1 }], { duration: 300 });
+        self.showToast('结束: ' + current.toFixed(1) + 's', 'info');
       });
       btnEnd.disabled = true;
       btnEnd.style.opacity = '0.5';
       btnEnd.style.cursor = 'not-allowed';
-
       row1.appendChild(btnStart);
       row1.appendChild(btnEnd);
 
-      // Row 2: Type Selector
       const row2 = createRow();
       const selectType = document.createElement('select');
       selectType.id = 'adskipper-type';
       selectType.style.cssText = 'width:100%;height:32px;background:#333;color:#fff;border:1px solid #555;border-radius:4px;padding:0 6px;font-size:0.9em;outline:none;cursor:pointer;';
       const types = [
-        { val: 'hard_ad', text: '硬广 (Hard Ad)' },
-        { val: 'soft_ad', text: '软广 (Soft Ad)' },
-        { val: 'product_placement', text: '植入 (Placement)' },
-        { val: 'intro_ad', text: '片头 (Intro)' },
-        { val: 'mid_ad', text: '中段 (Mid)' }
+        { val: 'hard_ad', text: '硬广' },
+        { val: 'soft_ad', text: '软广' },
+        { val: 'product_placement', text: '植入广告' },
+        { val: 'intro_ad', text: '片头广告' },
+        { val: 'mid_ad', text: '中段广告' }
       ];
-      types.forEach((t) => {
-        const opt = document.createElement('option');
-        opt.value = t.val;
-        opt.textContent = t.text;
-        selectType.appendChild(opt);
+      types.forEach((item) => {
+        const option = document.createElement('option');
+        option.value = item.val;
+        option.textContent = item.text;
+        selectType.appendChild(option);
       });
-      selectType.onchange = (e) => { self.pendingType = e.target.value; };
+      selectType.onchange = (event) => {
+        self.pendingType = event.target.value;
+      };
       row2.appendChild(selectType);
 
-      // Row 3: Submit + Delete
       const row3 = createRow();
-      const btnSubmit = createBtn('adskipper-btn-submit', '☁️', '提交标注', '提交到服务器', async () => {
-        if (!self.pendingStart || !self.pendingEnd) return;
+      const btnSubmit = createBtn('adskipper-btn-submit', '提交标注', '提交到服务器', async () => {
+        if (self.pendingStart === null || self.pendingEnd === null) return;
 
-        const storage = await new Promise(r => chrome.storage.local.get(['adskipper_token'], r));
+        const storage = await new Promise(resolve => chrome.storage.local.get(['adskipper_token'], resolve));
         if (!storage.adskipper_token) {
-          self.showToast("✗ 请先登录插件", "error");
+          self.showToast('请先登录插件', 'error');
           return;
         }
 
-        btnSubmit.innerHTML = '⏳ 提交中...';
+        btnSubmit.textContent = '提交中...';
         try {
           await self.submitAnnotation(self.pendingStart, self.pendingEnd, self.pendingType);
-          self.showToast("✓ 成功 +10分", "success");
+          self.showToast('提交成功 +10分', 'success');
 
-          // Reset
           self.pendingStart = null;
           self.pendingEnd = null;
-          self.updateButtonStates();
-
           btnStart.dataset.active = 'false';
           btnEnd.dataset.active = 'false';
-          [btnStart, btnEnd].forEach(btn => {
-            btn.style.background = '#333';
-            btn.style.borderColor = '#555';
-          });
-
-          btnSubmit.innerHTML = '<span style="font-size:1.2em;">☁️</span> <span style="font-size:0.9em;">提交标注</span>';
-
-          // Close popover on success
+          btnStart.style.background = '#333';
+          btnEnd.style.background = '#333';
+          btnStart.style.borderColor = '#555';
+          btnEnd.style.borderColor = '#555';
+          self.updateButtonStates();
+          btnSubmit.textContent = '提交标注';
           self.togglePopover(false);
-
-        } catch (err) {
-          self.showToast("✗ " + err.message, "error");
-          btnSubmit.innerHTML = '<span style="font-size:1.2em;">☁️</span> <span style="font-size:0.9em;">提交标注</span>';
+        } catch (error) {
+          self.showToast('提交失败: ' + error.message, 'error');
+          btnSubmit.textContent = '提交标注';
         }
       });
       btnSubmit.disabled = true;
       btnSubmit.style.opacity = '0.5';
       btnSubmit.style.cursor = 'not-allowed';
 
-      // 添加删除按钮
-      const btnDelete = createBtn('adskipper-btn-delete', '🗑️', '删除最近', '删除最近添加的标注', async () => {
-        // 检查是否有可删除的标注
+      const btnDelete = createBtn('adskipper-btn-delete', '删除最近', '删除最近一条标注', async () => {
         if (!self.currentSegmentIds.length) {
-          self.showToast("✗ 暂无可删除的标注", "error");
+          self.showToast('暂无可删除标注', 'error');
           return;
         }
 
-        // 显示确认对话框
-        const confirmResult = await self.showConfirmDialog(
-          "确认删除",
-          `是否确定删除最近添加的标注？\n（ID: ${self.currentSegmentIds[self.currentSegmentIds.length - 1]}）`
-        );
+        const targetId = self.currentSegmentIds[self.currentSegmentIds.length - 1];
+        // Use native confirm for control panel popover (dark theme UI)
+        const confirmed = confirm(`确定要删除最近标注（ID：${targetId}）吗？`);
+        if (!confirmed) return;
 
-        if (!confirmResult) return;
-
-        btnDelete.innerHTML = '⏳ 删除中...';
+        btnDelete.textContent = '删除中...';
         btnDelete.disabled = true;
         btnDelete.style.opacity = '0.5';
 
         try {
-          // 删除最后一个标注
-          const lastSegmentId = self.currentSegmentIds[self.currentSegmentIds.length - 1];
-          await self.deleteAnnotation(lastSegmentId);
-          self.showToast("✓ 删除成功", "success");
-
-          // 刷新标注数据
+          await self.deleteAnnotation(targetId);
           await self.loadSegments(self.player.currentBvid);
-
-          // 重置按钮状态
-          btnDelete.innerHTML = '<span style="font-size:1.2em;">🗑️</span> <span style="font-size:0.9em;">删除最近</span>';
-          btnDelete.disabled = false;
-          btnDelete.style.opacity = '1';
-
-          // 关闭弹窗
+          self.showToast('删除成功', 'success');
           self.togglePopover(false);
-        } catch (err) {
-          self.showToast("✗ " + err.message, "error");
-          btnDelete.innerHTML = '<span style="font-size:1.2em;">🗑️</span> <span style="font-size:0.9em;">删除最近</span>';
-          btnDelete.disabled = false;
-          btnDelete.style.opacity = '1';
+        } catch (error) {
+          self.showToast('删除失败: ' + error.message, 'error');
+        } finally {
+          btnDelete.textContent = '删除最近';
+          self.updateButtonStates();
         }
       });
 
-      // 禁用删除按钮（如果没有标注）
       if (!self.currentSegmentIds.length) {
         btnDelete.disabled = true;
         btnDelete.style.opacity = '0.5';
@@ -590,7 +1603,6 @@ import { videoState } from './store.js';
       row3.appendChild(btnSubmit);
       row3.appendChild(btnDelete);
 
-      // Preview Text
       const previewRow = createRow();
       previewRow.style.justifyContent = 'center';
       const preview = document.createElement('span');
@@ -598,28 +1610,23 @@ import { videoState } from './store.js';
       preview.style.cssText = 'color:#FB7299;font-size:0.85em;min-height:1.2em;';
       previewRow.appendChild(preview);
 
-      // Assemble Popover
       popover.appendChild(row1);
       popover.appendChild(row2);
       popover.appendChild(row3);
       popover.appendChild(previewRow);
-
-      // Assemble Wrapper
       wrapper.appendChild(toggleBtn);
       wrapper.appendChild(popover);
 
-      // Inject
       if (target.firstChild) {
         target.insertBefore(wrapper, target.firstChild);
       } else {
         target.appendChild(wrapper);
       }
 
-      // ResizeObserver
       const playerContainer = document.querySelector('.bpx-player-container') || document.querySelector('#bilibili-player');
       if (playerContainer) {
-        const ro = new ResizeObserver(entries => {
-          for (let entry of entries) {
+        const resizeObserver = new ResizeObserver((entries) => {
+          for (const entry of entries) {
             if (entry.contentRect.width < 600) {
               wrapper.classList.add('is-compact');
             } else {
@@ -627,70 +1634,30 @@ import { videoState } from './store.js';
             }
           }
         });
-        ro.observe(playerContainer);
+        resizeObserver.observe(playerContainer);
       }
 
-      // Preview update loop
       if (this.previewInterval) clearInterval(this.previewInterval);
       this.previewInterval = setInterval(() => {
-        const p = document.getElementById('adskipper-preview');
-        if (!p) return;
-        if (self.pendingStart && self.pendingEnd) {
-          const dur = (self.pendingEnd - self.pendingStart).toFixed(1);
-          p.textContent = '⏱️ 已选 ' + dur + '秒';
-        } else if (self.pendingStart) {
-          p.textContent = '从 ' + self.pendingStart.toFixed(1) + 's...';
-        } else {
-          p.textContent = '';
+        const previewElement = document.getElementById('adskipper-preview');
+        if (!previewElement) return;
+
+        if (self.pendingStart !== null && self.pendingEnd !== null) {
+          const duration = (self.pendingEnd - self.pendingStart).toFixed(1);
+          previewElement.textContent = `已选 ${duration}s`;
+          return;
         }
+
+        if (self.pendingStart !== null) {
+          previewElement.textContent = `从 ${self.pendingStart.toFixed(1)}s 开始...`;
+          return;
+        }
+
+        previewElement.textContent = '';
       }, 200);
     }
 
-    // 显示确认对话框
-    showConfirmDialog(title, message) {
-      return new Promise((resolve) => {
-        // 移除已存在的对话框
-        const oldDialog = document.getElementById('adskipper-confirm-dialog');
-        if (oldDialog) oldDialog.remove();
-
-        // 创建对话框
-        const dialog = document.createElement('div');
-        dialog.id = 'adskipper-confirm-dialog';
-        dialog.innerHTML = `
-          <h3>${title}</h3>
-          <p>${message}</p>
-          <div class="btn-group">
-            <button id="adskipper-confirm-cancel">取消</button>
-            <button id="adskipper-confirm-ok">确认</button>
-          </div>
-        `;
-        document.body.appendChild(dialog);
-
-        // 绑定事件
-        document.getElementById('adskipper-confirm-ok').onclick = () => {
-          dialog.remove();
-          resolve(true);
-        };
-        document.getElementById('adskipper-confirm-cancel').onclick = () => {
-          dialog.remove();
-          resolve(false);
-        };
-
-        // 点击外部关闭
-        const clickOutsideHandler = (e) => {
-          if (!dialog.contains(e.target)) {
-            dialog.remove();
-            resolve(false);
-            document.removeEventListener('click', clickOutsideHandler);
-          }
-        };
-        setTimeout(() => {
-          document.addEventListener('click', clickOutsideHandler);
-        }, 0);
-      });
-    }
-
-    // 调用删除API
+    // 调用删除 API
     async deleteAnnotation(segmentId) {
       const storage = await new Promise(r => chrome.storage.local.get(['adskipper_token'], r));
       const token = storage.adskipper_token;
@@ -706,10 +1673,10 @@ import { videoState } from './store.js';
 
       console.log("[AdSkipper] 准备删除标注 ID:", segmentId);
 
-      const res = await fetch(`${API_BASE}/segments/${segmentId}`, {
+      const res = await this.safeFetch(`${API_BASE}/segments/${segmentId}`, {
         method: "DELETE",
         headers: headers
-      });
+      }, 'delete annotation');
 
       if (!res.ok) {
         let errorMsg = "删除失败";
@@ -784,38 +1751,35 @@ import { videoState } from './store.js';
         ad_type: type
       };
 
-      console.log("[AdSkipper] 准备提交:", body);
-
-      // Get token
+      console.log('[AdSkipper] 提交标注:', body);
       const storage = await new Promise(r => chrome.storage.local.get(['adskipper_token'], r));
       const token = storage.adskipper_token;
-
-      console.log("[AdSkipper] Token状态:", token ? "存在" : "不存在");
+      console.log('[AdSkipper] 令牌状态:', token ? '存在' : '缺失');
 
       const headers = { "Content-Type": "application/json" };
       if (token) {
         headers['Authorization'] = 'Bearer ' + token;
-        console.log("[AdSkipper] Authorization Header:", 'Bearer ' + token.substring(0, 20) + '...');
+        console.log('[AdSkipper] 认证头:', 'Bearer ' + token.substring(0, 20) + '...');
       } else {
-        console.warn("[AdSkipper] 警告: Token不存在，请求可能会失败");
+        console.warn('[AdSkipper] 警告：请求未携带令牌');
       }
 
-      console.log("[AdSkipper] 请求头:", headers);
+      console.log('[AdSkipper] 请求头:', headers);
 
-      const res = await fetch(API_BASE + "/segments", {
+      const res = await this.safeFetch(API_BASE + "/segments", {
         method: "POST",
         headers: headers,
         body: JSON.stringify(body)
-      });
+      }, 'submit annotation');
 
       if (!res.ok) {
-        let errorMsg = "提交失败";
+        let errorMsg = '提交失败';
         try {
           const data = await res.json();
           errorMsg = data.error || errorMsg;
-          console.error("[AdSkipper] 服务器错误:", data);
+          console.error('[AdSkipper] 服务器错误:', data);
         } catch (e) {
-          console.error("[AdSkipper] 响应解析失败:", res.status, res.statusText);
+          console.error('[AdSkipper] 解析响应失败:', res.status, res.statusText);
         }
         throw new Error(errorMsg);
       }
@@ -830,14 +1794,7 @@ import { videoState } from './store.js';
 
       const t = document.createElement("div");
       t.id = 'adskipper-toast';
-
-      // Icon based on type
-      let icon = '';
-      if (type === 'success') icon = '✓ ';
-      else if (type === 'error') icon = '✗ ';
-      else if (type === 'info') icon = 'ℹ ';
-
-      t.innerHTML = `<span>${icon}${msg}</span>`;
+      t.innerHTML = `<span>${msg}</span>`;
 
       const color = type === 'success' ? '#67c23a' : (type === 'error' ? '#ff6b6b' : '#FB7299');
       t.style.cssText = `
@@ -898,7 +1855,7 @@ import { videoState } from './store.js';
         box-shadow: 0 4px 16px rgba(0,0,0,0.3);
         animation: slideDown 0.4s ease-out;
       `;
-      toast.innerHTML = `✓ 已跳过 ${duration} 秒广告`;
+      toast.innerHTML = `✓ 已自动跳过 ${duration}s`;
 
       // Progress bar
       const progress = document.createElement('div');
@@ -960,15 +1917,15 @@ import { videoState } from './store.js';
 
       const self = this;
 
-      // 3. 精准挂载容器选择 - 优先使用视频画面容器，避免控制栏
-      // 优先级：.bpx-player-video-wrap > .bpx-player-video-area > fallback
+      // 3. 精准挂载容器选择，优先挂到视频画面容器，避免控制栏
+      // 浼樺厛绾э細.bpx-player-video-wrap > .bpx-player-video-area > fallback
       let playerContainer = document.querySelector('.bpx-player-video-wrap') ||
         document.querySelector('.bpx-player-video-area') ||
         document.querySelector('.bpx-player-container') ||
         document.querySelector('#bilibili-player');
 
       if (!playerContainer) {
-        console.log("[AdSkipper] 未找到播放窗口容器");
+        console.log('[AdSkipper] 未找到视频容器');
         return;
       }
 
@@ -980,8 +1937,8 @@ import { videoState } from './store.js';
       const btn = document.createElement('div');
       btn.id = 'adskipper-skip-btn';
       btn.textContent = '跳过广告';
-      // 5. 响应式 CSS 定位：使用像素值 + !important 确保严格定位在视频画面右下角
-      // 默认 bottom: 60px，在全屏模式下通过 CSS 覆盖为 100px
+      // 5. 响应式 CSS 定位：使用像素值 + !important 确保位于视频右下角
+      // 默认 bottom: 60px，在全屏模式下动态调整
       btn.style.cssText = `
         position: absolute !important;
         right: 20px !important;
@@ -1036,7 +1993,7 @@ import { videoState } from './store.js';
         }
       });
 
-      // 监听播放器容器的 class 变化（全屏状态通过 class 改变）
+      // 监听播放器容器的 class 变化（全屏状态通常通过 class 变化体现）
       const playerContainerForObserver = document.querySelector('.bpx-player-container') ||
         document.querySelector('#bilibili-player') ||
         playerContainer;
@@ -1052,7 +2009,7 @@ import { videoState } from './store.js';
       btn.onclick = () => {
         self.player.skipTo(ad.end_time);
         self.lastSkipTime = Date.now();
-        self.showToast("已跳过 " + (ad.end_time - ad.start_time).toFixed(1) + " 秒广告", "success");
+        self.showToast('已跳过 ' + (ad.end_time - ad.start_time).toFixed(1) + ' 秒', 'success');
         self.hideSkipButton();
       };
 
@@ -1070,56 +2027,46 @@ import { videoState } from './store.js';
     }
 
     addSegmentMarkers() {
-      console.log('[AdSkipper] 开始添加进度条标记...');
-
-      // 移除旧标记
       const oldMarkers = document.querySelectorAll('.adskipper-progress-marker');
-      oldMarkers.forEach(m => m.remove());
+      oldMarkers.forEach(marker => marker.remove());
 
       if (!this.segments.length) {
-        console.log('[AdSkipper] 没有标注段，跳过标记添加');
         return;
       }
 
-      // 找到进度条容器（尝试多种选择器）
-      let progressContainer = document.querySelector('.bpx-player-progress') ||
+      const progressContainer = document.querySelector('.bpx-player-progress') ||
         document.querySelector('.bilibili-player-progress') ||
         document.querySelector('.bpx-player-progress-wrap');
-
       if (!progressContainer) {
-        console.log('[AdSkipper] 未找到进度条容器');
         return;
       }
-      console.log('[AdSkipper] 找到进度条容器:', progressContainer.className);
 
-      // 获取视频总时长
-      const player = this.player.getState();
-      const duration = player.duration;
+      const duration = this.player.getState().duration;
       if (!duration || duration <= 0) {
-        console.log('[AdSkipper] 视频时长无效:', duration);
         return;
       }
 
-      // 获取进度条滑轨（尝试多种选择器）
-      let progressSlide = progressContainer.querySelector('.bpx-player-progress-slide') ||
+      const progressSlide = progressContainer.querySelector('.bpx-player-progress-slide') ||
         progressContainer.querySelector('.bili-progress-slip') ||
         progressContainer.querySelector('.bpx-player-progress-buffer');
-
       if (!progressSlide) {
-        console.log('[AdSkipper] 未找到进度条滑轨');
         return;
       }
-      console.log('[AdSkipper] 找到进度条滑轨:', progressSlide.className);
 
-      // 为每个标注段添加标记
-      this.segments.forEach((seg, index) => {
-        const startPercent = (seg.start_time / duration) * 100;
-        const endPercent = (seg.end_time / duration) * 100;
-        const width = Math.max(endPercent - startPercent, 1); // 最小1%宽度
+      progressSlide.style.position = progressSlide.style.position || 'relative';
+
+      this.segments.forEach((segment, index) => {
+        const startPercent = (segment.start_time / duration) * 100;
+        const endPercent = (segment.end_time / duration) * 100;
+        const width = Math.max(endPercent - startPercent, 0.8);
 
         const marker = document.createElement('div');
         marker.className = 'adskipper-progress-marker';
-        marker.setAttribute('data-segment-id', seg.id);
+        marker.setAttribute('data-segment-id', this.getSegmentKey(segment, index));
+
+        const markerColor = segment.action === 'popup'
+          ? 'rgba(71, 167, 255, 0.88)'
+          : 'rgba(251, 114, 153, 0.82)';
 
         marker.style.cssText = `
           position: absolute;
@@ -1127,197 +2074,28 @@ import { videoState } from './store.js';
           top: 0;
           bottom: 0;
           width: ${width}%;
-          background: rgba(251, 114, 153, 0.8) !important;
+          background: ${markerColor} !important;
           pointer-events: none;
           z-index: 999 !important;
           height: 100% !important;
         `;
-        marker.title = `${seg.start_time.toFixed(1)}s - ${seg.end_time.toFixed(1)}s (${typeLabels[seg.ad_type] || seg.ad_type})`;
+
+        const titleContent = segment.action === 'popup' && segment.content
+          ? ` | ${segment.content.slice(0, 36)}`
+          : '';
+        const actionText = segment.action === 'popup' ? '重点' : '跳过';
+        marker.title = `${segment.start_time.toFixed(1)}s - ${segment.end_time.toFixed(1)}s | ${actionText}${titleContent}`;
 
         progressSlide.appendChild(marker);
-        console.log(`[AdSkipper] 添加标记 ${index + 1}:`, seg.start_time, seg.end_time, `${startPercent.toFixed(1)}%-${endPercent.toFixed(1)}%`);
       });
-
-      console.log(`[AdSkipper] ✓ 已添加 ${this.segments.length} 个进度条标记`);
     }
 
     handleShowMarkers() {
-      console.log('[AdSkipper] 显示标注列表');
-
-      if (!this.segments || this.segments.length === 0) {
-        this.showToast('ℹ️ 当前视频暂无标注', 'info');
-        return;
-      }
-
-      // 如果已经显示，则隐藏
-      const existingPanel = document.getElementById('adskipper-segment-panel');
-      if (existingPanel) {
-        existingPanel.remove();
-        return;
-      }
-
-      // 创建标注列表面板
-      const panel = document.createElement('div');
-      panel.id = 'adskipper-segment-panel';
-      panel.style.cssText = `
-        position: fixed;
-        bottom: 20px;
-        right: 20px;
-        width: 400px;
-        max-height: 500px;
-        background: #1e1e2e;
-        border-radius: 12px;
-        box-shadow: 0 8px 32px rgba(0,0,0,0.5);
-        z-index: 999999;
-        display: flex;
-        flex-direction: column;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      `;
-
-      // 标题栏
-      const header = document.createElement('div');
-      header.style.cssText = `
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 16px 20px;
-        border-bottom: 1px solid rgba(255,255,255,0.1);
-        background: rgba(251, 114, 153, 0.1);
-      `;
-      header.innerHTML = `
-        <span style="color: #FB7299; font-weight: bold; font-size: 16px;">
-          📊 标注历史 (${this.segments.length})
-        </span>
-        <button id="adskipper-close-panel" style="
-          background: none;
-          border: none;
-          color: #aaa;
-          font-size: 20px;
-          cursor: pointer;
-          padding: 4px 8px;
-        ">×</button>
-      `;
-
-      // 标注列表
-      const list = document.createElement('div');
-      list.id = 'adskipper-segment-list';
-      list.style.cssText = `
-        overflow-y: auto;
-        flex: 1;
-        padding: 12px;
-      `;
-
-      // 渲染标注项
-      this.segments.forEach((seg, index) => {
-        const item = document.createElement('div');
-        item.style.cssText = `
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          padding: 12px;
-          margin-bottom: 8px;
-          background: rgba(255,255,255,0.05);
-          border-radius: 8px;
-          border-left: 3px solid #FB7299;
-        `;
-
-        const typeLabels = {
-          'hard_ad': '硬广',
-          'soft_ad': '软广',
-          'product_placement': '植入',
-          'intro_ad': '片头',
-          'mid_ad': '中段'
-        };
-
-        item.innerHTML = `
-          <div>
-            <div style="color: #fff; font-size: 14px; margin-bottom: 4px;">
-              <span style="color: #FB7299;">${seg.start_time.toFixed(1)}s</span> -
-              <span style="color: #FB7299;">${seg.end_time.toFixed(1)}s</span>
-            </div>
-            <div style="color: #aaa; font-size: 12px;">
-              ${typeLabels[seg.ad_type] || seg.ad_type}
-            </div>
-          </div>
-          <div>
-            <button data-index="${index}" class="adskipper-jump-btn" style="
-              padding: 6px 12px;
-              background: #FB7299;
-              border: none;
-              border-radius: 4px;
-              color: #fff;
-              font-size: 12px;
-              cursor: pointer;
-              margin-right: 6px;
-            ">跳转</button>
-            <button data-id="${seg.id}" class="adskipper-delete-btn" style="
-              padding: 6px 12px;
-              background: #555;
-              border: none;
-              border-radius: 4px;
-              color: #fff;
-              font-size: 12px;
-              cursor: pointer;
-            ">删除</button>
-          </div>
-        `;
-
-        list.appendChild(item);
-      });
-
-      panel.appendChild(header);
-      panel.appendChild(list);
-      document.body.appendChild(panel);
-
-      // 绑定事件
-      document.getElementById('adskipper-close-panel').onclick = () => panel.remove();
-
-      // 跳转按钮
-      document.querySelectorAll('.adskipper-jump-btn').forEach(btn => {
-        btn.onclick = () => {
-          const index = parseInt(btn.getAttribute('data-index'));
-          const seg = this.segments[index];
-          this.player.skipTo(seg.start_time);
-          this.showToast(`✓ 已跳转到 ${seg.start_time.toFixed(1)}s`, 'success');
-        };
-      });
-
-      // 删除按钮
-      document.querySelectorAll('.adskipper-delete-btn').forEach(btn => {
-        btn.onclick = async () => {
-          const id = parseInt(btn.getAttribute('data-id'));
-          if (!confirm('确定要删除这条标注吗？')) return;
-
-          try {
-            const token = await this.getToken();
-            await fetch(API_BASE + '/segments/' + id, {
-              method: 'DELETE',
-              headers: { 'Authorization': 'Bearer ' + token }
-            });
-
-            // 从列表中移除
-            btn.parentElement.parentElement.remove();
-            this.segments = this.segments.filter(s => s.id !== id);
-
-            // 更新标题计数
-            const titleSpan = header.querySelector('span');
-            titleSpan.textContent = `📊 标注历史 (${this.segments.length})`;
-
-            this.showToast('✓ 标注已删除', 'success');
-
-            // 如果列表为空，关闭面板
-            if (this.segments.length === 0) {
-              panel.remove();
-            }
-          } catch (err) {
-            this.showToast('✗ 删除失败: ' + err.message, 'error');
-          }
-        };
-      });
-
-      this.showToast(`✓ 已显示 ${this.segments.length} 条标注`, 'success');
+      this.showSidebar({ refresh: true });
     }
   }
 
   new AdSkipperCore().init();
 })();
+
+

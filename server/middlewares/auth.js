@@ -2,13 +2,14 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const path = require('path');
 const Database = require('better-sqlite3');
+const config = require('../config.js');
 
 // 数据库连接（和server.js一致）
 const db = new Database(path.join(__dirname, '../database', 'app.db'));
 db.pragma('journal_mode = WAL');
 
 // JWT密钥（和server.js一致）
-const JWT_SECRET = 'secret-key-v1';
+const JWT_SECRET = config.JWT_SECRET;
 
 // 1. 登录验证中间件（原server.js里的authenticateToken）
 function authenticateToken(req, res, next) {

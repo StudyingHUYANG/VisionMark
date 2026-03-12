@@ -2,6 +2,16 @@ const API_BASE = window.LOCAL_CONFIG
   ? window.LOCAL_CONFIG.API_BASE + '/' + window.LOCAL_CONFIG.API_VERSION
   : 'http://localhost:8080/api/v1';
 
+const NETWORK_ERROR_CODE = 'NETWORK_UNAVAILABLE';
+const NETWORK_COOLDOWN_MS = 30000;
+const NETWORK_TIMEOUT_MS = 6000;
+
+const networkState = {
+  offlineUntil: 0,
+  hasLoggedOffline: false,
+  wasOffline: false
+};
+
 // State
 let allSegments = [];
 let filteredSegments = [];
@@ -10,12 +20,74 @@ const pageSize = 20;
 
 // Ad type labels
 const typeLabels = {
-  'hard_ad': '硬广',
-  'soft_ad': '软广',
-  'product_placement': '植入',
-  'intro_ad': '片头',
-  'mid_ad': '中段'
+  hard_ad: '硬广',
+  soft_ad: '软广',
+  product_placement: '植入',
+  intro_ad: '片头',
+  mid_ad: '中段'
 };
+
+function createNetworkUnavailableError() {
+  const error = new Error('网络不可用，请稍后重试');
+  error.code = NETWORK_ERROR_CODE;
+  return error;
+}
+
+function isNetworkFailure(error) {
+  if (!error) return false;
+  if (error.name === 'AbortError') return true;
+  const message = String(error.message || '').toLowerCase();
+  if (message.includes('failed to fetch') || message.includes('networkerror') || message.includes('load failed')) {
+    return true;
+  }
+  return error instanceof TypeError;
+}
+
+function markNetworkOffline(error) {
+  networkState.offlineUntil = Date.now() + NETWORK_COOLDOWN_MS;
+  networkState.wasOffline = true;
+  if (!networkState.hasLoggedOffline) {
+    console.warn('[History] 后端不可达，暂停请求 30 秒。', error);
+    networkState.hasLoggedOffline = true;
+  }
+}
+
+function markNetworkOnline() {
+  if (networkState.wasOffline) {
+    console.info('[History] 后端连接已恢复');
+  }
+  networkState.offlineUntil = 0;
+  networkState.hasLoggedOffline = false;
+  networkState.wasOffline = false;
+}
+
+async function safeFetch(url, options = {}) {
+  if (Date.now() < networkState.offlineUntil) {
+    throw createNetworkUnavailableError();
+  }
+
+  const controller = options.signal ? null : new AbortController();
+  const timeoutId = setTimeout(() => {
+    if (controller) controller.abort();
+  }, NETWORK_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: options.signal || (controller ? controller.signal : undefined)
+    });
+    clearTimeout(timeoutId);
+    markNetworkOnline();
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (isNetworkFailure(error)) {
+      markNetworkOffline(error);
+      throw createNetworkUnavailableError();
+    }
+    throw error;
+  }
+}
 
 // Get token
 async function getToken() {
@@ -39,10 +111,9 @@ async function loadSegments() {
   }
 
   try {
-    // 使用正确的API端点，并添加分页参数
-    const response = await fetch(`${API_BASE}/stats/user/contributions`, {
+    const response = await safeFetch(`${API_BASE}/stats/user/contributions`, {
       headers: {
-        'Authorization': `Bearer ${token}`
+        Authorization: `Bearer ${token}`
       }
     });
 
@@ -59,18 +130,19 @@ async function loadSegments() {
     allSegments = data.segments || [];
     filterAndRender();
     updateStats();
-
   } catch (error) {
-    console.error('加载失败:', error);
+    if (error.code !== NETWORK_ERROR_CODE) {
+      console.error('加载失败:', error);
+    }
     document.getElementById('segments-body').innerHTML =
-      '<tr><td colspan="5" class="empty">加载失败: ' + error.message + '</td></tr>';
+      `<tr><td colspan="5" class="empty">加载失败: ${error.message}</td></tr>`;
   }
 }
 
 // Filter and render
 function filterAndRender() {
   const search = document.getElementById('search-input').value.toLowerCase();
-  filteredSegments = allSegments.filter(seg =>
+  filteredSegments = allSegments.filter((seg) =>
     seg.bvid && seg.bvid.toLowerCase().includes(search)
   );
 
@@ -90,7 +162,7 @@ function renderPage() {
     return;
   }
 
-  const html = pageSegments.map(seg => `
+  const html = pageSegments.map((seg) => `
     <tr>
       <td><a href="https://www.bilibili.com/video/${seg.bvid}" target="_blank" class="bilibili-link">${seg.bvid}</a></td>
       <td>${seg.start_time.toFixed(1)}s - ${seg.end_time.toFixed(1)}s</td>
@@ -110,16 +182,14 @@ function renderPage() {
 // Update pagination
 function updatePagination() {
   const totalPages = Math.ceil(filteredSegments.length / pageSize);
-  document.getElementById('page-info').textContent =
-    `第 ${currentPage} / ${totalPages || 1} 页`;
+  document.getElementById('page-info').textContent = `第 ${currentPage} / ${totalPages || 1} 页`;
   document.getElementById('prev-btn').disabled = currentPage <= 1;
   document.getElementById('next-btn').disabled = currentPage >= totalPages;
 }
 
 // Update stats
 function updateStats() {
-  document.getElementById('stats').textContent =
-    `共 ${allSegments.length} 条标注`;
+  document.getElementById('stats').textContent = `共 ${allSegments.length} 条标注`;
 }
 
 // Delete segment
@@ -128,20 +198,19 @@ async function deleteSegment(id, bvid) {
 
   const token = await getToken();
   try {
-    const response = await fetch(`${API_BASE}/segments/${id}`, {
+    const response = await safeFetch(`${API_BASE}/segments/${id}`, {
       method: 'DELETE',
       headers: {
-        'Authorization': `Bearer ${token}`
+        Authorization: `Bearer ${token}`
       }
     });
 
     if (!response.ok) throw new Error('删除失败');
 
     // Remove from local list
-    allSegments = allSegments.filter(seg => seg.id !== id);
+    allSegments = allSegments.filter((seg) => seg.id !== id);
     filterAndRender();
     updateStats();
-
   } catch (error) {
     alert('删除失败: ' + error.message);
   }
@@ -152,28 +221,6 @@ function jumpToVideo(bvid, startTime) {
   chrome.tabs.create({
     url: `https://www.bilibili.com/video/${bvid}?t=${Math.floor(startTime)}`
   });
-}
-  if (!confirm(`确定要删除视频 ${bvid} 的这条标注吗？`)) return;
-
-  const token = await getToken();
-  try {
-    const response = await fetch(`${API_BASE}/segments/${id}`, {
-      method: 'DELETE',
-      headers: {
-        'Authorization': `Bearer ${token}`
-      }
-    });
-
-    if (!response.ok) throw new Error('删除失败');
-
-    // Remove from local list
-    allSegments = allSegments.filter(seg => seg.id !== id);
-    filterAndRender();
-    updateStats();
-
-  } catch (error) {
-    alert('删除失败: ' + error.message);
-  }
 }
 
 // Event listeners
