@@ -87,7 +87,8 @@ class VideoAnalyzer {
 
     try {
       // 使用yt-dlp下载（使用shell:true来确保找到正确的命令）
-      const command = `python -m yt_dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${outputTemplate}" "${url}"`;
+      // 使用 @ffmpeg-installer/ffmpeg 提供的路径，避免依赖系统 ffmpeg
+      const command = `python -m yt_dlp --ffmpeg-location "${ffmpegPath}" -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${outputTemplate}" "${url}"`;
 
       await execPromise(command, { shell: true });
 
@@ -150,18 +151,11 @@ class VideoAnalyzer {
       // 获取视频实际时长
       const duration = await this.getVideoDuration(videoPath);
 
-      // 根据视频时长动态调整提取间隔
-      let interval;
-      if (duration <= 300) {
-        interval = 10; // 5分钟以下视频，每10秒一帧
-      } else if (duration <= 600) {
-        interval = 15; // 10分钟以下视频，每15秒一帧
-      } else {
-        interval = 20; // 长视频，每20秒一帧
-      }
+      // 固定每5秒提取一帧
+      const interval = 5;
       const frameCount = Math.ceil(duration / interval);
 
-      console.log(`[VideoAnalyzer] 视频时长 ${duration.toFixed(2)}秒，将提取 ${frameCount} 帧，每 ${interval} 秒一帧`);
+      console.log(`[VideoAnalyzer] 视频时长 ${duration.toFixed(2)}秒，将提取 ${frameCount} 帧，每 5 秒一帧`);
 
       // 使用ffmpeg提取关键帧
       const command = `"${ffmpegPath}" -i "${videoPath}" -vf "fps=1/${interval},scale=640:-1" "${framesDir}/frame_%04d.jpg" -frames:v ${frameCount} -y`;
@@ -262,7 +256,9 @@ class VideoAnalyzer {
           },
           parameters: {
             text_mode: 'sentence',  // 使用sentence模式以获取时间戳
-            language_hints: ['zh', 'en']
+            language_hints: ['zh', 'en'],
+            disfluency_removal: false,  // 保留语气词和停顿
+            timestamp_alignment: true  // 启用时间戳对齐
           }
         },
         {
@@ -327,46 +323,48 @@ class VideoAnalyzer {
                   // 根据实际的数据结构提取转录文本
                   let transcriptText = '';
 
+                  // 辅助函数：按逗号分割句子并分配时间戳
+                  function splitByCommas(sentences) {
+                    const result = [];
+                    sentences.forEach(sentence => {
+                      const beginTime = (sentence.begin_time || 0) / 1000; // 毫秒转秒
+                      const text = sentence.text || '';
+
+                      // 按逗号分割
+                      const parts = text.split('，');
+                      const endTime = (sentence.end_time || sentence.begin_time || 0) / 1000;
+                      const duration = endTime - beginTime;
+
+                      parts.forEach((part, index) => {
+                        if (part.trim()) {
+                          // 按比例分配时间戳
+                          const partTime = beginTime + (duration * index / parts.length);
+                          const minutes = Math.floor(partTime / 60);
+                          const seconds = Math.floor(partTime % 60);
+                          const timeStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+                          result.push(`[${timeStr}] ${part.trim()}`);
+                        }
+                      });
+                    });
+                    return result.join('\n');
+                  }
+
                   // 格式1: {transcripts: [{sentences: [{begin_time, text}, ...]}]}
                   if (transcriptionData.transcripts && transcriptionData.transcripts.length > 0) {
-                    console.log('[VideoAnalyzer] 使用 transcripts 数据结构');
+                    console.log('[VideoAnalyzer] 使用 transcripts 数据结构（逗号分割模式）');
                     const allSentences = transcriptionData.transcripts.flatMap(t => t.sentences || []);
-                    transcriptText = allSentences
-                      .map(sentence => {
-                        const time = (sentence.begin_time || 0) / 1000; // 毫秒转秒
-                        const minutes = Math.floor(time / 60);
-                        const seconds = Math.floor(time % 60);
-                        const timeStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
-                        return `[${timeStr}] ${sentence.text}`;
-                      })
-                      .join('\n');
+                    transcriptText = splitByCommas(allSentences);
                   }
                   // 格式2: {transcription_lines: [{text: "...", begin_time: 1000}, ...]}
                   else if (transcriptionData.transcription_lines) {
-                    console.log('[VideoAnalyzer] 使用 transcription_lines 数据结构');
-                    transcriptText = transcriptionData.transcription_lines
-                      .map(line => {
-                        const time = (line.begin_time || line.timestamp || 0) / 1000;
-                        const minutes = Math.floor(time / 60);
-                        const seconds = Math.floor(time % 60);
-                        const timeStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
-                        return `[${timeStr}] ${line.text}`;
-                      })
-                      .join('\n');
+                    console.log('[VideoAnalyzer] 使用 transcription_lines 数据结构（逗号分割模式）');
+                    transcriptText = splitByCommas(transcriptionData.transcription_lines);
                   } else if (Array.isArray(transcriptionData)) {
                     // 格式3: 直接是数组 [{text: "...", begin_time: 1000}, ...]
-                    console.log('[VideoAnalyzer] 使用数组数据结构');
-                    transcriptText = transcriptionData
-                      .map(line => {
-                        const time = (line.begin_time || line.timestamp || 0) / 1000;
-                        const minutes = Math.floor(time / 60);
-                        const seconds = Math.floor(time % 60);
-                        const timeStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
-                        return `[${timeStr}] ${line.text || line.transcription_text || line.content}`;
-                      })
-                      .join('\n');
+                    console.log('[VideoAnalyzer] 使用数组数据结构（逗号分割模式）');
+                    transcriptText = splitByCommas(transcriptionData);
                   } else if (typeof transcriptionData === 'string') {
-                    // 格式4: 直接是文本
+                    // 格式4: 直接是文本（无时间戳，不处理）
                     console.log('[VideoAnalyzer] 使用字符串数据结构');
                     transcriptText = transcriptionData;
                   }
@@ -480,7 +478,7 @@ ${transcript}
   }
 
   /**
-   * 识别热词和网络梗
+   * 识别热词和网络梗（仅提取转录文本中原有的词）
    * @param {string} transcript - 音频转录文本
    */
   async extractHotWords(transcript) {
@@ -494,24 +492,31 @@ ${transcript}
         messages: [
           {
             role: 'user',
-            content: `请从以下文本中提取网络热词、流行梗和饭圈用语，并进行详细解释：
+            content: `请从以下转录文本中提取网络热词、流行梗和饭圈用语。
 
-文本内容（可能包含[MM:SS]时间标记）：
+**重要要求：只能提取转录文本中原有的词汇，不能自己编造或解释新的词！**
+
+转录文本内容（格式：[MM:SS] 文本内容）：
 ${transcript}
 
 请以JSON格式返回：
 {
   "hot_words": [
     {
-      "word": "热词/梗名称",
-      "meaning": "详细解释其来源、含义和使用场景",
+      "word": "从转录文本中直接提取的热词（必须是原文中出现的词）",
+      "meaning": "简要解释这个词的含义",
       "category": "分类（如：网络梗/流行语/饭圈用语等）",
-      "timestamp": "出现时间点(格式必须为MM:SS)。如果文本中有[MM:SS]标记，请直接使用该标记；否则请根据上下文推算。"
+      "timestamp": "出现时间点(格式必须为MM:SS)。必须直接使用转录文本中的[MM:SS]标记。"
     }
   ]
 }
 
-提取3-5个最热门的梗。请务必标注每个热词在文本中大致出现的时间点（根据文本顺序或[MM:SS]标记推测）。`
+**注意**：
+1. 只能提取转录文本中实际出现的词
+2. 不要创造或添加文本中没有的词
+3. 必须使用转录文本中的[MM:SS]时间戳
+4. 如果某个词在转录文本中没有明确的时间戳，就不要提取它
+5. 提取3-5个最热门的词`
           }
         ],
         max_tokens: 2000
@@ -593,20 +598,21 @@ ${transcript || '无语音内容'}
   ],
   "hot_words": [
     {
-      "word": "梗/热词",
-      "meaning": "梗的含义和来源",
-      "timestamp": "MM:SS (必须直接使用语音转录文本中的[MM:SS]标记，不允许推测)"
+      "word": "从转录文本中直接提取的热词（必须是原文中出现的词）",
+      "meaning": "简要解释",
+      "timestamp": "MM:SS (必须直接使用语音转录文本中的[MM:SS]标记)"
     }
   ]
 }
 
 **重要要求**：
-1. **知识点和热词的timestamp必须直接使用ASR语音转录文本中的[MM:SS]标记**，不允许推测或根据关键帧推算
-2. 如果某个知识点/热词在转录文本中没有对应的时间戳标记，就不要提取它
-3. 只提取那些在转录文本中能明确找到时间戳的知识点和热词
-4. 分段的start_time和end_time由关键帧画面分析决定
-5. 知识点要硬核且有趣，适合B站用户口味
-6. 只有真正有价值的内容才提取，不要凑数`;
+1. **热词必须严格从转录文本中提取，不能自己创造或解释新的词**。只提取文本中原有的词汇、短语或梗
+2. **知识点和热词的timestamp必须直接使用ASR语音转录文本中的[MM:SS]标记**，不允许推测或根据关键帧推算
+3. 如果某个知识点/热词在转录文本中没有对应的时间戳标记，就不要提取它
+4. 只提取那些在转录文本中能明确找到时间戳的知识点和热词
+5. 分段的start_time和end_time由关键帧画面分析决定
+6. 知识点要硬核且有趣，适合B站用户口味
+7. 只有真正有价值的内容才提取，不要凑数`;
 
     // 构建多模态消息
     const content = [

@@ -1,5 +1,3 @@
-import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.js';
-
 (function () {
   'use strict';
 
@@ -11,7 +9,6 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
   // API 基础路径
   const API_BASE = window.API_BASE || 'http://localhost:8080/api/v1';
   const VIDEO_ANALYSIS_BASE = window.LOCAL_CONFIG?.API_BASE || 'http://localhost:8080';
-  const MOCK_ANALYSIS = getMockAnalysisConfig(window.LOCAL_CONFIG).enabled;
   const DANMU_TRIGGER_WINDOW_SEC = 0.3;
   const DANMU_REWIND_RESET_SEC = 1.0;
   const DANMU_MAX_CONCURRENT = 3;
@@ -380,13 +377,25 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
     }
 
     async safeFetch(url, options = {}, context = 'request') {
-      if (Date.now() < this.networkState.offlineUntil) {
+      const now = Date.now();
+
+      // 检查网络冷却状态
+      if (now < this.networkState.offlineUntil) {
+        const remainingSec = Math.ceil((this.networkState.offlineUntil - now) / 1000);
+        console.warn(`[AdSkipper] safeFetch: 网络冷却中，还需等待 ${remainingSec} 秒`);
         throw this.createNetworkUnavailableError();
       }
 
+      console.log(`[AdSkipper] safeFetch: 开始请求 ${context}`);
+      console.log(`[AdSkipper] safeFetch: URL = ${url}`);
+      console.log(`[AdSkipper] safeFetch: 超时设置 = ${this.networkTimeoutMs}ms`);
+
       const controller = options.signal ? null : new AbortController();
       const timeoutId = setTimeout(() => {
-        if (controller) controller.abort();
+        if (controller) {
+          console.warn(`[AdSkipper] safeFetch: 请求超时 (${this.networkTimeoutMs}ms)`);
+          controller.abort();
+        }
       }, this.networkTimeoutMs);
 
       try {
@@ -396,9 +405,11 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
         });
         clearTimeout(timeoutId);
         this.markNetworkOnline();
+        console.log(`[AdSkipper] safeFetch: 请求成功，状态 = ${response.status}`);
         return response;
       } catch (error) {
         clearTimeout(timeoutId);
+        console.error(`[AdSkipper] safeFetch: 请求失败`, error);
         if (this.isNetworkFailure(error)) {
           this.markNetworkOffline(context, error);
           throw this.createNetworkUnavailableError();
@@ -562,11 +573,28 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
       if (!point || typeof point !== 'object') {
         return '';
       }
+
+      // 处理知识点（knowledge_points）
       const term = typeof point.term === 'string' ? point.term.trim() : '';
       const explanation = typeof point.explanation === 'string' ? point.explanation.trim() : '';
-      const text = term && explanation ? `${term}: ${explanation}` : (term || explanation);
+      // 处理热词（hot_words）
+      const word = typeof point.word === 'string' ? point.word.trim() : '';
+      const meaning = typeof point.meaning === 'string' ? point.meaning.trim() : '';
+
+      // 知识点格式：术语: 解释
+      // 热词格式：[热词] 解释
+      let text = '';
+      if (term && explanation) {
+        text = `${term}: ${explanation}`;
+      } else if (word && meaning) {
+        text = `[${word}] ${meaning}`;
+      } else {
+        text = term || explanation || word || meaning;
+      }
+
       if (!text) return '';
-      return text.length > 80 ? `${text.slice(0, 77)}...` : text;
+      // 不再截断文本，显示完整内容
+      return text;
     }
 
     updateKnowledgeDanmuSource(knowledgePoints, bvid) {
@@ -578,10 +606,16 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
           );
           const text = this.toKnowledgeDanmuText(point);
           if (!Number.isFinite(seconds) || !text) return null;
+
+          // 判断是热词还是知识点
+          const isHotWord = typeof point === 'object' && point.word && point.meaning;
+          const type = isHotWord ? 'hot-word' : 'knowledge-point';
+
           return {
             id: `${bvid || 'unknown'}-${Math.round(seconds * 10)}-${index}`,
             timeSec: seconds,
-            text
+            text,
+            type // 添加类型标识
           };
         })
         .filter(Boolean)
@@ -651,36 +685,60 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
           }
           .visionmark-knowledge-danmu {
             position: absolute;
-            max-width: min(58vw, 640px);
-            padding: 3px 8px;
+            max-width: min(75vw, 900px);
+            min-width: 200px;
+            padding: 8px 16px;
 
-            border-radius: 6px;
+            /* 无背景 - 完全透明 */
+            background: transparent !important;
+            border: none !important;
 
-            /* 轻度毛玻璃效果 */
-            background: rgba(255, 255, 255, 0.12);
-            backdrop-filter: blur(8px);
-            -webkit-backdrop-filter: blur(8px);
+            /* 增强文字效果 - 更醒目 */
+            color: #ffffff !important;
+            font-size: 22px;
+            line-height: 1.6;
+            letter-spacing: 0.5px;
 
-            border: 1px solid rgba(255, 255, 255, 0.18);
+            /* 使用 Noto Sans SC 字体 */
+            font-family: "Noto Sans SC", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+            font-weight: 700;
 
-            /* 加深粉红字体 */
-            color: #d64473 !important;
-            font-size: 26px;
-            line-height: 1.5;
+            /* 多层文字阴影 - 增强可读性 */
+            text-shadow:
+              0 2px 4px rgba(0, 0, 0, 0.8),
+              0 4px 8px rgba(0, 0, 0, 0.6),
+              0 0 20px rgba(0, 0, 0, 0.5),
+              0 0 40px rgba(0, 0, 0, 0.3);
 
-            /* 使用 Noto Sans SC 字体（思源黑体） */
-            font-family: "Noto Sans SC", sans-serif !important;
-            font-weight: 400;
-
-            white-space: nowrap;
-            text-overflow: ellipsis;
-            overflow: hidden;
-
-            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+            /* 允许换行，显示完整内容 */
+            white-space: normal;
+            word-wrap: break-word;
+            word-break: break-word;
 
             left: 0;
             transform: translate3d(0, 0, 0);
             will-change: transform;
+            transition: opacity 0.3s ease;
+          }
+
+          /* 知识点样式 - 蓝色光晕 */
+          .visionmark-knowledge-danmu.knowledge-point {
+            color: #66ccff !important;
+            text-shadow:
+              0 2px 4px rgba(0, 0, 0, 0.9),
+              0 4px 8px rgba(0, 0, 0, 0.7),
+              0 0 20px rgba(102, 204, 255, 0.6),
+              0 0 40px rgba(102, 204, 255, 0.4);
+          }
+
+          /* 热词样式 - 粉色光晕 */
+          .visionmark-knowledge-danmu.hot-word {
+            color: #ff99cc !important;
+            text-shadow:
+              0 2px 4px rgba(0, 0, 0, 0.9),
+              0 4px 8px rgba(0, 0, 0, 0.7),
+              0 0 20px rgba(255, 150, 180, 0.6),
+              0 0 40px rgba(255, 150, 180, 0.4);
           }
         `;
         document.head.appendChild(style);
@@ -912,7 +970,7 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
       this.nextDanmuLane += 1;
 
       const node = document.createElement('div');
-      node.className = 'visionmark-knowledge-danmu';
+      node.className = `visionmark-knowledge-danmu ${item.type || 'knowledge-point'}`;
       node.style.top = `${lane}%`;
       node.textContent = item.text;
       layer.appendChild(node);
@@ -962,30 +1020,36 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
 
 
     async requestAnalysis(bvid, token) {
-      const mockResult = await resolveMockAnalysisData(bvid, window.LOCAL_CONFIG);
-      if (mockResult) {
-        return mockResult;
-      }
-
       const url = VIDEO_ANALYSIS_BASE + "/video-analysis/analyze";
-      const res = await this.safeFetch(url, {
+      console.log('[AdSkipper] 请求URL:', url);
+      console.log('[AdSkipper] 请求体:', JSON.stringify({ bvid }));
+      console.log('[AdSkipper] 注意：视频分析无超时限制，可能需要几分钟时间');
+
+      // 直接使用原生 fetch，不设置超时
+      // 视频分析需要很长时间（下载、提取、AI分析），不能有超时限制
+      const res = await fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': 'Bearer ' + token
         },
         body: JSON.stringify({ bvid })
-      }, 'analyze video');
+      });
+
+      console.log('[AdSkipper] 响应状态:', res.status, res.statusText);
 
       let payload = null;
       try {
         payload = await res.json();
+        console.log('[AdSkipper] 响应数据:', payload);
       } catch (error) {
+        console.error('[AdSkipper] 解析JSON失败:', error);
         payload = null;
       }
 
       if (!res.ok) {
         const message = payload?.message || payload?.error || `分析失败（${res.status}）`;
+        console.error('[AdSkipper] API错误:', message);
         throw new Error(message);
       }
       return payload;
@@ -1009,12 +1073,25 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
       const knowledgePoints = Array.isArray(analysisData.knowledge_points) ? analysisData.knowledge_points : [];
       const hotWords = Array.isArray(analysisData.hot_words) ? analysisData.hot_words : [];
 
+      // 去重：知识点和热词重复时，以知识点为主（优先显示知识点）
+      const knowledgePointTerms = new Set(knowledgePoints.map(kp => kp.term));
+      const filteredHotWords = hotWords.filter(hw => !knowledgePointTerms.has(hw.word));
+
+      // 合并知识点和过滤后的热词（知识点在前，热词在后）
+      const allDanmuItems = [...knowledgePoints, ...filteredHotWords];
+
+      console.log('[AdSkipper] 弹幕数据统计:');
+      console.log('  - 知识点:', knowledgePoints.length);
+      console.log('  - 原始热词:', hotWords.length);
+      console.log('  - 去重后热词:', filteredHotWords.length);
+      console.log('  - 总弹幕数:', allDanmuItems.length);
+
       this.analysisBvid = bvid;
       this.aiSummary = typeof analysisData.summary === 'string' ? analysisData.summary.trim() : '';
       this.segments = aiSegments;
       this.allSegments = aiSegments;
       this.currentSegmentIds = [];
-      this.updateKnowledgeDanmuSource(knowledgePoints, bvid);
+      this.updateKnowledgeDanmuSource(allDanmuItems, bvid);
       this.addSegmentMarkers();
 
       if (sidebarState) {
@@ -1126,13 +1203,20 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
 
     async analyzeVideo(bvid) {
       try {
+        console.log('[AdSkipper] ========== 开始视频分析 ==========');
+        console.log('[AdSkipper] BV号:', bvid);
+        console.log('[AdSkipper] API地址:', VIDEO_ANALYSIS_BASE);
+
         let token = '';
-        if (!MOCK_ANALYSIS) {
-          token = await this.getToken();
-          if (!token) {
-            console.log('[AdSkipper] 未登录，跳过视频分析');
-            return;
+        token = await this.getToken();
+        console.log('[AdSkipper] Token:', token ? '已获取（前10位: ' + token.substring(0, 10) + '...）' : '未获取');
+
+        if (!token) {
+          console.log('[AdSkipper] 未登录，跳过视频分析');
+          if (sidebarState) {
+            sidebarState.loadError = '请先登录后再使用AI分析功能';
           }
+          return;
         }
 
         if (sidebarState) {
@@ -1140,7 +1224,10 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
           sidebarState.loadError = null;
         }
 
+        console.log('[AdSkipper] 开始请求分析API...');
         const result = await this.requestAnalysis(bvid, token);
+        console.log('[AdSkipper] API返回:', result);
+
         if (!result?.success || !result?.data) {
           throw new Error('分析结果无效');
         }
@@ -1149,8 +1236,14 @@ import { getMockAnalysisConfig, resolveMockAnalysisData } from './mockAnalysis.j
         if (sidebarState) {
           sidebarState.isLoading = false;
         }
+        console.log('[AdSkipper] ========== 视频分析完成 ==========');
       } catch (error) {
         console.error('[AdSkipper] 视频分析异常:', error);
+        console.error('[AdSkipper] 错误详情:', {
+          message: error.message,
+          code: error.code,
+          stack: error.stack
+        });
         if (sidebarState) {
           sidebarState.isLoading = false;
           sidebarState.loadError = '分析失败: ' + error.message;
