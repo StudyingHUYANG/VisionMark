@@ -1,29 +1,73 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <style>
-    body { width: 300px; padding: 15px; font-family: sans-serif; background: #1e1e2e; color: #fff; }
-    h1 { font-size: 16px; color: #FB7299; margin: 0 0 10px 0; }
-    .stat { display: flex; justify-content: space-between; margin: 8px 0; font-size: 14px; }
-    .btn { width: 100%; background: #FB7299; color: #fff; border: none; padding: 10px; border-radius: 4px; cursor: pointer; margin-top: 10px; }
-  </style>
-</head>
-<body>
-  <h1>🚫 B站广告跳过</h1>
-  <div class="stat"><span>用户等级:</span> <span id="tier" style="color:#ffd700">Gold</span></div>
-  <div class="stat"><span>今日剩余:</span> <span id="limit">∞</span></div>
-  <div class="stat"><span>我的积分:</span> <span id="points">1,250</span></div>
-  <button class="btn" onclick="alert('在视频页面按 Alt+A 标注广告')">如何标注?</button>
-  <script>
-    // 简单演示数据，实际应从API获取
-    fetch('http://localhost:3000/api/v1/user/stats')
-      .then(r => r.json())
-      .then(d => {
-        document.getElementById('tier').textContent = d.tier || 'Bronze';
-        document.getElementById('points').textContent = d.points || 0;
-      })
-      .catch(() => {});
-  </script>
+  <!-- 登录/注册表单 -->
+  <div id="auth-form">
+    <div class="header">
+      <div class="logo">🚫</div>
+      <div class="title">B站广告跳过</div>
+      <div class="subtitle">社区驱动 · 智能标注</div>
+    </div>
+
+    <div id="error-msg" class="error"></div>
+
+    <div class="form-group">
+      <label>用户名</label>
+      <input type="text" id="username" placeholder="请输入用户名">
+    </div>
+
+    <div class="form-group">
+      <label>密码</label>
+      <input type="password" id="password" placeholder="至少6位字符">
+    </div>
+
+    <button id="submit-btn">登录</button>
+
+    <div class="switch-mode">
+      还没有账号？<span id="switch-text">立即注册</span>
+    </div>
+
+    <div
+      style="margin-top: 15px; padding-top: 15px; border-top: 1px solid rgba(255,255,255,0.1); text-align: center; font-size: 11px; color: #666;">
+      测试账号：admin / admin
+    </div>
+
+  </div>
+
+  <!-- 用户信息面板（登录后） -->
+  <div id="user-panel" class="user-panel">
+    <div class="user-header">
+      <div class="avatar">👤</div>
+      <div class="user-info">
+        <h3 id="display-username">用户</h3>
+        <p id="display-tier">青铜会员</p>
+      </div>
+    </div>
+
+    <div class="stats">
+      <div class="stat-box">
+        <div class="stat-value" id="display-points">0</div>
+        <div class="stat-label">积分</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-value" id="display-count">0</div>
+        <div class="stat-label">已标注</div>
+      </div>
+    </div>
+
+    <!-- 跳过模式设置（登录后显示） -->
+    <div class="skip-mode-section">
+      <div class="settings-label">跳过模式</div>
+      <div class="toggle-group">
+        <button id="user-mode-auto" class="toggle-btn active">自动跳过</button>
+        <button id="user-mode-manual" class="toggle-btn">手动跳过</button>
+      </div>
+      <div class="settings-hint">手动模式下会显示"跳过广告"按钮</div>
+    </div>
+
+    <button class="history-btn" id="history-btn">📊 查看标注历史</button>
+    <button class="refresh-btn" id="refresh-btn">🔄 刷新数据</button>
+    <button class="logout-btn" id="logout-btn">退出登录</button>
+  </div>
+
+  <script src="../content/config.local.js"></script>
+  <script src="popup.js"></script>
 </body>
 </html>

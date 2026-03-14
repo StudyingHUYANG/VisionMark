@@ -3,89 +3,59 @@ class BilibiliPlayerController {
     this.video = null;
     this.currentBvid = null;
     this.currentCid = null;
-    this.onTimeUpdate = null;
-    this.onCidChange = null;
+    this.init();
   }
 
-  async init() {
-    return new Promise((resolve) => {
-      this.tryFindVideo(resolve);
-    });
-  }
-
-  tryFindVideo(callback, attempts = 0) {
-    for (let selector of CONFIG.SELECTORS.video) {
-      this.video = document.querySelector(selector);
-      if (this.video) break;
+  init() {
+    // 查找B站视频播放器
+    const videoElement = document.querySelector('video');
+    if (videoElement) {
+      this.video = videoElement;
+      this.extractVideoInfo();
     }
-
-    if (this.video) {
-      console.log('[AdSkipper] 找到视频元素');
-      this.extractVideoId();
-      this.setupListeners();
-      callback(true);
-    } else if (attempts < 20) {
-      setTimeout(() => this.tryFindVideo(callback, attempts + 1), 500);
-    } else {
-      console.error('[AdSkipper] 未找到视频');
-      callback(false);
-    }
-  }
-
-  extractVideoId() {
-    const bvidMatch = window.location.pathname.match(/BV\w+/);
-    this.currentBvid = bvidMatch ? bvidMatch[0] : null;
     
+    // 监听页面变化，因为B站是SPA应用
+    const observer = new MutationObserver(() => {
+      const newVideo = document.querySelector('video');
+      if (newVideo && newVideo !== this.video) {
+        this.video = newVideo;
+        this.extractVideoInfo();
+      }
+    });
+    
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  extractVideoInfo() {
     try {
-      if (window.__INITIAL_STATE__?.videoData?.cid) {
-        this.currentCid = window.__INITIAL_STATE__.videoData.cid;
-      } else {
-        // 从弹幕接口推断
-        const scripts = document.querySelectorAll('script');
-        for (let s of scripts) {
-          const m = s.textContent.match(/"cid":(\d+)/);
-          if (m) { this.currentCid = parseInt(m[1]); break; }
-        }
+      // 从URL中提取BV号
+      const url = window.location.href;
+      const bvidMatch = url.match(/\/video\/(BV\w+)/);
+      if (bvidMatch) {
+        this.currentBvid = bvidMatch[1];
       }
       
-      if (this.currentCid && this.onCidChange) {
-        this.onCidChange(this.currentBvid, this.currentCid);
-      }
-    } catch(e) {}
+      // 从页面中提取CID（如果需要）
+      // 这里可以根据实际需求实现
+    } catch (error) {
+      console.warn('[AdSkipper] 无法提取视频信息:', error);
+    }
   }
 
-  setupListeners() {
-    if (!this.video) return;
-    
-    setInterval(() => {
-      if (this.onTimeUpdate) {
-        this.onTimeUpdate(this.video.currentTime);
-      }
-    }, CONFIG.CHECK_INTERVAL);
-
-    // 监听URL变化(B站是单页应用)
-    let lastUrl = location.href;
-    new MutationObserver(() => {
-      if (location.href !== lastUrl) {
-        lastUrl = location.href;
-        setTimeout(() => this.extractVideoId(), 1000);
-      }
-    }).observe(document, {subtree: true, childList: true});
-  }
-
-  skipTo(time) {
-    if (!this.video) return false;
-    try {
-      this.video.currentTime = time;
-      return true;
-    } catch(e) { return false; }
-  }
-
-  getState() {
+  getCurrentState() {
+    const duration = this.video && Number.isFinite(this.video.duration) ? this.video.duration : 0;
+    const playbackRate = this.video && Number.isFinite(this.video.playbackRate) && this.video.playbackRate > 0
+      ? this.video.playbackRate
+      : 1;
     return {
-      currentTime: this.video?.currentTime,
+      currentTime: this.video ? this.video.currentTime : 0,
+      duration,
+      paused: this.video ? Boolean(this.video.paused) : true,
+      playbackRate,
       bvid: this.currentBvid,
       cid: this.currentCid
     };
   }
 }
+
+window.BilibiliPlayerController = BilibiliPlayerController;
