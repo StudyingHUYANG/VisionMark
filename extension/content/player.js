@@ -3,73 +3,46 @@ class BilibiliPlayerController {
     this.video = null;
     this.currentBvid = null;
     this.currentCid = null;
-    this.onTimeUpdate = null;
+    this.init();
   }
 
-  async init() {
-    console.log('[AdSkipper] Looking for video element...');
-    return new Promise((resolve) => this.tryFindVideo(resolve, 0));
-  }
-
-  tryFindVideo(callback, attempts) {
-    const selectors = [
-      'video[src*="bilivideo"]',
-      'video[class*="bilateral-player"]',
-      'bpx-player-video-wrap video',
-      '.bilibili-player-video video',
-      'video'
-    ];
-
-    for (const selector of selectors) {
-      const video = document.querySelector(selector);
-      if (video && video.readyState >= 1) {
-        this.video = video;
-        console.log('[AdSkipper] Video found');
-        break;
+  init() {
+    // 查找B站视频播放器
+    const videoElement = document.querySelector('video');
+    if (videoElement) {
+      this.video = videoElement;
+      this.extractVideoInfo();
+    }
+    
+    // 监听页面变化，因为B站是SPA应用
+    const observer = new MutationObserver(() => {
+      const newVideo = document.querySelector('video');
+      if (newVideo && newVideo !== this.video) {
+        this.video = newVideo;
+        this.extractVideoInfo();
       }
-    }
-
-    if (this.video) {
-      this.extractVideoId();
-      this.setupListeners();
-      callback(true);
-      return;
-    }
-
-    if (attempts < 30) {
-      setTimeout(() => this.tryFindVideo(callback, attempts + 1), 500);
-      return;
-    }
-
-    callback(false);
+    });
+    
+    observer.observe(document.body, { childList: true, subtree: true });
   }
 
-  extractVideoId() {
-    const match = window.location.pathname.match(/BV[a-zA-Z0-9]+/);
-    this.currentBvid = match ? match[0] : null;
-    console.log('[AdSkipper] BVID:', this.currentBvid);
-  }
-
-  setupListeners() {
-    if (!this.video) return;
-    setInterval(() => {
-      if (this.onTimeUpdate) {
-        this.onTimeUpdate(this.video.currentTime);
-      }
-    }, 200);
-  }
-
-  skipTo(time) {
-    if (!this.video) return false;
+  extractVideoInfo() {
     try {
-      this.video.currentTime = time;
-      return true;
+      // 从URL中提取BV号
+      const url = window.location.href;
+      const bvidMatch = url.match(/\/video\/(BV\w+)/);
+      if (bvidMatch) {
+        this.currentBvid = bvidMatch[1];
+      }
+      
+      // 从页面中提取CID（如果需要）
+      // 这里可以根据实际需求实现
     } catch (error) {
-      return false;
+      console.warn('[AdSkipper] 无法提取视频信息:', error);
     }
   }
 
-  getState() {
+  getCurrentState() {
     const duration = this.video && Number.isFinite(this.video.duration) ? this.video.duration : 0;
     const playbackRate = this.video && Number.isFinite(this.video.playbackRate) && this.video.playbackRate > 0
       ? this.video.playbackRate

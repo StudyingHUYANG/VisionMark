@@ -7,8 +7,8 @@
   let sidebarState = null;
 
   // API 基础路径
-  const API_BASE = window.API_BASE || 'http://localhost:8080/api/v1';
-  const VIDEO_ANALYSIS_BASE = window.LOCAL_CONFIG?.API_BASE || 'http://localhost:8080';
+  const API_BASE = window.API_BASE || 'http://localhost:3000/api/v1';
+  const VIDEO_ANALYSIS_BASE = window.LOCAL_CONFIG?.API_BASE || 'http://localhost:3000';
   const DANMU_TRIGGER_WINDOW_SEC = 0.3;
   const DANMU_REWIND_RESET_SEC = 1.0;
   const DANMU_MAX_CONCURRENT = 3;

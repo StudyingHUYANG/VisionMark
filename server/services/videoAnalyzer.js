@@ -40,9 +40,10 @@ if (hasOssConfig) {
 
 // 时间格式化辅助函数
 function formatTime(seconds) {
-  const mins = Math.floor(seconds / 60);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
   const secs = Math.floor(seconds % 60);
-  return `${mins}:${secs.toString().padStart(2, '0')}`;
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 }
 
 class VideoAnalyzer {
@@ -657,7 +658,7 @@ ${transcript || '无语音内容'}
 
         // 尝试解析JSON
         try {
-          // 提取JSON部分（AI可能返回markdown格式的json）
+          // 提取JSON部分（AI可能返回``json\n``）
           const jsonMatch = aiResponse.match(/```json\n([\s\S]*?)\n```/) ||
                            aiResponse.match(/\{[\s\S]*\}/);
 

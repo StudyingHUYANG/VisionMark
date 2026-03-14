@@ -1,1 +1,13 @@
-{"files.autoGuessEncoding": false, "files.encoding": "utf8", "python-envs.defaultEnvManager": "ms-python.python:conda", "python-envs.defaultPackageManager": "ms-python.python:conda", "python-envs.pythonProjects": []}
+<<<<<<< HEAD
+{
+    "python-envs.defaultEnvManager": "ms-python.python:venv",
+    "python-envs.defaultPackageManager": "ms-python.python:pip"
+}
+=======
+{
+    "files.autoGuessEncoding": false,
+    "files.encoding": "utf8",
+    "python-envs.defaultEnvManager": "ms-python.python:venv",
+    "python-envs.defaultPackageManager": "ms-python.python:pip",
+    "python-envs.pythonProjects": []
+}
