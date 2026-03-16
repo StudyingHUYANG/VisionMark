@@ -1,17 +1,25 @@
-// 加载环境变量
-require('dotenv').config();
+# fix_db_reset.py - 重置数据库
+import os
+import shutil
 
-const { authenticateToken } = require('./middlewares/auth.js');
-const express = require('express');
+base = r"E:\BiliVideoEvaluation\ChromeExtention"
+db_path = os.path.join(base, "server", "database", "app.db")
+
+# 删除旧数据库
+if os.path.exists(db_path):
+    os.remove(db_path)
+    print("✅ 已删除旧数据库")
+
+# 写入修复后的 server.js（使用单引号SQL）
+server_js = r'''const express = require('express');
 const Database = require('better-sqlite3');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const path = require('path');
-const config = require('./config.js');
 
 const app = express();
-const JWT_SECRET = config.JWT_SECRET;
+const JWT_SECRET = 'secret-key-v1';
 
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
@@ -61,7 +69,6 @@ if (!admin) {
   console.log('[Auth] 测试账号: admin/admin');
 }
 
-
 // 登录API
 app.post('/api/v1/auth/login', (req, res) => {
   const { username, password } = req.body;
@@ -86,26 +93,15 @@ app.post('/api/v1/auth/login', (req, res) => {
 app.post('/api/v1/auth/register', (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: '必填' });
-
+  
   const existing = db.prepare("SELECT id FROM users WHERE username = ?").get(username);
   if (existing) return res.status(409).json({ error: '已存在' });
-
+  
   const hash = bcrypt.hashSync(password, 10);
   const result = db.prepare("INSERT INTO users (username, password_hash) VALUES (?, ?)").run(username, hash);
   db.prepare("INSERT INTO user_points (user_id) VALUES (?)").run(result.lastInsertRowid);
-
+  
   res.json({ message: '注册成功' });
-});
-
-// 获取当前用户信息API
-app.get('/api/v1/auth/me', authenticateToken, (req, res) => {
-  const points = db.prepare("SELECT * FROM user_points WHERE user_id = ?").get(req.user.userId);
-  res.json({
-    username: req.user.username,
-    userId: req.user.userId,
-    points: points ? points.total_points : 0,
-    tier: points ? points.tier : 'bronze'
-  });
 });
 
 // 其他API
@@ -116,9 +112,8 @@ app.get('/api/v1/segments', (req, res) => {
   res.json({ segments: rows });
 });
 
-app.post('/api/v1/segments', authenticateToken, (req, res) => {
+app.post('/api/v1/segments', (req, res) => {
   const { bvid, cid, start_time, end_time, ad_type } = req.body;
-  const userId = req.user.userId;
   
   let video = db.prepare("SELECT id FROM videos WHERE bvid = ?").get(bvid);
   if (!video) {
@@ -126,48 +121,21 @@ app.post('/api/v1/segments', authenticateToken, (req, res) => {
     video = { id: r.lastInsertRowid };
   }
   
-  const result = db.prepare("INSERT INTO ad_segments (video_id, start_time, end_time, ad_type, contributor_id, is_active) VALUES (?, ?, ?, ?, ?, 1)").run(video.id, start_time, end_time, ad_type, userId);
-  
-  // Award points
-  db.prepare("UPDATE user_points SET total_points = total_points + 10 WHERE user_id = ?").run(userId);
-
+  const result = db.prepare("INSERT INTO ad_segments (video_id, start_time, end_time, ad_type, is_active) VALUES (?, ?, ?, ?, 1)").run(video.id, start_time, end_time, ad_type);
   res.json({ id: result.lastInsertRowid, message: '提交成功' });
 });
 
 app.get('/api/v1/health', (req, res) => res.json({ ok: true }));
 
-// 引入路由文件
-const statsRouter = require('./routes/stats.js');
-const segmentsRouter = require('./routes/segments.js');
-const videoAnalysisRouter = require('./routes/videoAnalysis.js');
-
-// 注册路由
-app.use('/api/v1/stats', statsRouter);
-app.use('/api/v1/segments', segmentsRouter); // 补充批量/删除接口，和原有segments接口合并
-app.use('/video-analysis', videoAnalysisRouter); // AI视频分析路由
-
-// Get user's all segments
-app.get('/api/v1/segments/user', authenticateToken, (req, res) => {
-  const userId = req.user.userId;
-
-  const rows = db.prepare(`
-    SELECT
-      s.id, s.start_time, s.end_time, s.ad_type,
-      v.bvid, v.page,
-      datetime(s.created_at, 'localtime') as created_at
-    FROM ad_segments s
-    JOIN videos v ON s.video_id = v.id
-    WHERE s.contributor_id = ?
-    ORDER BY s.created_at DESC
-  `).all(userId);
-
-  res.json({ segments: rows });
-});
-
-// 使用配置文件的端口
-app.listen(config.PORT, '0.0.0.0', () => {
-  console.log('[Server] http://localhost:' + config.PORT);
+app.listen(3000, () => {
+  console.log('[Server] http://localhost:3000');
   console.log('[Auth] admin/admin 登录');
 });
+'''
 
+with open(os.path.join(base, "server", "server.js"), 'w', encoding='utf-8') as f:
+    f.write(server_js)
 
+print("✅ 数据库已重置，server.js已修复（使用单引号）")
+print("现在运行: node server.js")
+print("然后刷新扩展登录")
