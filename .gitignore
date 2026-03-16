@@ -13,3 +13,9 @@ node_modules/
 .DS_Store
 Thumbs.db
 downloads/
+
+# Build artifacts
+extension/dist/
+
+# Local configuration
+.claude/settings.local.json
