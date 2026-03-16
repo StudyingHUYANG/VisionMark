@@ -1,6 +1,11 @@
 import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
-import { resolve } from 'path';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+// 获取项目根目录路径
+const __filename = fileURLToPath(import.meta.url);
+const projectRoot = resolve(dirname(__filename), '..');
 
 export default defineConfig({
     plugins: [
@@ -8,15 +13,15 @@ export default defineConfig({
     ],
     resolve: {
         alias: {
-            '@': resolve(__dirname, './extension'),
+            '@': resolve(projectRoot, './extension'),
         },
     },
     build: {
-        outDir: 'extension/dist',
+        outDir: resolve(projectRoot, 'extension/dist'),
         emptyOutDir: true,
         lib: {
             // 我们的目标是 content script
-            entry: resolve(__dirname, 'extension/content/main.js'),
+            entry: resolve(projectRoot, 'extension/content/main.js'),
             name: 'VisionMarkContent',
             formats: ['iife'],
             fileName: () => 'main.js'
