@@ -1,0 +1,32 @@
+{
+  "name": "visionmark",
+  "version": "1.0.0",
+  "description": "ChromeExtention/\r ├── setup.py          # 环境安装脚本（已运行）\r ├── start.bat         # Windows一键启动\r ├── start.py          # Python智能启动器\r ├── extension/        # 浏览器插件代码\r │   ├── manifest.json\r │   └── content/      # 核心JS文件\r └── server/           # 后端服务\r ├── server.js     # Express服务\r └── database/     # SQLite数据库文件\r 复制",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite --config build/vite.config.js",
+    "build": "vite build --config build/vite.config.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/StudyingHUYANG/VisionMark.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/StudyingHUYANG/VisionMark/issues"
+  },
+  "homepage": "https://github.com/StudyingHUYANG/VisionMark#readme",
+  "dependencies": {
+    "vue": "^3.5.29"
+  },
+  "devDependencies": {
+    "@crxjs/vite-plugin": "^2.3.0",
+    "@vitejs/plugin-vue": "^6.0.4",
+    "path": "^0.12.7",
+    "vite": "^7.3.1"
+  }
+}

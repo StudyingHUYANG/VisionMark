@@ -17,8 +17,6 @@ server/database/app.db
 # System files
 .DS_Store
 Thumbs.db
-
-# Downloads
 downloads/
 
 # Local configuration
