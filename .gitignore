@@ -1,13 +1,18 @@
+
 # Dependencies
 node_modules/
 
 # Database
+*.db
 *.db-shm
 *.db-wal
-*.db
+server/database/app.db
 
 # Environment variables
 .env
+
+# Logs
+*.log
 
 # System files
 .DS_Store
