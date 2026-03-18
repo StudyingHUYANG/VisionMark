@@ -29,13 +29,13 @@
     '.bilibili-player-video-danmaku [class*="danmaku"]'
   ];
 
-  // 广告类型标签映射
+  // 分段类型标签映射
   const typeLabels = {
-    'hard_ad': '硬广',
-    'soft_ad': '软广',
-    'product_placement': '植入广告',
-    'intro_ad': '片头广告',
-    'mid_ad': '中段广告'
+    'hard_ad': '商业内容',
+    'soft_ad': '推广内容',
+    'product_placement': '品牌植入',
+    'intro_ad': '片头内容',
+    'mid_ad': '中段内容'
   };
 
   class AdSkipperCore {
@@ -1755,8 +1755,8 @@
 
       const toggleBtn = document.createElement('div');
       toggleBtn.id = 'adskipper-toggle';
-      toggleBtn.title = '广告控制';
-      toggleBtn.setAttribute('aria-label', '广告控制');
+      toggleBtn.title = '分段评价';
+      toggleBtn.setAttribute('aria-label', '分段评价');
       toggleBtn.style.cssText = `
         cursor: pointer;
         background-color: #FB7299;
@@ -1772,7 +1772,7 @@
         height: auto;
         min-height: 24px;
       `;
-      toggleBtn.innerHTML = '<span class="adskipper-toggle-text">广告控制</span>';
+      toggleBtn.innerHTML = '<span class="adskipper-toggle-text">分段评价</span>';
       toggleBtn.onclick = (event) => {
         event.stopPropagation();
         self.togglePopover();
@@ -1880,11 +1880,11 @@
       selectType.id = 'adskipper-type';
       selectType.style.cssText = 'width:100%;height:32px;background:#333;color:#fff;border:1px solid #555;border-radius:4px;padding:0 6px;font-size:0.9em;outline:none;cursor:pointer;';
       const types = [
-        { val: 'hard_ad', text: '硬广' },
-        { val: 'soft_ad', text: '软广' },
-        { val: 'product_placement', text: '植入广告' },
-        { val: 'intro_ad', text: '片头广告' },
-        { val: 'mid_ad', text: '中段广告' }
+        { val: 'hard_ad', text: '商业内容' },
+        { val: 'soft_ad', text: '推广内容' },
+        { val: 'product_placement', text: '品牌植入' },
+        { val: 'intro_ad', text: '片头内容' },
+        { val: 'mid_ad', text: '中段内容' }
       ];
       types.forEach((item) => {
         const option = document.createElement('option');
@@ -2302,7 +2302,7 @@
 
       const btn = document.createElement('div');
       btn.id = 'adskipper-skip-btn';
-      btn.textContent = '跳过广告';
+      btn.textContent = '跳过分段';
       // 5. 响应式 CSS 定位：使用像素值 + !important 确保位于视频右下角
       // 默认 bottom: 60px，在全屏模式下动态调整
       btn.style.cssText = `

@@ -174,7 +174,7 @@ function jumpToVideo(bvid, startTime) {
   } catch (error) {
     alert('删除失败: ' + error.message);
   }
-}
+
 
 // Event listeners
 document.addEventListener('DOMContentLoaded', () => {
