@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "B站广告跳过 - 众测版",
+  "name": "B站视频分段评价 - 众测版",
   "version": "1.0.0",
-  "description": "社区驱动的B站广告自动跳过插件",
+  "description": "社区驱动的B站视频分段评价插件",
   "permissions": [
     "storage",
     "activeTab",
