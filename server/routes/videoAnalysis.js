@@ -7,6 +7,7 @@ const express = require('express');
 const router = express.Router();
 const VideoAnalyzer = require('../services/videoAnalyzer');
 const { authenticateToken } = require('../middlewares/auth.js');
+const db = require('../database/db');
 
 // 创建视频分析器实例
 const videoAnalyzer = new VideoAnalyzer();
@@ -50,6 +51,66 @@ router.post('/analyze', authenticateToken, async (req, res) => {
       hot_words: result.analysis.hot_words || [],
       analyzed_at: result.analyzed_at
     };
+
+    let video = db.prepare("SELECT id FROM videos WHERE bvid = ?").get(result.bvid);
+    if (!video) {
+      const r = db.prepare("INSERT INTO videos (bvid, cid) VALUES (?, ?)").run(result.bvid, null);
+      video = { id: r.lastInsertRowid };
+    }
+
+    const normalizedContent = {
+      meta: {
+        bvid: result.bvid,
+        title: result.analysis.title || null
+    },
+      content_analysis: {
+        summary: result.analysis.summary || null,
+        transcript: result.analysis.transcript || null,
+        knowledge_points: result.analysis.knowledge_points || [],
+        hot_words: result.analysis.hot_words || [],
+        tags: result.analysis.tags || [],
+        analyzed_at: result.analyzed_at || null,
+        ad_segments: result.analysis.segments
+          ? result.analysis.segments.map(seg => ({
+              start_time: parseTimeToSeconds(seg.start_time),
+              end_time: parseTimeToSeconds(seg.end_time),
+              ad_type: seg.highlight ? 'hard_ad' : 'soft_ad',
+              description: seg.description || null,
+              highlight: !!seg.highlight
+            }))
+          : []
+      }
+    };
+
+    db.prepare(`
+      INSERT INTO annotations (
+        video_id,
+        source_type,
+        submitter_id,
+        submitter_name,
+        parent_id,
+        annotation_type,
+        title,
+        summary,
+        transcript,
+        score,
+        content_json,
+        model_name
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      video.id,
+      'AI',
+      null,
+      'AI',
+      null,
+      'full_analysis',
+      adaptedData.title || null,
+      adaptedData.summary || null,
+      adaptedData.transcript || null,
+      null,
+      JSON.stringify(normalizedContent),
+      'qwen-vl-max'
+    );
 
     res.json({
       success: true,
