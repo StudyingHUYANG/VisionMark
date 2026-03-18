@@ -3,6 +3,110 @@ const API_BASE = window.LOCAL_CONFIG
   ? window.LOCAL_CONFIG.API_BASE + '/' + window.LOCAL_CONFIG.API_VERSION
   : 'http://localhost:8080/api/v1';
 
+const NETWORK_ERROR_CODE = 'NETWORK_UNAVAILABLE';
+const NETWORK_COOLDOWN_MS = 30000;
+const NETWORK_TIMEOUT_MS = 6000;
+const USER_CACHE_TTL_MS = 5000;
+
+const networkState = {
+  offlineUntil: 0,
+  hasLoggedOffline: false,
+  wasOffline: false
+};
+
+const userInfoCache = {
+  data: null,
+  updatedAt: 0,
+  pending: null
+};
+
+function createNetworkUnavailableError() {
+  const error = new Error('网络不可用，请稍后重试');
+  error.code = NETWORK_ERROR_CODE;
+  return error;
+}
+
+function isNetworkFailure(error) {
+  if (!error) return false;
+  if (error.name === 'AbortError') return true;
+  const message = String(error.message || '').toLowerCase();
+  if (message.includes('failed to fetch') || message.includes('networkerror') || message.includes('load failed')) {
+    return true;
+  }
+  return error instanceof TypeError;
+}
+
+function markNetworkOffline(error) {
+  networkState.offlineUntil = Date.now() + NETWORK_COOLDOWN_MS;
+  networkState.wasOffline = true;
+  if (!networkState.hasLoggedOffline) {
+    console.warn('[Popup] 后端不可达，暂停请求 30 秒。', error);
+    networkState.hasLoggedOffline = true;
+  }
+}
+
+function markNetworkOnline() {
+  if (networkState.wasOffline) {
+    console.info('[Popup] 后端连接已恢复');
+  }
+  networkState.offlineUntil = 0;
+  networkState.hasLoggedOffline = false;
+  networkState.wasOffline = false;
+}
+
+async function safeFetch(url, options = {}) {
+  if (Date.now() < networkState.offlineUntil) {
+    throw createNetworkUnavailableError();
+  }
+
+  const controller = options.signal ? null : new AbortController();
+  const timeoutId = setTimeout(() => {
+    if (controller) controller.abort();
+  }, NETWORK_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: options.signal || (controller ? controller.signal : undefined)
+    });
+    clearTimeout(timeoutId);
+    markNetworkOnline();
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (isNetworkFailure(error)) {
+      markNetworkOffline(error);
+      throw createNetworkUnavailableError();
+    }
+    throw error;
+  }
+}
+
+function resetUserInfoCache() {
+  userInfoCache.data = null;
+  userInfoCache.updatedAt = 0;
+  userInfoCache.pending = null;
+}
+
+function formatTierLabel(tier) {
+  const rawTier = String(tier || '').trim();
+  if (!rawTier) return '青铜会员';
+
+  const normalized = rawTier.toLowerCase();
+  const tierMap = {
+    bronze: '青铜会员',
+    silver: '白银会员',
+    gold: '黄金会员',
+    platinum: '铂金会员',
+    diamond: '钻石会员',
+    admin: '管理员'
+  };
+
+  if (tierMap[normalized]) return tierMap[normalized];
+  if (/[\u4e00-\u9fa5]/.test(rawTier)) return rawTier;
+  return '普通会员';
+}
+
 // 统一的API请求函数
 async function apiRequest(endpoint, options = {}) {
   try {
@@ -13,7 +117,7 @@ async function apiRequest(endpoint, options = {}) {
     };
     if (token) headers['Authorization'] = 'Bearer ' + token;
     
-    const res = await fetch(API_BASE + endpoint, {
+    const res = await safeFetch(API_BASE + endpoint, {
       ...options,
       headers
     });
@@ -28,7 +132,9 @@ async function apiRequest(endpoint, options = {}) {
     if (!res.ok) throw new Error(data.error || '请求失败');
     return data;
   } catch(err) {
-    console.error('API Error:', err);
+    if (err.code !== NETWORK_ERROR_CODE) {
+      console.error('API Error:', err);
+    }
     throw err;
   }
 }
@@ -56,33 +162,122 @@ async function checkAuth() {
   return false;
 }
 
+async function getCurrentUserInfo(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && userInfoCache.data && (now - userInfoCache.updatedAt) < USER_CACHE_TTL_MS) {
+    return userInfoCache.data;
+  }
+
+  if (!forceRefresh && userInfoCache.pending) {
+    return userInfoCache.pending;
+  }
+
+  userInfoCache.pending = apiRequest('/auth/me')
+    .then((data) => {
+      userInfoCache.data = data;
+      userInfoCache.updatedAt = Date.now();
+      return data;
+    })
+    .finally(() => {
+      userInfoCache.pending = null;
+    });
+
+  return userInfoCache.pending;
+}
+
 function showLoginForm() {
   document.getElementById('auth-form').style.display = 'block';
   document.getElementById('user-panel').style.display = 'none';
 }
 
-function showUserPanel(user) {
+// 显示用户面板并获取标注数量
+async function showUserPanel(user) {
   document.getElementById('auth-form').style.display = 'none';
   document.getElementById('user-panel').style.display = 'block';
   document.getElementById('user-panel').classList.add('user-panel-active');
 
   document.getElementById('display-username').textContent = user.username;
   document.getElementById('display-points').textContent = user.points || 0;
-  document.getElementById('display-tier').textContent = (user.tier || 'Bronze').toUpperCase();
+  document.getElementById('display-tier').textContent = formatTierLabel(user.tier);
+  
+  // 确保登录后面板使用最新跳过模式状态
+  loadSkipModeSetting();
+
+  // 获取并显示用户标注数量
+  await loadUserContributionCount();
 }
 
-// 刷新用户积分
+// 加载用户标注数量
+async function loadUserContributionCount() {
+  try {
+    // 首先获取当前用户的ID
+    const userInfo = await getCurrentUserInfo();
+    const userId = await getUserIdByUsername(userInfo.username);
+    
+    if (userId) {
+      // 调用用户贡献API获取标注总数
+      const response = await safeFetch(`${API_BASE}/stats/user/contributions?user_id=${userId}&page_size=1`);
+      if (response.ok) {
+        const data = await response.json();
+        if (data.code === 200) {
+          document.getElementById('display-count').textContent = data.data.total || 0;
+          console.log('[Popup] 标注数量已更新:', data.data.total);
+        }
+      }
+    }
+  } catch(err) {
+    if (err.code !== NETWORK_ERROR_CODE) {
+      console.error('[Popup] 获取标注数量失败:', err);
+    }
+    document.getElementById('display-count').textContent = '0';
+  }
+}
+
+// 通过用户名获取用户ID（辅助函数）
+async function getUserIdByUsername(username) {
+  try {
+    // 这里需要一个获取用户ID的API，暂时通过查询用户表实现
+    // 或者可以在登录时将用户ID也存储到localStorage中
+    const token = localStorage.getItem('adskipper_token');
+    if (!token) return null;
+    
+    // 尝试从登录响应中获取用户ID（如果之前存储了的话）
+    const storedUser = JSON.parse(localStorage.getItem('adskipper_user') || '{}');
+    if (storedUser.userId) {
+      return storedUser.userId;
+    }
+    
+    // 如果没有存储userId，则需要通过API获取
+    // 这里假设登录API返回的用户信息包含userId
+    const loginData = await getCurrentUserInfo();
+    // 注意：当前的/auth/me API不返回userId，我们需要修改它或者添加新的端点
+    
+    return null;
+  } catch(err) {
+    if (err.code !== NETWORK_ERROR_CODE) {
+      console.error('获取用户ID失败:', err);
+    }
+    return null;
+  }
+}
+
+// 刷新用户信息（包括积分和标注数量）
 async function refreshUserInfo() {
   try {
-    const user = await apiRequest('/auth/me');
+    const user = await getCurrentUserInfo(true);
     // 更新localStorage
     localStorage.setItem('adskipper_user', JSON.stringify(user));
     // 更新显示
     document.getElementById('display-points').textContent = user.points || 0;
-    document.getElementById('display-tier').textContent = (user.tier || 'Bronze').toUpperCase();
+    document.getElementById('display-tier').textContent = formatTierLabel(user.tier);
     console.log('[Popup] 积分已刷新:', user.points);
+    
+    // 同时刷新标注数量
+    await loadUserContributionCount();
   } catch(err) {
-    console.error('[Popup] 刷新积分失败:', err);
+    if (err.code !== NETWORK_ERROR_CODE) {
+      console.error('[Popup] 刷新用户信息失败:', err);
+    }
   }
 }
 
@@ -117,18 +312,27 @@ async function handleAuth() {
     
     if (isLogin) {
       localStorage.setItem('adskipper_token', data.token);
-      localStorage.setItem('adskipper_user', JSON.stringify(data));
+      // 存储完整的用户信息，包括userId
+      localStorage.setItem('adskipper_user', JSON.stringify({
+        username: data.username,
+        points: data.points || 0,
+        tier: data.tier || 'bronze',
+        userId: data.userId || null // 如果登录API返回userId的话
+      }));
       // 同步到 chrome.storage.local 供 content script 使用
       chrome.storage.local.set({ adskipper_token: data.token }, () => {
         console.log('[Popup] Token已同步到chrome.storage.local');
       });
+      userInfoCache.data = data;
+      userInfoCache.updatedAt = Date.now();
+      userInfoCache.pending = null;
       showUserPanel(data);
     } else {
       showError('✓ 注册成功，请登录');
       toggleMode();
     }
   } catch(err) {
-    showError(err.message || '网络错误，请检查后端是否启动 (localhost:3000)');
+    showError(err.message || '网络错误，请检查后端是否启动 (localhost:8080)');
   } finally {
     btn.disabled = false;
     btn.textContent = originalText;
@@ -152,6 +356,7 @@ function toggleMode() {
 function logout() {
   localStorage.removeItem('adskipper_token');
   localStorage.removeItem('adskipper_user');
+  resetUserInfoCache();
   // 同时清理 chrome.storage.local
   chrome.storage.local.remove(['adskipper_token']);
   showLoginForm();
@@ -167,25 +372,12 @@ function loadSkipModeSetting() {
 
 // 更新跳过模式 UI
 function updateSkipModeUI(mode) {
-  // 更新所有具有相应 class 的按钮（登录前和登录后各有一组）
-  const autoBtns = document.querySelectorAll('.toggle-btn:first-child');
-  const manualBtns = document.querySelectorAll('.toggle-btn:last-child');
+  const autoBtn = document.getElementById('user-mode-auto');
+  const manualBtn = document.getElementById('user-mode-manual');
+  if (!autoBtn || !manualBtn) return;
 
-  autoBtns.forEach(btn => {
-    if (mode === 'auto') {
-      btn.classList.add('active');
-    } else {
-      btn.classList.remove('active');
-    }
-  });
-
-  manualBtns.forEach(btn => {
-    if (mode === 'manual') {
-      btn.classList.add('active');
-    } else {
-      btn.classList.remove('active');
-    }
-  });
+  autoBtn.classList.toggle('active', mode === 'auto');
+  manualBtn.classList.toggle('active', mode === 'manual');
 }
 
 // 设置跳过模式
@@ -196,11 +388,31 @@ function setSkipMode(mode) {
   });
 }
 
+// 刷新功能
+async function refreshAllData() {
+  const refreshBtn = document.getElementById('refresh-btn');
+  const originalText = refreshBtn.innerHTML;
+  refreshBtn.innerHTML = '🔄 刷新中...';
+  refreshBtn.disabled = true;
+  
+  try {
+    await refreshUserInfo();
+    showError('✓ 数据已刷新');
+  } catch(err) {
+    showError('刷新失败: ' + err.message);
+  } finally {
+    setTimeout(() => {
+      refreshBtn.innerHTML = originalText;
+      refreshBtn.disabled = false;
+    }, 1000);
+  }
+}
+
 // 初始化
 document.addEventListener('DOMContentLoaded', async () => {
   const isLoggedIn = await checkAuth();
 
-  // 如果已登录，刷新最新积分
+  // 如果已登录，刷新最新积分和标注数量
   if (isLoggedIn) {
     refreshUserInfo();
   }
@@ -212,17 +424,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('switch-text').onclick = toggleMode;
   document.getElementById('logout-btn').onclick = logout;
   document.getElementById('history-btn').onclick = openHistoryPage;
+  // 绑定刷新按钮
+  document.getElementById('refresh-btn').onclick = refreshAllData;
 
-  // 绑定跳过模式切换按钮（使用 class 选择器，同时绑定登录前和登录后的按钮）
-  document.querySelectorAll('.toggle-btn').forEach(btn => {
-    btn.onclick = () => {
-      if (btn.textContent.includes('自动')) {
-        setSkipMode('auto');
-      } else {
-        setSkipMode('manual');
-      }
-    };
-  });
+  // 绑定登录后面板的跳过模式切换按钮
+  document.getElementById('user-mode-auto').onclick = () => setSkipMode('auto');
+  document.getElementById('user-mode-manual').onclick = () => setSkipMode('manual');
 
   document.getElementById('password').onkeypress = (e) => {
     if (e.key === 'Enter') handleAuth();
@@ -231,7 +438,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 检查后端健康状态
   apiRequest('/health')
     .then(() => console.log('后端连接正常'))
-    .catch(() => showError('警告：无法连接后端，请确保localhost:3000运行中'));
+    .catch(() => showError('警告：无法连接后端，请确保localhost:8080运行中'));
 });
 
 // 打开标注历史页面
