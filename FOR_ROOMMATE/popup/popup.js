@@ -1,4 +1,4 @@
-const API_BASE = 'http://localhost:3000/api/v1';
+const API_BASE = 'http://localhost:8080/api/v1';
 
 // 统一的API请求函数
 async function apiRequest(endpoint, options = {}) {
@@ -106,7 +106,7 @@ async function handleAuth() {
       toggleMode();
     }
   } catch(err) {
-    showError(err.message || '网络错误，请检查后端是否启动 (localhost:3000)');
+    showError(err.message || '网络错误，请检查后端是否启动 (localhost:8080)');
   } finally {
     btn.disabled = false;
     btn.textContent = originalText;
@@ -148,5 +148,5 @@ document.addEventListener('DOMContentLoaded', () => {
   // 检查后端健康状态
   apiRequest('/health')
     .then(() => console.log('后端连接正常'))
-    .catch(() => showError('警告：无法连接后端，请确保localhost:3000运行中'));
+    .catch(() => showError('警告：无法连接后端，请确保localhost:8080运行中'));
 });
