@@ -17,6 +17,20 @@ server/database/app.db
 # System files
 .DS_Store
 Thumbs.db
+
+# 忽略SQLite数据库文件（规范要求）
+server/database/app.db
+
+# 忽略日志/临时文件
+*.log
+
+.agent
+.claude
+CLAUDE.md
+
+build_output.txt
+dist
+build_test.js
 downloads/
 
 # Local configuration

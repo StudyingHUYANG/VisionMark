@@ -39,6 +39,13 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS annotations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id INTEGER,
+    start_time REAL,
+    end_time REAL,
+    ad_type TEXT,
+    contributor_id INTEGER,
+    is_active BOOLEAN DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP -- 仅新增这一行
     video_id INTEGER NOT NULL,
     source_type TEXT NOT NULL,              -- AI / HUMAN
     submitter_id INTEGER,                   -- HUMAN时是用户id，AI时可为空
@@ -257,7 +264,7 @@ const videoAnalysisRouter = require('./routes/videoAnalysis.js');
 
 // 注册路由
 app.use('/api/v1/stats', statsRouter);
-app.use('/api/v1/segments', segmentsRouter); // 补充批量/删除接口，和原有segments接口合并
+// app.use('/api/v1/segments', segmentsRouter); // 已在上面定义了 segments 相关 API，这里注释掉路由注册
 app.use('/video-analysis', videoAnalysisRouter); // AI视频分析路由
 
 // Get user's all segments
