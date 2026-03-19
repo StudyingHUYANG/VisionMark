@@ -1,4 +1,4 @@
-(function () {
+﻿(function () {
   'use strict';
 
   if (window.adSkipper) return;
@@ -79,9 +79,11 @@
       this.lastDanmuFrameTs = 0;
       this.nativeDanmuSpeedPxPerSec = 0;
       this.lastNativeSpeedSampleTs = 0;
-      this.nativeDanmuTrackSample = null;
-
-
+      this.progressHoverCleanup = null;
+      this.progressHoverTarget = null;
+      this.progressHoverCard = null;
+      this.hoveredSegmentKey = null;
+      this.segmentMarkerRetryTimer = null;
     }
 
     init() {
@@ -489,6 +491,7 @@
         }
 
         this.addSegmentMarkers();
+      this.scheduleSegmentMarkerRetry(2);
       } catch (error) {
         if (error.code !== 'NETWORK_UNAVAILABLE') {
           console.error('[AdSkipper] 加载片段失败:', error);
@@ -531,6 +534,368 @@
         content,
         ad_type: segment.ad_type || (action === 'skip' ? 'hard_ad' : 'mid_ad'),
         hasActionField: typeof segment.action === 'string'
+      };
+    }
+
+    ensureProgressHoverCardStyle() {
+      if (document.getElementById('visionmark-progress-hover-style')) return;
+
+      const style = document.createElement('style');
+      style.id = 'visionmark-progress-hover-style';
+      style.textContent = `
+        #visionmark-progress-hover-card {
+          position: fixed;
+          z-index: 2147483647;
+          width: min(320px, calc(100vw - 24px));
+          padding: 14px 16px;
+          border-radius: 16px;
+          color: #fff;
+          background: linear-gradient(145deg, rgba(20, 20, 28, 0.96), rgba(31, 31, 44, 0.92));
+          box-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          backdrop-filter: blur(14px);
+          -webkit-backdrop-filter: blur(14px);
+          pointer-events: none;
+          opacity: 0;
+          transform: translateY(6px);
+          transition: opacity 0.16s ease, transform 0.16s ease;
+        }
+        #visionmark-progress-hover-card.is-visible {
+          opacity: 1;
+          transform: translateY(0);
+        }
+        .visionmark-progress-hover__eyebrow {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          margin-bottom: 8px;
+          font-size: 12px;
+          color: rgba(255, 255, 255, 0.82);
+        }
+        .visionmark-progress-hover__badge {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          padding: 2px 8px;
+          border-radius: 999px;
+          font-size: 11px;
+          font-weight: 700;
+          letter-spacing: 0.3px;
+          color: #fff;
+        }
+        .visionmark-progress-hover__badge--popup {
+          background: linear-gradient(135deg, #47a7ff, #6fc1ff);
+        }
+        .visionmark-progress-hover__badge--skip {
+          background: linear-gradient(135deg, #fb7299, #ff9a8b);
+        }
+        .visionmark-progress-hover__title {
+          margin: 0 0 8px;
+          font-size: 14px;
+          line-height: 1.55;
+          font-weight: 600;
+          color: #fff;
+          word-break: break-word;
+        }
+        .visionmark-progress-hover__detail-list {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+        .visionmark-progress-hover__detail-item {
+          padding: 8px 10px;
+          border-radius: 10px;
+          background: rgba(255, 255, 255, 0.08);
+          font-size: 12px;
+          line-height: 1.55;
+          color: rgba(255, 255, 255, 0.9);
+          word-break: break-word;
+        }
+      `;
+      document.head.appendChild(style);
+    }
+
+    getProgressHoverCard() {
+      this.ensureProgressHoverCardStyle();
+
+      let card = document.getElementById('visionmark-progress-hover-card');
+      if (!card) {
+        card = document.createElement('div');
+        card.id = 'visionmark-progress-hover-card';
+        document.body.appendChild(card);
+      }
+
+      this.progressHoverCard = card;
+      return card;
+    }
+
+    hideProgressHoverCard() {
+      this.hoveredSegmentKey = null;
+      if (this.progressHoverCard) {
+        this.progressHoverCard.classList.remove('is-visible');
+      }
+    }
+
+    cleanupProgressHover() {
+      if (typeof this.progressHoverCleanup === 'function') {
+        this.progressHoverCleanup();
+      }
+      this.progressHoverCleanup = null;
+      this.progressHoverTarget = null;
+      this.hideProgressHoverCard();
+    }
+
+    formatTimeLabel(seconds) {
+      const safeSeconds = Math.max(0, Number(seconds) || 0);
+      const wholeSeconds = Math.floor(safeSeconds);
+      const hours = Math.floor(wholeSeconds / 3600);
+      const minutes = Math.floor((wholeSeconds % 3600) / 60);
+      const secs = wholeSeconds % 60;
+
+      if (hours > 0) {
+        return `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+      }
+      return `${minutes}:${String(secs).padStart(2, '0')}`;
+    }
+
+    findSegmentByTime(timeSec) {
+      if (!Number.isFinite(timeSec) || !Array.isArray(this.segments) || !this.segments.length) return null;
+
+      const exactMatch = this.segments.find(segment => timeSec >= segment.start_time && timeSec <= segment.end_time);
+      if (exactMatch) return exactMatch;
+
+      const duration = Number(this.player?.getState?.().duration) || 0;
+      const maxSnapDistance = duration > 0
+        ? Math.min(24, Math.max(8, duration * 0.05))
+        : 12;
+
+      let nearestSegment = null;
+      let nearestDistance = Infinity;
+      for (const segment of this.segments) {
+        const distance = Math.min(
+          Math.abs(timeSec - segment.start_time),
+          Math.abs(timeSec - segment.end_time)
+        );
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearestSegment = segment;
+        }
+      }
+
+      return nearestDistance <= maxSnapDistance ? nearestSegment : null;
+    }
+
+    getKnowledgeDetailsForRange(segment) {
+      if (!segment || !Array.isArray(this.knowledgeDanmuQueue) || !this.knowledgeDanmuQueue.length) {
+        return [];
+      }
+
+      const rangePadding = 4;
+      const matched = this.knowledgeDanmuQueue.filter(item =>
+        item.timeSec >= (segment.start_time - rangePadding) && item.timeSec <= (segment.end_time + rangePadding)
+      );
+
+      return matched.slice(0, 3).map(item => {
+        const prefix = item.type === 'hot-word' ? '热词' : '知识点';
+        return `${prefix} ${this.formatTimeLabel(item.timeSec)}  ${item.text}`;
+      });
+    }
+
+    getSegmentHoverDetails(segment) {
+      if (!segment) return [];
+
+      const details = [];
+      if (segment.content) {
+        details.push(segment.content.trim());
+      }
+
+      const knowledgeDetails = this.getKnowledgeDetailsForRange(segment);
+      knowledgeDetails.forEach(item => {
+        if (!details.includes(item)) {
+          details.push(item);
+        }
+      });
+
+      if (!details.length && this.aiSummary) {
+        details.push(this.aiSummary.trim());
+      }
+
+      return details.slice(0, 3);
+    }
+
+    findNativeProgressPreview() {
+      const selectors = [
+        '.bpx-player-progress-preview',
+        '.bpx-player-progress-thumbnail',
+        '.bpx-player-progress-detail',
+        '.bilibili-player-video-progress-detail',
+        '.bilibili-player-video-progress-thumbnail',
+        '[class*="progress-preview"]',
+        '[class*="progress-thumbnail"]'
+      ];
+
+      for (const selector of selectors) {
+        const element = document.querySelector(selector);
+        if (!element) continue;
+
+        const rect = element.getBoundingClientRect();
+        const computedStyle = window.getComputedStyle(element);
+        if (rect.width > 20 && rect.height > 20 && computedStyle.visibility !== 'hidden' && computedStyle.display !== 'none') {
+          return { element, rect };
+        }
+      }
+
+      return null;
+    }
+
+    positionProgressHoverCard(card, anchorClientX, progressRect) {
+      const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+      const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+      const preview = this.findNativeProgressPreview();
+      const cardRect = card.getBoundingClientRect();
+      const gap = 16;
+
+      let left = Math.min(anchorClientX + gap, viewportWidth - cardRect.width - 12);
+      let top = progressRect.top - cardRect.height - 22;
+
+      if (preview?.rect) {
+        const previewRect = preview.rect;
+        left = previewRect.right + 18;
+        top = previewRect.top + Math.max(0, (previewRect.height - cardRect.height) / 2);
+
+        if (left + cardRect.width > viewportWidth - 12) {
+          left = previewRect.left - cardRect.width - 18;
+        }
+      }
+
+      if (left < 12) {
+        left = 12;
+      }
+      if (top < 12) {
+        top = Math.min(progressRect.bottom + 18, viewportHeight - cardRect.height - 12);
+      }
+      if (top + cardRect.height > viewportHeight - 12) {
+        top = Math.max(12, viewportHeight - cardRect.height - 12);
+      }
+
+      card.style.left = `${Math.round(left)}px`;
+      card.style.top = `${Math.round(top)}px`;
+    }
+
+    escapeHtml(value) {
+      return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    showProgressHoverCard(segment, anchorClientX, progressRect) {
+      const details = this.getSegmentHoverDetails(segment);
+      if (!details.length) {
+        this.hideProgressHoverCard();
+        return;
+      }
+
+      const card = this.getProgressHoverCard();
+      const segmentKey = this.getSegmentKey(segment);
+      const isPopup = segment.action === 'popup';
+      const badgeText = isPopup ? '重点' : '跳过';
+      const titleText = this.escapeHtml(details[0]);
+      const extraDetails = details.slice(1);
+      const timeLabel = `${this.formatTimeLabel(segment.start_time)} - ${this.formatTimeLabel(segment.end_time)}`;
+
+      if (this.hoveredSegmentKey !== segmentKey) {
+        card.innerHTML = `
+          <div class="visionmark-progress-hover__eyebrow">
+            <span class="visionmark-progress-hover__badge ${isPopup ? 'visionmark-progress-hover__badge--popup' : 'visionmark-progress-hover__badge--skip'}">${badgeText}</span>
+            <span>${this.escapeHtml(timeLabel)}</span>
+          </div>
+          <p class="visionmark-progress-hover__title">${titleText}</p>
+          ${extraDetails.length ? `
+            <div class="visionmark-progress-hover__detail-list">
+              ${extraDetails.map(text => `<div class="visionmark-progress-hover__detail-item">${this.escapeHtml(text)}</div>`).join('')}
+            </div>
+          ` : ''}
+        `;
+        this.hoveredSegmentKey = segmentKey;
+      }
+
+      card.classList.add('is-visible');
+      this.positionProgressHoverCard(card, anchorClientX, progressRect);
+    }
+
+    bindProgressHover(progressContainer, progressSlide, duration) {
+      const hoverTargets = [progressContainer, progressSlide].filter(Boolean);
+      if (!hoverTargets.length || !Number.isFinite(duration) || duration <= 0) return;
+      if (this.progressHoverTarget === hoverTargets[0]) return;
+
+      this.cleanupProgressHover();
+      this.progressHoverTarget = hoverTargets[0];
+
+      const resolveHoverRect = () => {
+        const containerRect = progressContainer?.getBoundingClientRect?.();
+        if (containerRect && containerRect.width > 0) return containerRect;
+        const slideRect = progressSlide?.getBoundingClientRect?.();
+        if (slideRect && slideRect.width > 0) return slideRect;
+        return null;
+      };
+
+      const isWithinHoverZone = (event, rect) => {
+        if (!rect?.width) return false;
+
+        const preview = this.findNativeProgressPreview();
+        const previewRect = preview?.rect || null;
+        const zoneLeft = Math.min(rect.left, previewRect?.left ?? rect.left);
+        const zoneRight = Math.max(rect.right, previewRect?.right ?? rect.right);
+        const zoneTop = Math.min(rect.top - 160, previewRect ? previewRect.top - 24 : rect.top - 160);
+        const zoneBottom = Math.max(rect.bottom + 28, previewRect ? previewRect.bottom + 24 : rect.bottom + 28);
+
+        return event.clientX >= zoneLeft && event.clientX <= zoneRight && event.clientY >= zoneTop && event.clientY <= zoneBottom;
+      };
+
+      const handleHoverMove = (event) => {
+        const rect = resolveHoverRect();
+        if (!rect?.width) return;
+
+        if (!isWithinHoverZone(event, rect)) {
+          this.hideProgressHoverCard();
+          return;
+        }
+
+        const percent = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+        const currentTime = percent * duration;
+        const segment = this.findSegmentByTime(currentTime);
+
+        if (!segment) {
+          this.hideProgressHoverCard();
+          return;
+        }
+
+        this.showProgressHoverCard(segment, event.clientX, rect);
+      };
+
+      const handleMouseLeave = () => {
+        this.hideProgressHoverCard();
+      };
+
+      hoverTargets.forEach(target => {
+        target.addEventListener('mousemove', handleHoverMove);
+        target.addEventListener('mouseleave', handleMouseLeave);
+      });
+      document.addEventListener('mousemove', handleHoverMove, true);
+      window.addEventListener('blur', handleMouseLeave);
+      document.addEventListener('scroll', handleMouseLeave, true);
+
+      this.progressHoverCleanup = () => {
+        hoverTargets.forEach(target => {
+          target.removeEventListener('mousemove', handleHoverMove);
+          target.removeEventListener('mouseleave', handleMouseLeave);
+        });
+        document.removeEventListener('mousemove', handleHoverMove, true);
+        window.removeEventListener('blur', handleMouseLeave);
+        document.removeEventListener('scroll', handleMouseLeave, true);
       };
     }
 
@@ -1093,6 +1458,7 @@
       this.currentSegmentIds = [];
       this.updateKnowledgeDanmuSource(allDanmuItems, bvid);
       this.addSegmentMarkers();
+        this.scheduleSegmentMarkerRetry(2);
 
       if (sidebarState) {
         sidebarState.aiSummary = this.aiSummary || '暂无总结';
@@ -2026,11 +2392,30 @@
       }
     }
 
-    addSegmentMarkers() {
+    scheduleSegmentMarkerRetry(attempt = 1) {
+      if (this.segmentMarkerRetryTimer) {
+        clearTimeout(this.segmentMarkerRetryTimer);
+        this.segmentMarkerRetryTimer = null;
+      }
+
+      if (attempt > 8) {
+        console.warn('[AdSkipper] progress hover: retry limit reached');
+        return;
+      }
+
+      const delayMs = 250 * attempt;
+      console.log(`[AdSkipper] progress hover: scheduling retry #${attempt} in ${delayMs}ms`);
+      this.segmentMarkerRetryTimer = setTimeout(() => {
+        this.segmentMarkerRetryTimer = null;
+        this.addSegmentMarkers(attempt + 1);
+      }, delayMs);
+    }
+    addSegmentMarkers(retryAttempt = 1) {
       const oldMarkers = document.querySelectorAll('.adskipper-progress-marker');
       oldMarkers.forEach(marker => marker.remove());
 
       if (!this.segments.length) {
+        console.log('[AdSkipper] progress hover: skip binding because segments are empty');
         return;
       }
 
@@ -2038,22 +2423,40 @@
         document.querySelector('.bilibili-player-progress') ||
         document.querySelector('.bpx-player-progress-wrap');
       if (!progressContainer) {
+        console.warn('[AdSkipper] progress hover: progressContainer not found');
+        this.scheduleSegmentMarkerRetry(retryAttempt);
         return;
       }
 
       const duration = this.player.getState().duration;
       if (!duration || duration <= 0) {
+        console.warn('[AdSkipper] progress hover: invalid duration', duration);
+        this.scheduleSegmentMarkerRetry(retryAttempt);
         return;
       }
 
       const progressSlide = progressContainer.querySelector('.bpx-player-progress-slide') ||
         progressContainer.querySelector('.bili-progress-slip') ||
         progressContainer.querySelector('.bpx-player-progress-buffer');
+      const markerHost = progressSlide || progressContainer;
       if (!progressSlide) {
-        return;
+        console.warn('[AdSkipper] progress hover: progressSlide not found, fallback to progressContainer', progressContainer.className || progressContainer.id);
       }
 
-      progressSlide.style.position = progressSlide.style.position || 'relative';
+      if (this.segmentMarkerRetryTimer) {
+        clearTimeout(this.segmentMarkerRetryTimer);
+        this.segmentMarkerRetryTimer = null;
+      }
+
+      markerHost.style.position = markerHost.style.position || 'relative';
+
+      console.log('[AdSkipper] progress hover: binding listeners', {
+        segmentCount: this.segments.length,
+        duration,
+        progressContainer: progressContainer.className || progressContainer.id,
+        progressSlide: progressSlide ? (progressSlide.className || progressSlide.id) : '(fallback:container)'
+      });
+      this.bindProgressHover(progressContainer, markerHost, duration);
 
       this.segments.forEach((segment, index) => {
         const startPercent = (segment.start_time / duration) * 100;
@@ -2086,7 +2489,7 @@
         const actionText = segment.action === 'popup' ? '重点' : '跳过';
         marker.title = `${segment.start_time.toFixed(1)}s - ${segment.end_time.toFixed(1)}s | ${actionText}${titleContent}`;
 
-        progressSlide.appendChild(marker);
+        markerHost.appendChild(marker);
       });
     }
 
@@ -2097,5 +2500,12 @@
 
   new AdSkipperCore().init();
 })();
+
+
+
+
+
+
+
 
 
