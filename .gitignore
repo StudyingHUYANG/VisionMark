@@ -1,13 +1,18 @@
 # Dependencies
 node_modules/
+.venv/
 
 # Database
+*.db
 *.db-shm
 *.db-wal
-*.db
+server/database/app.db
 
 # Environment variables
 .env
+
+# Logs
+*.log
 
 # System files
 .DS_Store
@@ -26,3 +31,7 @@ CLAUDE.md
 build_output.txt
 dist
 build_test.js
+downloads/
+
+# Local configuration
+.claude/settings.local.json

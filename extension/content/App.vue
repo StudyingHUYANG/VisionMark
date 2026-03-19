@@ -6,7 +6,7 @@
       <p>当前播放时间: <strong>{{ videoState.currentTime.toFixed(2) }}s</strong></p>
       <p>当前视频 BV 号: {{ videoState.bvid || '未获取' }}</p>
       <p>
-        广告段数: {{ videoState.segments.length }}
+        分段评价数: {{ videoState.segments.length }}
       </p>
     </div>
   </div>

@@ -1,7 +1,7 @@
 {
   "name": "bilibili-ad-skipper-server",
   "version": "1.0.0",
-  "description": "广告跳过众包服务",
+  "description": "视频分段评价众包服务",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
