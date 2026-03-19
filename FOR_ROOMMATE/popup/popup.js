@@ -1,4 +1,4 @@
-const API_BASE = 'http://localhost:8080/api/v1';
+const API_BASE = 'http://localhost:3000/api/v1';
 
 // 统一的API请求函数
 async function apiRequest(endpoint, options = {}) {
