@@ -88,94 +88,111 @@
 
     init() {
       console.log("[AdSkipper] 初始化...");
+      
+      // 1. Load preferences
+      this.initPrefs();
+
+      // 2. Start UI Keeper to ensure buttons persist
+      this.startUiKeeper();
+
+      // 3. Init global event listeners
+      this.initGlobalListeners();
+
+      // 4. Initialize player connection
       this.player.init().then(ok => {
-        if (!ok) return;
+        if (!ok) {
+           console.log('[AdSkipper] 暂未找到播放器，Keeper将继续尝试');
+           return;
+        }
+        this.onPlayerReady();
+      });
+    }
 
-        // 检查登录状态
-        chrome.storage.local.get(['adskipper_token'], (storage) => {
-          const token = storage.adskipper_token;
-          console.log('[AdSkipper] 登录状态:', token ? '已登录' : '未登录');
+    initPrefs() {
+        chrome.storage.local.get(['adskipper_token'], (s) => console.log('[AdSkipper] 登录状态:', s.adskipper_token ? '已登录' : '未登录'));
+        chrome.storage.local.get(['skip_mode'], (s) => {
+            this.skipMode = s.skip_mode || 'auto';
+            console.log("[AdSkipper] 跳过模式:", this.skipMode);
         });
-
-        // 加载跳过模式设置
-        chrome.storage.local.get(['skip_mode'], (storage) => {
-          this.skipMode = storage.skip_mode || 'auto';
-          console.log("[AdSkipper] 跳过模式:", this.skipMode);
-        });
-
-        // 监听跳过模式变化
         chrome.storage.onChanged.addListener((changes, area) => {
           if (area === 'local' && changes.skip_mode) {
             this.skipMode = changes.skip_mode.newValue || 'auto';
-            console.log("[AdSkipper] 跳过模式已更新:", this.skipMode);
-            // 如果切换到自动模式，立即隐藏按钮
-            if (this.skipMode === 'auto') {
-              this.hideSkipButton();
-            }
+            if (this.skipMode === 'auto') this.hideSkipButton();
           }
         });
+    }
 
-        // ==========================
-        // Vue 侧边栏初始化
-        // ==========================
-        this.initSidebar().then(() => {
-          console.log('[AdSkipper] 侧边栏初始化完成');
-        }).catch(err => {
-          console.error("[AdSkipper] Sidebar 初始化失败:", err);
-        });
-
+    startUiKeeper() {
+        // Initial setup
         this.initAiFloatingButton();
+        this.initSidebar().catch(e => console.error(e));
 
-        this.player.onTimeUpdate = (t) => this.checkSkip(t);
-        this.startInjectionObserver();
+        // Periodic check loop
+        setInterval(() => {
+            const fab = document.getElementById('visionmark-ai-fab');
+            if (!fab) {
+                console.log('[AdSkipper] Keeper: Restore AI FAB');
+                this.initAiFloatingButton();
+            }
+            
+            const sidebarRoot = document.getElementById('vm-sidebar-root');
+            if (!sidebarRoot) {
+                // console.log('[AdSkipper] Keeper: Restore Sidebar Root'); // Reduce log noise
+                this.initSidebar().catch(() => {});
+            }
 
-        const bvid = this.player.currentBvid;
-        if (bvid) {
-          this.refreshAnalysisForBvid(bvid).then(() => {
-            window.adSkipper = this;
-          });
-        }
-      });
+            // Restore segment markers if needed
+            if (this.segments && this.segments.length > 0) {
+                 const markers = document.querySelectorAll('.adskipper-progress-marker');
+                 if (markers.length === 0) {
+                     // Check if progress bar exists before trying to add
+                     const progressBar = document.querySelector('.bpx-player-progress') || 
+                                         document.querySelector('.bilibili-player-progress') ||
+                                         document.querySelector('.bpx-player-progress-wrap');
+                     if (progressBar) {
+                        console.log('[AdSkipper] Keeper: Restore markers');
+                        this.addSegmentMarkers();
+                     }
+                 }
+            }
+        }, 1500);
+    }
 
-      // Global click listener for closing popover
+    initGlobalListeners() {
       document.addEventListener('click', (e) => {
         const wrapper = document.getElementById('adskipper-wrapper');
-        if (wrapper && !wrapper.contains(e.target)) {
-          this.togglePopover(false);
-        }
-
+        if (wrapper && !wrapper.contains(e.target)) this.togglePopover(false);
       });
-
-      // ESC key listener
       document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
           this.togglePopover(false);
-          if (this.sidebarController) {
-            this.sidebarController.hide();
-          }
+          if (this.sidebarController) this.sidebarController.hide();
         }
       });
-
-      window.addEventListener('visionmark:seek', (event) => {
-        const time = Number(event?.detail?.time);
-        if (!Number.isFinite(time)) return;
-        this.player.skipTo(Math.max(time, 0));
+      window.addEventListener('visionmark:seek', (e) => {
+        const time = Number(e?.detail?.time);
+        if (Number.isFinite(time)) this.player.skipTo(Math.max(time, 0));
       });
-
       window.addEventListener('visionmark:refresh-ai', () => {
         if (this.player.currentBvid) {
-          this.refreshAnalysisForBvid(this.player.currentBvid, { forceAnalyze: true });
+           this.refreshAnalysisForBvid(this.player.currentBvid, { forceAnalyze: true });
         }
       });
-
-      window.addEventListener('visionmark:delete-segment', (event) => {
-        const segmentId = Number(event?.detail?.segmentId);
-        this.handleSidebarDelete(segmentId);
-      });
-
-      // 调试：将实例暴露到全局，便于控制台调试
+      window.addEventListener('visionmark:delete-segment', (e) => this.handleSidebarDelete(Number(e?.detail?.segmentId)));
+      
       window.adSkipperDebug = this;
-      console.log('[AdSkipper] 调试模式已启用，使用: adSkipperDebug.addSegmentMarkers() 手动添加标记');
+      console.log('[AdSkipper] 调试模式已启用');
+    }
+
+    onPlayerReady() {
+        console.log('[AdSkipper] Player Ready');
+        this.player.onTimeUpdate = (t) => this.checkSkip(t);
+        this.startInjectionObserver();
+        
+        const bvid = this.player.currentBvid;
+        if (bvid) {
+          this.refreshAnalysisForBvid(bvid).then(() => window.adSkipper = this);
+        }
     }
 
     async initSidebar() {
