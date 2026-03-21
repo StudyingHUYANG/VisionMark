@@ -22,7 +22,8 @@ class BilibiliPlayerController {
 
     for (const selector of selectors) {
       const video = document.querySelector(selector);
-      if (video && video.readyState >= 1) {
+      // Relaxed check: don't require readyState >= 1 immediately for initial detection
+      if (video) {
         this.video = video;
         console.log('[AdSkipper] Video found');
         break;
