@@ -673,7 +673,7 @@ ${transcript || '无语音内容'}
 
     // 添加图片（使用base64编码）
     for (const frame of frames) {
-      const framePath = path.join(framesDir, frame);
+      const framePath = path.join(framesDir, frame.file);
       const imageBuffer = fs.readFileSync(framePath);
       const base64Image = imageBuffer.toString('base64');
 
