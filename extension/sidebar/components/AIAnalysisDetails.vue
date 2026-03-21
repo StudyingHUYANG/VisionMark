@@ -43,17 +43,28 @@
         <span
           v-for="(word, index) in hotWords"
           :key="index"
-          class="vm-analysis-tag"
+          class="vm-analysis-tag clickable"
           :style="{ fontSize: `${Math.max(12, 16 - index * 0.5)}px` }"
+          @click="openHotWordDialog(word)"
         >
           {{ formatHotWord(word) }}
         </span>
       </div>
     </div>
+    
+    <HotWordDialog 
+      v-model:visible="dialogVisible"
+      :word="currentWord"
+      :explanation="currentExplanation"
+      :timestamp="currentTimestamp"
+    />
   </div>
 </template>
 
 <script setup>
+import { ref } from 'vue';
+import HotWordDialog from './HotWordDialog.vue';
+
 const props = defineProps({
   title: {
     type: String,
@@ -68,6 +79,20 @@ const props = defineProps({
     default: () => []
   }
 });
+
+const dialogVisible = ref(false);
+const currentWord = ref('');
+const currentExplanation = ref('');
+const currentTimestamp = ref('');
+
+function openHotWordDialog(wordObj) {
+  if (!wordObj) return;
+  // 支持不同的字段命名习惯
+  currentWord.value = normalizeText(wordObj.word || wordObj.term || wordObj.name);
+  currentExplanation.value = normalizeText(wordObj.explanation || wordObj.meaning || wordObj.desc || '');
+  currentTimestamp.value = normalizeText(wordObj.timestamp || '');
+  dialogVisible.value = true;
+}
 
 function normalizeText(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -235,5 +260,15 @@ function formatHotWord(word) {
   background: linear-gradient(135deg, rgba(251, 114, 153, 0.15), rgba(255, 142, 159, 0.12));
   border-color: rgba(251, 114, 153, 0.3);
   transform: translateY(-1px);
+}
+
+.vm-analysis-tag.clickable {
+  cursor: pointer;
+  box-shadow: 0 2px 4px rgba(251, 114, 153, 0.05);
+}
+
+.vm-analysis-tag.clickable:active {
+  transform: translateY(0);
+  box-shadow: none;
 }
 </style>

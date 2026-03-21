@@ -961,7 +961,7 @@
       const explanation = typeof point.explanation === 'string' ? point.explanation.trim() : '';
       // 处理热词（hot_words）
       const word = typeof point.word === 'string' ? point.word.trim() : '';
-      const meaning = typeof point.meaning === 'string' ? point.meaning.trim() : '';
+      const meaning = typeof (point.meaning || point.explanation) === 'string' ? (point.meaning || point.explanation).trim() : '';
 
       // 知识点格式：术语: 解释
       // 热词格式：[热词] 解释
@@ -990,7 +990,7 @@
           if (!Number.isFinite(seconds) || !text) return null;
 
           // 判断是热词还是知识点
-          const isHotWord = typeof point === 'object' && point.word && point.meaning;
+          const isHotWord = typeof point === 'object' && point.word && (point.meaning || point.explanation);
           const type = isHotWord ? 'hot-word' : 'knowledge-point';
 
           return {
