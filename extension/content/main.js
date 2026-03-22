@@ -33,9 +33,7 @@
   const typeLabels = {
     'hard_ad': '商业内容',
     'soft_ad': '推广内容',
-    'product_placement': '品牌植入',
-    'intro_ad': '片头广告',
-    'mid_ad': '中段广告'
+    'product_placement': '品牌植入'
   };
 
   class AdSkipperCore {
@@ -552,7 +550,7 @@
         end_time: end,
         action,
         content,
-        ad_type: segment.ad_type || (action === 'skip' ? 'hard_ad' : 'mid_ad'),
+        ad_type: segment.ad_type || (action === 'skip' ? 'hard_ad' : 'product_placement'),
         hasActionField: typeof segment.action === 'string'
       };
     }
@@ -2019,9 +2017,7 @@
       const types = [
         { val: 'hard_ad', text: '商业内容' },
         { val: 'soft_ad', text: '推广内容' },
-        { val: 'product_placement', text: '品牌植入' },
-        { val: 'intro_ad', text: '片头广告' },
-        { val: 'mid_ad', text: '中段广告' }
+        { val: 'product_placement', text: '品牌植入' }
       ];
       types.forEach((item) => {
         const option = document.createElement('option');
