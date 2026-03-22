@@ -90,6 +90,8 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       this.chapterTimelineController = createChapterTimelineInjector();
       this.routeWatcherCleanup = null;
       this.lastRouteBvid = null;
+      this.hotWordPopupLayer = null;
+      this.currentHotWordId = null;
     }
 
     init() {
@@ -1096,7 +1098,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       const explanation = typeof point.explanation === 'string' ? point.explanation.trim() : '';
       // 处理热词（hot_words）
       const word = typeof point.word === 'string' ? point.word.trim() : '';
-      const meaning = typeof point.meaning === 'string' ? point.meaning.trim() : '';
+      const meaning = typeof (point.meaning || point.explanation) === 'string' ? (point.meaning || point.explanation).trim() : '';
 
       // 知识点格式：术语: 解释
       // 热词格式：[热词] 解释
@@ -1125,14 +1127,16 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           if (!Number.isFinite(seconds) || !text) return null;
 
           // 判断是热词还是知识点
-          const isHotWord = typeof point === 'object' && point.word && point.meaning;
+          const isHotWord = typeof point === 'object' && point.word && (point.meaning || point.explanation);
           const type = isHotWord ? 'hot-word' : 'knowledge-point';
 
           return {
             id: `${bvid || 'unknown'}-${Math.round(seconds * 10)}-${index}`,
             timeSec: seconds,
             text,
-            type // 添加类型标识
+            type, // 添加类型标识
+            rawWord: point.word || point.term || null,
+            rawExplanation: point.explanation || point.meaning || null
           };
         })
         .filter(Boolean)
@@ -1167,6 +1171,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       this.lastNativeSpeedSampleTs = 0;
       this.nativeDanmuTrackSample = null;
       this.clearKnowledgeDanmuNodes();
+      this.hideHotWordPopup();
     }
 
     ensureKnowledgeDanmuLayer() {
@@ -1535,6 +1540,99 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       this.syncKnowledgeDanmuAnimationState();
     }
 
+    ensureHotWordPopupLayer() {
+      const container = document.querySelector('.bpx-player-video-wrap') ||
+        document.querySelector('.bpx-player-video-area') ||
+        document.querySelector('.bpx-player-container') ||
+        document.querySelector('#bilibili-player');
+
+      if (!container) return null;
+
+      if (getComputedStyle(container).position === 'static') {
+        container.style.position = 'relative';
+      }
+
+      if (!this.hotWordPopupLayer || !document.body.contains(this.hotWordPopupLayer)) {
+        this.hotWordPopupLayer = document.createElement('div');
+        this.hotWordPopupLayer.className = 'visionmark-hotword-popup-layer';
+        this.hotWordPopupLayer.style.cssText = `
+          position: absolute;
+          bottom: 60px; /* 进度条上方 */
+          left: 20px;   /* 视频界面左下角 */
+          z-index: 99999;
+          pointer-events: none;
+          transition: opacity 0.3s ease, transform 0.3s ease;
+          opacity: 0;
+          transform: translateY(10px);
+        `;
+        container.appendChild(this.hotWordPopupLayer);
+      }
+      return this.hotWordPopupLayer;
+    }
+
+    renderHotWordPopup(item) {
+      const layer = this.ensureHotWordPopupLayer();
+      if (!layer) return;
+
+      if (this.currentHotWordId === item.id) return; // 防止重复渲染
+      this.currentHotWordId = item.id;
+
+      const word = item.rawWord || '小知识';
+      const explanation = item.rawExplanation || '暂无详细解释';
+
+      layer.innerHTML = `
+        <div style="background: rgba(0, 0, 0, 0.3);
+                    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+                    border-radius: 8px; padding: 10px 14px;
+                    max-width: 320px; pointer-events: none;
+                    display: flex; flex-direction: column; gap: 6px;">
+           <div style="display: flex; align-items: center; gap: 6px;">
+             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fb7299" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 2c0 0-5 6-5 12a5 5 0 0 0 10 0c0-6-5-12-5-12Z"/>
+                <path d="M12 2v10"/>
+             </svg>
+             <span style="font-size: 16px; font-weight: bold; color: #fb7299; margin: 0; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);">${this.escapeHtml(word)}</span>
+           </div>
+           <div style="font-size: 13px; color: #fff; line-height: 1.5; font-weight: 500; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);">${this.escapeHtml(explanation)}</div>
+        </div>
+      `;
+      
+      layer.style.opacity = '1';
+      layer.style.transform = 'translateY(0)';
+    }
+
+    hideHotWordPopup() {
+      if (this.hotWordPopupLayer && this.hotWordPopupLayer.style.opacity !== '0') {
+        this.hotWordPopupLayer.style.opacity = '0';
+        this.hotWordPopupLayer.style.transform = 'translateY(10px)';
+        this.currentHotWordId = null;
+      }
+    }
+
+    handleHotWordPopup(currentTime) {
+      if (!Number.isFinite(currentTime) || !this.knowledgeDanmuQueue || !this.knowledgeDanmuQueue.length) {
+        this.hideHotWordPopup();
+        return;
+      }
+
+      // 寻找当前时间点处于 [timeSec, timeSec + 5秒] 内的热词
+      let activeHotWord = null;
+      for (const item of this.knowledgeDanmuQueue) {
+        if (item.type === 'hot-word') {
+          if (currentTime >= item.timeSec && currentTime <= item.timeSec + 5) {
+            activeHotWord = item;
+            break;
+          }
+        }
+      }
+
+      if (activeHotWord) {
+        this.renderHotWordPopup(activeHotWord);
+      } else {
+        this.hideHotWordPopup();
+      }
+    }
+
 
     async requestAnalysis(bvid, token) {
       const url = VIDEO_ANALYSIS_BASE + "/video-analysis/analyze";
@@ -1803,6 +1901,13 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       if (!segment || segment.action !== 'skip') return;
 
       if (this.skipMode === 'auto') {
+        const segKey = this.getSegmentKey(segment);
+        if (!this.autoSkippedSegments) this.autoSkippedSegments = new Set();
+        
+        // 确保每个片段在一次播放中只会被自动跳过一次
+        if (this.autoSkippedSegments.has(segKey)) return;
+        this.autoSkippedSegments.add(segKey);
+
         this.seekToSegmentEnd(segment);
         this.lastSkipTime = Date.now();
         this.showSkipNotification(segment);
@@ -1814,12 +1919,25 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       }
     }
 
-    // 鏇存柊鍚庣殑 checkSkip 鏂规硶
+    // 更新后的 checkSkip 方法
     checkSkip(currentTime) {
       if (this.analysisBvid && this.player.currentBvid && this.analysisBvid !== this.player.currentBvid) {
+        console.log('[AdSkipper] 视频切换检测到！由', this.analysisBvid, '切换为', this.player.currentBvid);
         this.clearKnowledgeDanmuState();
         this.analysisBvid = this.player.currentBvid;
+        this.autoSkippedSegments = new Set();
+        
+        // 当页面未刷新单页跳转时，自动为新视频拉取总结/分析
+        this.refreshAnalysisForBvid(this.player.currentBvid);
       }
+
+      // 新增：检测进度条倒退（倒退超过2秒认为是回放或重播）
+      if (this.lastCheckedTime && currentTime < this.lastCheckedTime - 2) {
+          if (this.autoSkippedSegments) {
+              this.autoSkippedSegments.clear();
+          }
+      }
+      this.lastCheckedTime = currentTime;
 
       if (sidebarState) {
         sidebarState.currentTime = currentTime;
@@ -1832,6 +1950,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       }
 
       this.handleKnowledgeDanmu(currentTime);
+      this.handleHotWordPopup(currentTime);
 
       if (!this.segments.length) {
         if (sidebarState) {

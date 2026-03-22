@@ -57,20 +57,28 @@ class BilibiliPlayerController {
 
     if (urlMatch) {
       this.currentBvid = urlMatch[0];
-      console.log('[AdSkipper] BVID:', this.currentBvid);
-      return;
+    } else {
+      const initialState = window.__INITIAL_STATE__ || {};
+      const candidates = [
+        initialState?.bvid,
+        initialState?.videoData?.bvid,
+        initialState?.epInfo?.bvid,
+        initialState?.mediaInfo?.bvid
+      ];
+
+      const matchedBvid = candidates.find((candidate) => typeof candidate === 'string' && /^BV[a-zA-Z0-9]+$/i.test(candidate));
+      this.currentBvid = matchedBvid || null;
     }
 
     const initialState = window.__INITIAL_STATE__ || {};
-    const candidates = [
-      initialState?.bvid,
-      initialState?.videoData?.bvid,
-      initialState?.epInfo?.bvid,
-      initialState?.mediaInfo?.bvid
+    const cidCandidates = [
+      initialState?.cid,
+      initialState?.videoData?.cid,
+      initialState?.epInfo?.cid,
+      initialState?.mediaInfo?.cid
     ];
-
-    const matchedBvid = candidates.find((candidate) => typeof candidate === 'string' && /^BV[a-zA-Z0-9]+$/i.test(candidate));
-    this.currentBvid = matchedBvid || null;
+    const matchedCid = cidCandidates.find((candidate) => Number.isFinite(Number(candidate)) && Number(candidate) > 0);
+    this.currentCid = matchedCid ? Number(matchedCid) : null;
     console.log('[AdSkipper] BVID:', this.currentBvid);
   }
 
@@ -90,9 +98,23 @@ class BilibiliPlayerController {
   }
 
   setupListeners() {
-    if (!this.video) return;
     setInterval(() => {
-      if (this.onTimeUpdate) {
+      // 在 B 站这种 SPA 单页应用中，切换视频时页面不刷新但 URL 会变
+      const match = window.location.pathname.match(/BV[a-zA-Z0-9]+/);
+      const newBvid = match ? match[0] : null;
+      
+      if (newBvid && newBvid !== this.currentBvid) {
+        console.log('[AdSkipper] BVID changed from', this.currentBvid, 'to', newBvid);
+        this.extractVideoId();
+        
+        // 当视频切换时，原有 video 元素可能被销毁或替换，重新获取
+        const video = this.findVideoElement();
+        if (video) {
+          this.video = video;
+        }
+      }
+
+      if (this.video && this.onTimeUpdate) {
         this.onTimeUpdate(this.video.currentTime);
       }
     }, 200);
