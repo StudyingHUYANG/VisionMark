@@ -12,22 +12,10 @@ class BilibiliPlayerController {
   }
 
   tryFindVideo(callback, attempts) {
-    const selectors = [
-      'video[src*="bilivideo"]',
-      'video[class*="bilateral-player"]',
-      'bpx-player-video-wrap video',
-      '.bilibili-player-video video',
-      'video'
-    ];
-
-    for (const selector of selectors) {
-      const video = document.querySelector(selector);
-      // Relaxed check: don't require readyState >= 1 immediately for initial detection
-      if (video) {
-        this.video = video;
-        console.log('[AdSkipper] Video found');
-        break;
-      }
+    const video = this.findVideoElement();
+    if (video) {
+      this.video = video;
+      console.log('[AdSkipper] Video found');
     }
 
     if (this.video) {
@@ -45,15 +33,68 @@ class BilibiliPlayerController {
     callback(false);
   }
 
+  findVideoElement() {
+    const selectors = [
+      'video[src*="bilivideo"]',
+      'video[class*="bilateral-player"]',
+      'bpx-player-video-wrap video',
+      '.bilibili-player-video video',
+      'video'
+    ];
+
+    for (const selector of selectors) {
+      const video = document.querySelector(selector);
+      if (video) {
+        return video;
+      }
+    }
+
+    return null;
+  }
+
   extractVideoId() {
-    const match = window.location.pathname.match(/BV[a-zA-Z0-9]+/);
-    this.currentBvid = match ? match[0] : null;
+    const urlMatch = window.location.href.match(/BV[a-zA-Z0-9]+/i);
 
-    // 尝试获取 cid
-    const cidMatch = window.location.search.match(/p=(\d+)/);
-    this.currentCid = cidMatch ? cidMatch[1] : null;
+    if (urlMatch) {
+      this.currentBvid = urlMatch[0];
+    } else {
+      const initialState = window.__INITIAL_STATE__ || {};
+      const candidates = [
+        initialState?.bvid,
+        initialState?.videoData?.bvid,
+        initialState?.epInfo?.bvid,
+        initialState?.mediaInfo?.bvid
+      ];
 
-    console.log('[AdSkipper] Initial BVID:', this.currentBvid);
+      const matchedBvid = candidates.find((candidate) => typeof candidate === 'string' && /^BV[a-zA-Z0-9]+$/i.test(candidate));
+      this.currentBvid = matchedBvid || null;
+    }
+
+    const initialState = window.__INITIAL_STATE__ || {};
+    const cidCandidates = [
+      initialState?.cid,
+      initialState?.videoData?.cid,
+      initialState?.epInfo?.cid,
+      initialState?.mediaInfo?.cid
+    ];
+    const matchedCid = cidCandidates.find((candidate) => Number.isFinite(Number(candidate)) && Number(candidate) > 0);
+    this.currentCid = matchedCid ? Number(matchedCid) : null;
+    console.log('[AdSkipper] BVID:', this.currentBvid);
+  }
+
+  refreshContext(nextBvid = null) {
+    const nextVideo = this.findVideoElement();
+    if (nextVideo) {
+      this.video = nextVideo;
+    }
+
+    if (nextBvid) {
+      this.currentBvid = nextBvid;
+    } else {
+      this.extractVideoId();
+    }
+
+    return Boolean(this.video);
   }
 
   setupListeners() {
@@ -64,10 +105,10 @@ class BilibiliPlayerController {
       
       if (newBvid && newBvid !== this.currentBvid) {
         console.log('[AdSkipper] BVID changed from', this.currentBvid, 'to', newBvid);
-        this.currentBvid = newBvid;
+        this.extractVideoId();
         
         // 当视频切换时，原有 video 元素可能被销毁或替换，重新获取
-        const video = document.querySelector('video[src*="bilivideo"], video[class*="bilateral-player"], bpx-player-video-wrap video, .bilibili-player-video video, video');
+        const video = this.findVideoElement();
         if (video) {
           this.video = video;
         }
