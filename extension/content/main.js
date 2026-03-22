@@ -1777,13 +1777,25 @@
       }
     }
 
-    // 鏇存柊鍚庣殑 checkSkip 鏂规硶
+    // 更新后的 checkSkip 方法
     checkSkip(currentTime) {
       if (this.analysisBvid && this.player.currentBvid && this.analysisBvid !== this.player.currentBvid) {
+        console.log('[AdSkipper] 视频切换检测到！由', this.analysisBvid, '切换为', this.player.currentBvid);
         this.clearKnowledgeDanmuState();
         this.analysisBvid = this.player.currentBvid;
         this.autoSkippedSegments = new Set();
+        
+        // 当页面未刷新单页跳转时，自动为新视频拉取总结/分析
+        this.refreshAnalysisForBvid(this.player.currentBvid);
       }
+
+      // 新增：检测进度条倒退（倒退超过2秒认为是回放或重播）
+      if (this.lastCheckedTime && currentTime < this.lastCheckedTime - 2) {
+          if (this.autoSkippedSegments) {
+              this.autoSkippedSegments.clear();
+          }
+      }
+      this.lastCheckedTime = currentTime;
 
       if (sidebarState) {
         sidebarState.currentTime = currentTime;
