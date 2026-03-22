@@ -611,9 +611,17 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       const end = Number(segment.end ?? segment.end_time ?? 0);
       const candidateAction = typeof segment.action === 'string' ? segment.action.toLowerCase() : '';
       const action = candidateAction === 'popup' || candidateAction === 'skip' ? candidateAction : 'skip';
+      const isAiSegment = Boolean(segment.is_ai_segment);
+      const aiSegmentDisplayType = isAiSegment
+        ? (segment.ai_segment_display_type === 'high-energy' || segment.ai_segment_display_type === 'clip'
+          ? segment.ai_segment_display_type
+          : (action === 'popup' ? 'high-energy' : 'clip'))
+        : null;
 
       const rawContent = typeof segment.content === 'string' ? segment.content.trim() : null;
-      const content = action === 'popup' ? (rawContent || null) : null;
+      const content = isAiSegment
+        ? (rawContent || null)
+        : (action === 'popup' ? (rawContent || null) : null);
 
       return {
         ...segment,
@@ -624,8 +632,53 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         end_time: end,
         action,
         content,
+        is_ai_segment: isAiSegment,
+        ai_segment_display_type: aiSegmentDisplayType,
         ad_type: segment.ad_type || (action === 'skip' ? 'hard_ad' : 'mid_ad'),
         hasActionField: typeof segment.action === 'string'
+      };
+    }
+
+    getAiSegmentDisplayType(segment) {
+      if (!segment?.is_ai_segment) return null;
+
+      if (segment.ai_segment_display_type === 'high-energy' || segment.ai_segment_display_type === 'clip') {
+        return segment.ai_segment_display_type;
+      }
+
+      return segment.action === 'popup' ? 'high-energy' : 'clip';
+    }
+
+    getOfficialProgressPresentation(segment) {
+      const aiSegmentDisplayType = this.getAiSegmentDisplayType(segment);
+
+      if (aiSegmentDisplayType === 'high-energy') {
+        return {
+          badgeText: '高能',
+          badgeClass: 'visionmark-progress-hover__badge--ai-high-energy',
+          markerColor: 'rgba(34, 197, 94, 0.88)',
+          actionText: '高能',
+          includeContentInMarkerTitle: true
+        };
+      }
+
+      if (aiSegmentDisplayType === 'clip') {
+        return {
+          badgeText: '片段',
+          badgeClass: 'visionmark-progress-hover__badge--ai-clip',
+          markerColor: 'rgba(250, 204, 21, 0.88)',
+          actionText: '片段',
+          includeContentInMarkerTitle: true
+        };
+      }
+
+      const isPopup = segment?.action === 'popup';
+      return {
+        badgeText: isPopup ? '重点' : '跳过',
+        badgeClass: isPopup ? 'visionmark-progress-hover__badge--popup' : 'visionmark-progress-hover__badge--skip',
+        markerColor: isPopup ? 'rgba(71, 167, 255, 0.88)' : 'rgba(251, 114, 153, 0.82)',
+        actionText: isPopup ? '重点' : '跳过',
+        includeContentInMarkerTitle: isPopup
       };
     }
 
@@ -680,6 +733,13 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         }
         .visionmark-progress-hover__badge--skip {
           background: linear-gradient(135deg, #fb7299, #ff9a8b);
+        }
+        .visionmark-progress-hover__badge--ai-high-energy {
+          background: linear-gradient(135deg, #16a34a, #4ade80);
+        }
+        .visionmark-progress-hover__badge--ai-clip {
+          background: linear-gradient(135deg, #eab308, #fde047);
+          color: #3b2f00;
         }
         .visionmark-progress-hover__title {
           margin: 0 0 8px;
@@ -892,8 +952,8 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
 
       const card = this.getProgressHoverCard();
       const segmentKey = this.getSegmentKey(segment);
-      const isPopup = segment.action === 'popup';
-      const badgeText = isPopup ? '重点' : '跳过';
+      const presentation = this.getOfficialProgressPresentation(segment);
+      const badgeText = presentation.badgeText;
       const titleText = this.escapeHtml(details[0]);
       const extraDetails = details.slice(1);
       const timeLabel = `${this.formatTimeLabel(segment.start_time)} - ${this.formatTimeLabel(segment.end_time)}`;
@@ -901,7 +961,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       if (this.hoveredSegmentKey !== segmentKey) {
         card.innerHTML = `
           <div class="visionmark-progress-hover__eyebrow">
-            <span class="visionmark-progress-hover__badge ${isPopup ? 'visionmark-progress-hover__badge--popup' : 'visionmark-progress-hover__badge--skip'}">${badgeText}</span>
+            <span class="visionmark-progress-hover__badge ${presentation.badgeClass}">${badgeText}</span>
             <span>${this.escapeHtml(timeLabel)}</span>
           </div>
           <p class="visionmark-progress-hover__title">${titleText}</p>
@@ -1523,7 +1583,8 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           action: segment.highlight ? 'popup' : 'skip',
           content: typeof segment.description === 'string' ? segment.description : '',
           ad_type: segment.ad_type || (segment.highlight ? 'hard_ad' : 'soft_ad'),
-          is_ai_segment: true
+          is_ai_segment: true,
+          ai_segment_display_type: segment.highlight ? 'high-energy' : 'clip'
         }, index))
         .filter(segment => Number.isFinite(segment.start_time) && Number.isFinite(segment.end_time) && segment.end_time > segment.start_time);
 
@@ -1628,15 +1689,18 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
               console.log("[AdSkipper] 发现", result.data.ad_segments.length, "个 AI 分析分段");
 
               // 将 AI 分段转换为 TimelineItem 期望的格式
-              const aiSegments = result.data.ad_segments.map((seg, index) => ({
-                id: `ai-${bvid}-${index}`, // 生成唯一 ID
-                start_time: seg.start_time,
-                end_time: seg.end_time,
-                action: seg.highlight ? 'popup' : 'skip', // highlight 为 true 时为重点
-                content: seg.description || '',
-                ad_type: seg.ad_type || (seg.highlight ? 'hard_ad' : 'soft_ad'),
-                is_ai_segment: true // 标记为 AI 分析的片段
-              }));
+              const aiSegments = result.data.ad_segments
+                .map((seg, index) => this.normalizeSegment({
+                  id: `ai-${bvid}-${index}`, // 生成唯一 ID
+                  start_time: Number(seg.start_time ?? seg.start ?? 0),
+                  end_time: Number(seg.end_time ?? seg.end ?? 0),
+                  action: seg.highlight ? 'popup' : 'skip', // highlight 为 true 时为重点
+                  content: typeof seg.description === 'string' ? seg.description : '',
+                  ad_type: seg.ad_type || (seg.highlight ? 'hard_ad' : 'soft_ad'),
+                  is_ai_segment: true, // 标记为 AI 分析的片段
+                  ai_segment_display_type: seg.highlight ? 'high-energy' : 'clip'
+                }, index))
+                .filter(segment => Number.isFinite(segment.start_time) && Number.isFinite(segment.end_time) && segment.end_time > segment.start_time);
 
               // 将 AI 分段添加到侧边栏
               sidebarState.segments = aiSegments;
@@ -2558,14 +2622,11 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         const startPercent = (segment.start_time / duration) * 100;
         const endPercent = (segment.end_time / duration) * 100;
         const width = Math.max(endPercent - startPercent, 0.8);
+        const presentation = this.getOfficialProgressPresentation(segment);
 
         const marker = document.createElement('div');
         marker.className = 'adskipper-progress-marker';
         marker.setAttribute('data-segment-id', this.getSegmentKey(segment, index));
-
-        const markerColor = segment.action === 'popup'
-          ? 'rgba(71, 167, 255, 0.88)'
-          : 'rgba(251, 114, 153, 0.82)';
 
         marker.style.cssText = `
           position: absolute;
@@ -2573,17 +2634,16 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           top: 0;
           bottom: 0;
           width: ${width}%;
-          background: ${markerColor} !important;
+          background: ${presentation.markerColor} !important;
           pointer-events: none;
           z-index: 999 !important;
           height: 100% !important;
         `;
 
-        const titleContent = segment.action === 'popup' && segment.content
+        const titleContent = presentation.includeContentInMarkerTitle && segment.content
           ? ` | ${segment.content.slice(0, 36)}`
           : '';
-        const actionText = segment.action === 'popup' ? '重点' : '跳过';
-        marker.title = `${segment.start_time.toFixed(1)}s - ${segment.end_time.toFixed(1)}s | ${actionText}${titleContent}`;
+        marker.title = `${segment.start_time.toFixed(1)}s - ${segment.end_time.toFixed(1)}s | ${presentation.actionText}${titleContent}`;
 
         markerHost.appendChild(marker);
       });
