@@ -39,14 +39,13 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS annotations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    video_id INTEGER,
+    video_id INTEGER NOT NULL,
     start_time REAL,
     end_time REAL,
     ad_type TEXT,
     contributor_id INTEGER,
     is_active BOOLEAN DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP -- 仅新增这一行
-    video_id INTEGER NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     source_type TEXT NOT NULL,              -- AI / HUMAN
     submitter_id INTEGER,                   -- HUMAN时是用户id，AI时可为空
     submitter_name TEXT,                    -- HUMAN时是用户名，AI时写'AI'
@@ -57,8 +56,7 @@ db.exec(`
     transcript TEXT,
     score REAL,
     content_json TEXT NOT NULL,             -- 统一存完整JSON
-    model_name TEXT,                        -- AI模型名
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    model_name TEXT                        -- AI模型名
   );
 
 `);
