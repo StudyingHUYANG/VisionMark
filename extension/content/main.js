@@ -1,3 +1,6 @@
+﻿import { createChapterTimelineInjector, watchBilibiliSpaRoute } from './chapterRail/inject.js';
+import { ANALYSIS_UPDATED_EVENT } from './events.js';
+
 (function () {
   'use strict';
 
@@ -29,11 +32,11 @@
     '.bilibili-player-video-danmaku [class*="danmaku"]'
   ];
 
-  // 广告类型标签映射
+  // 分段类型标签映射
   const typeLabels = {
-    'hard_ad': '硬广',
-    'soft_ad': '软广',
-    'product_placement': '植入广告',
+    'hard_ad': '商业内容',
+    'soft_ad': '推广内容',
+    'product_placement': '品牌植入',
     'intro_ad': '片头广告',
     'mid_ad': '中段广告'
   };
@@ -79,101 +82,194 @@
       this.lastDanmuFrameTs = 0;
       this.nativeDanmuSpeedPxPerSec = 0;
       this.lastNativeSpeedSampleTs = 0;
-      this.nativeDanmuTrackSample = null;
-
-
+      this.progressHoverCleanup = null;
+      this.progressHoverTarget = null;
+      this.progressHoverCard = null;
+      this.hoveredSegmentKey = null;
+      this.segmentMarkerRetryTimer = null;
+      this.chapterTimelineController = createChapterTimelineInjector();
+      this.routeWatcherCleanup = null;
+      this.lastRouteBvid = null;
+      this.hotWordPopupLayer = null;
+      this.currentHotWordId = null;
     }
 
     init() {
       console.log("[AdSkipper] 初始化...");
+      this.chapterTimelineController.init();
+
+      // 1. Load preferences
+      this.initPrefs();
+
+      // 2. Start UI Keeper to ensure buttons persist
+      this.startUiKeeper();
+
+      // 3. Init global event listeners
+      this.initGlobalListeners();
+
+      // 4. Initialize player connection
       this.player.init().then(ok => {
-        if (!ok) return;
+        if (!ok) {
+           console.log('[AdSkipper] 暂未找到播放器，Keeper将继续尝试');
+           return;
+        }
+        this.lastRouteBvid = this.player.currentBvid || null;
+        this.startSpaRouteWatcher();
+        this.onPlayerReady();
+      });
+    }
 
-        // 检查登录状态
-        chrome.storage.local.get(['adskipper_token'], (storage) => {
-          const token = storage.adskipper_token;
-          console.log('[AdSkipper] 登录状态:', token ? '已登录' : '未登录');
+    initPrefs() {
+        chrome.storage.local.get(['adskipper_token'], (s) => console.log('[AdSkipper] 登录状态:', s.adskipper_token ? '已登录' : '未登录'));
+        chrome.storage.local.get(['skip_mode'], (s) => {
+            this.skipMode = s.skip_mode || 'auto';
+            console.log("[AdSkipper] 跳过模式:", this.skipMode);
         });
-
-        // 加载跳过模式设置
-        chrome.storage.local.get(['skip_mode'], (storage) => {
-          this.skipMode = storage.skip_mode || 'auto';
-          console.log("[AdSkipper] 跳过模式:", this.skipMode);
-        });
-
-        // 监听跳过模式变化
         chrome.storage.onChanged.addListener((changes, area) => {
           if (area === 'local' && changes.skip_mode) {
             this.skipMode = changes.skip_mode.newValue || 'auto';
-            console.log("[AdSkipper] 跳过模式已更新:", this.skipMode);
-            // 如果切换到自动模式，立即隐藏按钮
-            if (this.skipMode === 'auto') {
-              this.hideSkipButton();
-            }
+            if (this.skipMode === 'auto') this.hideSkipButton();
           }
         });
+    }
 
-        // ==========================
-        // Vue 侧边栏初始化
-        // ==========================
-        this.initSidebar().then(() => {
-          console.log('[AdSkipper] 侧边栏初始化完成');
-        }).catch(err => {
-          console.error("[AdSkipper] Sidebar 初始化失败:", err);
-        });
-
+    startUiKeeper() {
+        // Initial setup
         this.initAiFloatingButton();
+        this.initSidebar().catch(e => console.error(e));
 
-        this.player.onTimeUpdate = (t) => this.checkSkip(t);
-        this.startInjectionObserver();
+        // Periodic check loop
+        setInterval(() => {
+            const fab = document.getElementById('visionmark-ai-fab');
+            if (!fab) {
+                console.log('[AdSkipper] Keeper: Restore AI FAB');
+                this.initAiFloatingButton();
+            }
+            
+            const sidebarRoot = document.getElementById('vm-sidebar-root');
+            if (!sidebarRoot) {
+                // console.log('[AdSkipper] Keeper: Restore Sidebar Root'); // Reduce log noise
+                this.initSidebar().catch(() => {});
+            }
 
-        const bvid = this.player.currentBvid;
-        if (bvid) {
-          this.refreshAnalysisForBvid(bvid).then(() => {
-            window.adSkipper = this;
-          });
-        }
-      });
+            // Restore segment markers if needed
+            if (this.segments && this.segments.length > 0) {
+                 const markers = document.querySelectorAll('.adskipper-progress-marker');
+                 if (markers.length === 0) {
+                     // Check if progress bar exists before trying to add
+                     const progressBar = document.querySelector('.bpx-player-progress') || 
+                                         document.querySelector('.bilibili-player-progress') ||
+                                         document.querySelector('.bpx-player-progress-wrap');
+                     if (progressBar) {
+                        console.log('[AdSkipper] Keeper: Restore markers');
+                        this.addSegmentMarkers();
+                     }
+                 }
+            }
+        }, 1500);
+    }
 
-      // Global click listener for closing popover
+    initGlobalListeners() {
       document.addEventListener('click', (e) => {
         const wrapper = document.getElementById('adskipper-wrapper');
-        if (wrapper && !wrapper.contains(e.target)) {
-          this.togglePopover(false);
-        }
-
+        if (wrapper && !wrapper.contains(e.target)) this.togglePopover(false);
       });
-
-      // ESC key listener
       document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
           this.togglePopover(false);
-          if (this.sidebarController) {
-            this.sidebarController.hide();
-          }
+          if (this.sidebarController) this.sidebarController.hide();
         }
       });
-
-      window.addEventListener('visionmark:seek', (event) => {
-        const time = Number(event?.detail?.time);
-        if (!Number.isFinite(time)) return;
-        this.player.skipTo(Math.max(time, 0));
+      window.addEventListener('visionmark:seek', (e) => {
+        const time = Number(e?.detail?.time);
+        if (Number.isFinite(time)) this.player.skipTo(Math.max(time, 0));
       });
-
       window.addEventListener('visionmark:refresh-ai', () => {
         if (this.player.currentBvid) {
-          this.refreshAnalysisForBvid(this.player.currentBvid, { forceAnalyze: true });
+           this.refreshAnalysisForBvid(this.player.currentBvid, { forceAnalyze: true });
         }
       });
-
       window.addEventListener('visionmark:delete-segment', (event) => {
         const segmentId = Number(event?.detail?.segmentId);
         this.handleSidebarDelete(segmentId);
       });
 
+      window.addEventListener('beforeunload', () => {
+        if (this.routeWatcherCleanup) {
+          this.routeWatcherCleanup();
+          this.routeWatcherCleanup = null;
+        }
+        this.chapterTimelineController.destroy();
+      }, { once: true });
+
       // 调试：将实例暴露到全局，便于控制台调试
       window.adSkipperDebug = this;
-      console.log('[AdSkipper] 调试模式已启用，使用: adSkipperDebug.addSegmentMarkers() 手动添加标记');
+      console.log('[AdSkipper] 调试模式已启用');
+    }
+
+    onPlayerReady() {
+        console.log('[AdSkipper] Player Ready');
+        this.player.onTimeUpdate = (t) => this.checkSkip(t);
+        this.startInjectionObserver();
+        
+        const bvid = this.player.currentBvid;
+        if (bvid) {
+          this.refreshAnalysisForBvid(bvid).then(() => window.adSkipper = this);
+        }
+    }
+
+    startSpaRouteWatcher() {
+      if (this.routeWatcherCleanup) return;
+
+      this.routeWatcherCleanup = watchBilibiliSpaRoute(({ bvid }) => {
+        this.handleSpaRouteChange(bvid);
+      });
+    }
+
+    handleSpaRouteChange(nextBvid) {
+      const normalizedBvid = typeof nextBvid === 'string' ? nextBvid : '';
+
+      if (typeof this.player.refreshContext === 'function') {
+        this.player.refreshContext(normalizedBvid || null);
+      } else if (normalizedBvid) {
+        this.player.currentBvid = normalizedBvid;
+      }
+
+      if (!normalizedBvid || normalizedBvid === this.lastRouteBvid) {
+        return;
+      }
+
+      this.lastRouteBvid = normalizedBvid;
+      this.handleVideoSwitch(normalizedBvid).catch((error) => {
+        console.error('[AdSkipper] SPA 视频切换处理失败:', error);
+      });
+    }
+
+    async handleVideoSwitch(nextBvid) {
+      this.hideSkipButton();
+      this.pendingStart = null;
+      this.pendingEnd = null;
+      this.lastSkipTime = 0;
+      this.segments = [];
+      this.allSegments = [];
+      this.currentSegmentIds = [];
+      this.analysisBvid = null;
+      this.clearKnowledgeDanmuState();
+
+      if (sidebarState) {
+        sidebarState.bvid = nextBvid;
+        sidebarState.cid = this.player.currentCid || null;
+        sidebarState.currentTime = 0;
+        sidebarState.aiSummary = '';
+        sidebarState.aiTitle = '';
+        sidebarState.knowledgePoints = [];
+        sidebarState.hotWords = [];
+        sidebarState.loadError = null;
+        sidebarState.segments = [];
+        sidebarState.activeSegmentKey = null;
+      }
+
+      await this.refreshAnalysisForBvid(nextBvid);
     }
 
     async initSidebar() {
@@ -489,6 +585,7 @@
         }
 
         this.addSegmentMarkers();
+      this.scheduleSegmentMarkerRetry(2);
       } catch (error) {
         if (error.code !== 'NETWORK_UNAVAILABLE') {
           console.error('[AdSkipper] 加载片段失败:', error);
@@ -516,9 +613,17 @@
       const end = Number(segment.end ?? segment.end_time ?? 0);
       const candidateAction = typeof segment.action === 'string' ? segment.action.toLowerCase() : '';
       const action = candidateAction === 'popup' || candidateAction === 'skip' ? candidateAction : 'skip';
+      const isAiSegment = Boolean(segment.is_ai_segment);
+      const aiSegmentDisplayType = isAiSegment
+        ? (segment.ai_segment_display_type === 'high-energy' || segment.ai_segment_display_type === 'clip'
+          ? segment.ai_segment_display_type
+          : (action === 'popup' ? 'high-energy' : 'clip'))
+        : null;
 
       const rawContent = typeof segment.content === 'string' ? segment.content.trim() : null;
-      const content = action === 'popup' ? (rawContent || null) : null;
+      const content = isAiSegment
+        ? (rawContent || null)
+        : (action === 'popup' ? (rawContent || null) : null);
 
       return {
         ...segment,
@@ -529,8 +634,422 @@
         end_time: end,
         action,
         content,
+        is_ai_segment: isAiSegment,
+        ai_segment_display_type: aiSegmentDisplayType,
         ad_type: segment.ad_type || (action === 'skip' ? 'hard_ad' : 'mid_ad'),
         hasActionField: typeof segment.action === 'string'
+      };
+    }
+
+    getAiSegmentDisplayType(segment) {
+      if (!segment?.is_ai_segment) return null;
+
+      if (segment.ai_segment_display_type === 'high-energy' || segment.ai_segment_display_type === 'clip') {
+        return segment.ai_segment_display_type;
+      }
+
+      return segment.action === 'popup' ? 'high-energy' : 'clip';
+    }
+
+    getOfficialProgressPresentation(segment) {
+      const aiSegmentDisplayType = this.getAiSegmentDisplayType(segment);
+
+      if (aiSegmentDisplayType === 'high-energy') {
+        return {
+          badgeText: '高能',
+          badgeClass: 'visionmark-progress-hover__badge--ai-high-energy',
+          markerColor: 'rgba(34, 197, 94, 0.88)',
+          actionText: '高能',
+          includeContentInMarkerTitle: true
+        };
+      }
+
+      if (aiSegmentDisplayType === 'clip') {
+        return {
+          badgeText: '片段',
+          badgeClass: 'visionmark-progress-hover__badge--ai-clip',
+          markerColor: 'rgba(250, 204, 21, 0.88)',
+          actionText: '片段',
+          includeContentInMarkerTitle: true
+        };
+      }
+
+      const isPopup = segment?.action === 'popup';
+      return {
+        badgeText: isPopup ? '重点' : '跳过',
+        badgeClass: isPopup ? 'visionmark-progress-hover__badge--popup' : 'visionmark-progress-hover__badge--skip',
+        markerColor: isPopup ? 'rgba(71, 167, 255, 0.88)' : 'rgba(251, 114, 153, 0.82)',
+        actionText: isPopup ? '重点' : '跳过',
+        includeContentInMarkerTitle: isPopup
+      };
+    }
+
+    ensureProgressHoverCardStyle() {
+      if (document.getElementById('visionmark-progress-hover-style')) return;
+
+      const style = document.createElement('style');
+      style.id = 'visionmark-progress-hover-style';
+      style.textContent = `
+        #visionmark-progress-hover-card {
+          position: fixed;
+          z-index: 2147483647;
+          width: min(320px, calc(100vw - 24px));
+          padding: 14px 16px;
+          border-radius: 16px;
+          color: #fff;
+          background: linear-gradient(145deg, rgba(20, 20, 28, 0.96), rgba(31, 31, 44, 0.92));
+          box-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          backdrop-filter: blur(14px);
+          -webkit-backdrop-filter: blur(14px);
+          pointer-events: none;
+          opacity: 0;
+          transform: translateY(6px);
+          transition: opacity 0.16s ease, transform 0.16s ease;
+        }
+        #visionmark-progress-hover-card.is-visible {
+          opacity: 1;
+          transform: translateY(0);
+        }
+        .visionmark-progress-hover__eyebrow {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          margin-bottom: 8px;
+          font-size: 12px;
+          color: rgba(255, 255, 255, 0.82);
+        }
+        .visionmark-progress-hover__badge {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          padding: 2px 8px;
+          border-radius: 999px;
+          font-size: 11px;
+          font-weight: 700;
+          letter-spacing: 0.3px;
+          color: #fff;
+        }
+        .visionmark-progress-hover__badge--popup {
+          background: linear-gradient(135deg, #47a7ff, #6fc1ff);
+        }
+        .visionmark-progress-hover__badge--skip {
+          background: linear-gradient(135deg, #fb7299, #ff9a8b);
+        }
+        .visionmark-progress-hover__badge--ai-high-energy {
+          background: linear-gradient(135deg, #16a34a, #4ade80);
+        }
+        .visionmark-progress-hover__badge--ai-clip {
+          background: linear-gradient(135deg, #eab308, #fde047);
+          color: #3b2f00;
+        }
+        .visionmark-progress-hover__title {
+          margin: 0 0 8px;
+          font-size: 14px;
+          line-height: 1.55;
+          font-weight: 600;
+          color: #fff;
+          word-break: break-word;
+        }
+        .visionmark-progress-hover__detail-list {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+        .visionmark-progress-hover__detail-item {
+          padding: 8px 10px;
+          border-radius: 10px;
+          background: rgba(255, 255, 255, 0.08);
+          font-size: 12px;
+          line-height: 1.55;
+          color: rgba(255, 255, 255, 0.9);
+          word-break: break-word;
+        }
+      `;
+      document.head.appendChild(style);
+    }
+
+    getProgressHoverCard() {
+      this.ensureProgressHoverCardStyle();
+
+      let card = document.getElementById('visionmark-progress-hover-card');
+      if (!card) {
+        card = document.createElement('div');
+        card.id = 'visionmark-progress-hover-card';
+        document.body.appendChild(card);
+      }
+
+      this.progressHoverCard = card;
+      return card;
+    }
+
+    hideProgressHoverCard() {
+      this.hoveredSegmentKey = null;
+      if (this.progressHoverCard) {
+        this.progressHoverCard.classList.remove('is-visible');
+      }
+    }
+
+    cleanupProgressHover() {
+      if (typeof this.progressHoverCleanup === 'function') {
+        this.progressHoverCleanup();
+      }
+      this.progressHoverCleanup = null;
+      this.progressHoverTarget = null;
+      this.hideProgressHoverCard();
+    }
+
+    formatTimeLabel(seconds) {
+      const safeSeconds = Math.max(0, Number(seconds) || 0);
+      const wholeSeconds = Math.floor(safeSeconds);
+      const hours = Math.floor(wholeSeconds / 3600);
+      const minutes = Math.floor((wholeSeconds % 3600) / 60);
+      const secs = wholeSeconds % 60;
+
+      if (hours > 0) {
+        return `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+      }
+      return `${minutes}:${String(secs).padStart(2, '0')}`;
+    }
+
+    findSegmentByTime(timeSec) {
+      if (!Number.isFinite(timeSec) || !Array.isArray(this.segments) || !this.segments.length) return null;
+
+      const exactMatch = this.segments.find(segment => timeSec >= segment.start_time && timeSec <= segment.end_time);
+      if (exactMatch) return exactMatch;
+
+      const duration = Number(this.player?.getState?.().duration) || 0;
+      const maxSnapDistance = duration > 0
+        ? Math.min(24, Math.max(8, duration * 0.05))
+        : 12;
+
+      let nearestSegment = null;
+      let nearestDistance = Infinity;
+      for (const segment of this.segments) {
+        const distance = Math.min(
+          Math.abs(timeSec - segment.start_time),
+          Math.abs(timeSec - segment.end_time)
+        );
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          nearestSegment = segment;
+        }
+      }
+
+      return nearestDistance <= maxSnapDistance ? nearestSegment : null;
+    }
+
+    getKnowledgeDetailsForRange(segment) {
+      if (!segment || !Array.isArray(this.knowledgeDanmuQueue) || !this.knowledgeDanmuQueue.length) {
+        return [];
+      }
+
+      const rangePadding = 4;
+      const matched = this.knowledgeDanmuQueue.filter(item =>
+        item.timeSec >= (segment.start_time - rangePadding) && item.timeSec <= (segment.end_time + rangePadding)
+      );
+
+      return matched.slice(0, 3).map(item => {
+        const prefix = item.type === 'hot-word' ? '热词' : '知识点';
+        return `${prefix} ${this.formatTimeLabel(item.timeSec)}  ${item.text}`;
+      });
+    }
+
+    getSegmentHoverDetails(segment) {
+      if (!segment) return [];
+
+      const details = [];
+      if (segment.content) {
+        details.push(segment.content.trim());
+      }
+
+      const knowledgeDetails = this.getKnowledgeDetailsForRange(segment);
+      knowledgeDetails.forEach(item => {
+        if (!details.includes(item)) {
+          details.push(item);
+        }
+      });
+
+      if (!details.length && this.aiSummary) {
+        details.push(this.aiSummary.trim());
+      }
+
+      return details.slice(0, 3);
+    }
+
+    findNativeProgressPreview() {
+      const selectors = [
+        '.bpx-player-progress-preview',
+        '.bpx-player-progress-thumbnail',
+        '.bpx-player-progress-detail',
+        '.bilibili-player-video-progress-detail',
+        '.bilibili-player-video-progress-thumbnail',
+        '[class*="progress-preview"]',
+        '[class*="progress-thumbnail"]'
+      ];
+
+      for (const selector of selectors) {
+        const element = document.querySelector(selector);
+        if (!element) continue;
+
+        const rect = element.getBoundingClientRect();
+        const computedStyle = window.getComputedStyle(element);
+        if (rect.width > 20 && rect.height > 20 && computedStyle.visibility !== 'hidden' && computedStyle.display !== 'none') {
+          return { element, rect };
+        }
+      }
+
+      return null;
+    }
+
+    positionProgressHoverCard(card, anchorClientX, progressRect) {
+      const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+      const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+      const preview = this.findNativeProgressPreview();
+      const cardRect = card.getBoundingClientRect();
+      const gap = 16;
+
+      let left = Math.min(anchorClientX + gap, viewportWidth - cardRect.width - 12);
+      let top = progressRect.top - cardRect.height - 22;
+
+      if (preview?.rect) {
+        const previewRect = preview.rect;
+        left = previewRect.right + 18;
+        top = previewRect.top + Math.max(0, (previewRect.height - cardRect.height) / 2);
+
+        if (left + cardRect.width > viewportWidth - 12) {
+          left = previewRect.left - cardRect.width - 18;
+        }
+      }
+
+      if (left < 12) {
+        left = 12;
+      }
+      if (top < 12) {
+        top = Math.min(progressRect.bottom + 18, viewportHeight - cardRect.height - 12);
+      }
+      if (top + cardRect.height > viewportHeight - 12) {
+        top = Math.max(12, viewportHeight - cardRect.height - 12);
+      }
+
+      card.style.left = `${Math.round(left)}px`;
+      card.style.top = `${Math.round(top)}px`;
+    }
+
+    escapeHtml(value) {
+      return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    showProgressHoverCard(segment, anchorClientX, progressRect) {
+      const details = this.getSegmentHoverDetails(segment);
+      if (!details.length) {
+        this.hideProgressHoverCard();
+        return;
+      }
+
+      const card = this.getProgressHoverCard();
+      const segmentKey = this.getSegmentKey(segment);
+      const presentation = this.getOfficialProgressPresentation(segment);
+      const badgeText = presentation.badgeText;
+      const titleText = this.escapeHtml(details[0]);
+      const extraDetails = details.slice(1);
+      const timeLabel = `${this.formatTimeLabel(segment.start_time)} - ${this.formatTimeLabel(segment.end_time)}`;
+
+      if (this.hoveredSegmentKey !== segmentKey) {
+        card.innerHTML = `
+          <div class="visionmark-progress-hover__eyebrow">
+            <span class="visionmark-progress-hover__badge ${presentation.badgeClass}">${badgeText}</span>
+            <span>${this.escapeHtml(timeLabel)}</span>
+          </div>
+          <p class="visionmark-progress-hover__title">${titleText}</p>
+          ${extraDetails.length ? `
+            <div class="visionmark-progress-hover__detail-list">
+              ${extraDetails.map(text => `<div class="visionmark-progress-hover__detail-item">${this.escapeHtml(text)}</div>`).join('')}
+            </div>
+          ` : ''}
+        `;
+        this.hoveredSegmentKey = segmentKey;
+      }
+
+      card.classList.add('is-visible');
+      this.positionProgressHoverCard(card, anchorClientX, progressRect);
+    }
+
+    bindProgressHover(progressContainer, progressSlide, duration) {
+      const hoverTargets = [progressContainer, progressSlide].filter(Boolean);
+      if (!hoverTargets.length || !Number.isFinite(duration) || duration <= 0) return;
+      if (this.progressHoverTarget === hoverTargets[0]) return;
+
+      this.cleanupProgressHover();
+      this.progressHoverTarget = hoverTargets[0];
+
+      const resolveHoverRect = () => {
+        const containerRect = progressContainer?.getBoundingClientRect?.();
+        if (containerRect && containerRect.width > 0) return containerRect;
+        const slideRect = progressSlide?.getBoundingClientRect?.();
+        if (slideRect && slideRect.width > 0) return slideRect;
+        return null;
+      };
+
+      const isWithinHoverZone = (event, rect) => {
+        if (!rect?.width) return false;
+
+        const preview = this.findNativeProgressPreview();
+        const previewRect = preview?.rect || null;
+        const zoneLeft = Math.min(rect.left, previewRect?.left ?? rect.left);
+        const zoneRight = Math.max(rect.right, previewRect?.right ?? rect.right);
+        const zoneTop = Math.min(rect.top - 160, previewRect ? previewRect.top - 24 : rect.top - 160);
+        const zoneBottom = Math.max(rect.bottom + 28, previewRect ? previewRect.bottom + 24 : rect.bottom + 28);
+
+        return event.clientX >= zoneLeft && event.clientX <= zoneRight && event.clientY >= zoneTop && event.clientY <= zoneBottom;
+      };
+
+      const handleHoverMove = (event) => {
+        const rect = resolveHoverRect();
+        if (!rect?.width) return;
+
+        if (!isWithinHoverZone(event, rect)) {
+          this.hideProgressHoverCard();
+          return;
+        }
+
+        const percent = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+        const currentTime = percent * duration;
+        const segment = this.findSegmentByTime(currentTime);
+
+        if (!segment) {
+          this.hideProgressHoverCard();
+          return;
+        }
+
+        this.showProgressHoverCard(segment, event.clientX, rect);
+      };
+
+      const handleMouseLeave = () => {
+        this.hideProgressHoverCard();
+      };
+
+      hoverTargets.forEach(target => {
+        target.addEventListener('mousemove', handleHoverMove);
+        target.addEventListener('mouseleave', handleMouseLeave);
+      });
+      document.addEventListener('mousemove', handleHoverMove, true);
+      window.addEventListener('blur', handleMouseLeave);
+      document.addEventListener('scroll', handleMouseLeave, true);
+
+      this.progressHoverCleanup = () => {
+        hoverTargets.forEach(target => {
+          target.removeEventListener('mousemove', handleHoverMove);
+          target.removeEventListener('mouseleave', handleMouseLeave);
+        });
+        document.removeEventListener('mousemove', handleHoverMove, true);
+        window.removeEventListener('blur', handleMouseLeave);
+        document.removeEventListener('scroll', handleMouseLeave, true);
       };
     }
 
@@ -579,7 +1098,7 @@
       const explanation = typeof point.explanation === 'string' ? point.explanation.trim() : '';
       // 处理热词（hot_words）
       const word = typeof point.word === 'string' ? point.word.trim() : '';
-      const meaning = typeof point.meaning === 'string' ? point.meaning.trim() : '';
+      const meaning = typeof (point.meaning || point.explanation) === 'string' ? (point.meaning || point.explanation).trim() : '';
 
       // 知识点格式：术语: 解释
       // 热词格式：[热词] 解释
@@ -608,14 +1127,16 @@
           if (!Number.isFinite(seconds) || !text) return null;
 
           // 判断是热词还是知识点
-          const isHotWord = typeof point === 'object' && point.word && point.meaning;
+          const isHotWord = typeof point === 'object' && point.word && (point.meaning || point.explanation);
           const type = isHotWord ? 'hot-word' : 'knowledge-point';
 
           return {
             id: `${bvid || 'unknown'}-${Math.round(seconds * 10)}-${index}`,
             timeSec: seconds,
             text,
-            type // 添加类型标识
+            type, // 添加类型标识
+            rawWord: point.word || point.term || null,
+            rawExplanation: point.explanation || point.meaning || null
           };
         })
         .filter(Boolean)
@@ -650,6 +1171,7 @@
       this.lastNativeSpeedSampleTs = 0;
       this.nativeDanmuTrackSample = null;
       this.clearKnowledgeDanmuNodes();
+      this.hideHotWordPopup();
     }
 
     ensureKnowledgeDanmuLayer() {
@@ -1018,6 +1540,99 @@
       this.syncKnowledgeDanmuAnimationState();
     }
 
+    ensureHotWordPopupLayer() {
+      const container = document.querySelector('.bpx-player-video-wrap') ||
+        document.querySelector('.bpx-player-video-area') ||
+        document.querySelector('.bpx-player-container') ||
+        document.querySelector('#bilibili-player');
+
+      if (!container) return null;
+
+      if (getComputedStyle(container).position === 'static') {
+        container.style.position = 'relative';
+      }
+
+      if (!this.hotWordPopupLayer || !document.body.contains(this.hotWordPopupLayer)) {
+        this.hotWordPopupLayer = document.createElement('div');
+        this.hotWordPopupLayer.className = 'visionmark-hotword-popup-layer';
+        this.hotWordPopupLayer.style.cssText = `
+          position: absolute;
+          bottom: 60px; /* 进度条上方 */
+          left: 20px;   /* 视频界面左下角 */
+          z-index: 99999;
+          pointer-events: none;
+          transition: opacity 0.3s ease, transform 0.3s ease;
+          opacity: 0;
+          transform: translateY(10px);
+        `;
+        container.appendChild(this.hotWordPopupLayer);
+      }
+      return this.hotWordPopupLayer;
+    }
+
+    renderHotWordPopup(item) {
+      const layer = this.ensureHotWordPopupLayer();
+      if (!layer) return;
+
+      if (this.currentHotWordId === item.id) return; // 防止重复渲染
+      this.currentHotWordId = item.id;
+
+      const word = item.rawWord || '小知识';
+      const explanation = item.rawExplanation || '暂无详细解释';
+
+      layer.innerHTML = `
+        <div style="background: rgba(0, 0, 0, 0.3);
+                    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+                    border-radius: 8px; padding: 10px 14px;
+                    max-width: 320px; pointer-events: none;
+                    display: flex; flex-direction: column; gap: 6px;">
+           <div style="display: flex; align-items: center; gap: 6px;">
+             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fb7299" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 2c0 0-5 6-5 12a5 5 0 0 0 10 0c0-6-5-12-5-12Z"/>
+                <path d="M12 2v10"/>
+             </svg>
+             <span style="font-size: 16px; font-weight: bold; color: #fb7299; margin: 0; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);">${this.escapeHtml(word)}</span>
+           </div>
+           <div style="font-size: 13px; color: #fff; line-height: 1.5; font-weight: 500; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);">${this.escapeHtml(explanation)}</div>
+        </div>
+      `;
+      
+      layer.style.opacity = '1';
+      layer.style.transform = 'translateY(0)';
+    }
+
+    hideHotWordPopup() {
+      if (this.hotWordPopupLayer && this.hotWordPopupLayer.style.opacity !== '0') {
+        this.hotWordPopupLayer.style.opacity = '0';
+        this.hotWordPopupLayer.style.transform = 'translateY(10px)';
+        this.currentHotWordId = null;
+      }
+    }
+
+    handleHotWordPopup(currentTime) {
+      if (!Number.isFinite(currentTime) || !this.knowledgeDanmuQueue || !this.knowledgeDanmuQueue.length) {
+        this.hideHotWordPopup();
+        return;
+      }
+
+      // 寻找当前时间点处于 [timeSec, timeSec + 5秒] 内的热词
+      let activeHotWord = null;
+      for (const item of this.knowledgeDanmuQueue) {
+        if (item.type === 'hot-word') {
+          if (currentTime >= item.timeSec && currentTime <= item.timeSec + 5) {
+            activeHotWord = item;
+            break;
+          }
+        }
+      }
+
+      if (activeHotWord) {
+        this.renderHotWordPopup(activeHotWord);
+      } else {
+        this.hideHotWordPopup();
+      }
+    }
+
 
     async requestAnalysis(bvid, token) {
       const url = VIDEO_ANALYSIS_BASE + "/video-analysis/analyze";
@@ -1066,7 +1681,8 @@
           action: segment.highlight ? 'popup' : 'skip',
           content: typeof segment.description === 'string' ? segment.description : '',
           ad_type: segment.ad_type || (segment.highlight ? 'hard_ad' : 'soft_ad'),
-          is_ai_segment: true
+          is_ai_segment: true,
+          ai_segment_display_type: segment.highlight ? 'high-energy' : 'clip'
         }, index))
         .filter(segment => Number.isFinite(segment.start_time) && Number.isFinite(segment.end_time) && segment.end_time > segment.start_time);
 
@@ -1093,6 +1709,7 @@
       this.currentSegmentIds = [];
       this.updateKnowledgeDanmuSource(allDanmuItems, bvid);
       this.addSegmentMarkers();
+        this.scheduleSegmentMarkerRetry(2);
 
       if (sidebarState) {
         sidebarState.aiSummary = this.aiSummary || '暂无总结';
@@ -1104,6 +1721,10 @@
         sidebarState.segments = aiSegments;
         sidebarState.activeSegmentKey = null;
       }
+
+      window.dispatchEvent(new CustomEvent(ANALYSIS_UPDATED_EVENT, {
+        detail: { bvid }
+      }));
     }
 
     async analyzeVideoLegacy(bvid) {
@@ -1166,15 +1787,18 @@
               console.log("[AdSkipper] 发现", result.data.ad_segments.length, "个 AI 分析分段");
 
               // 将 AI 分段转换为 TimelineItem 期望的格式
-              const aiSegments = result.data.ad_segments.map((seg, index) => ({
-                id: `ai-${bvid}-${index}`, // 生成唯一 ID
-                start_time: seg.start_time,
-                end_time: seg.end_time,
-                action: seg.highlight ? 'popup' : 'skip', // highlight 为 true 时为重点
-                content: seg.description || '',
-                ad_type: seg.ad_type || (seg.highlight ? 'hard_ad' : 'soft_ad'),
-                is_ai_segment: true // 标记为 AI 分析的片段
-              }));
+              const aiSegments = result.data.ad_segments
+                .map((seg, index) => this.normalizeSegment({
+                  id: `ai-${bvid}-${index}`, // 生成唯一 ID
+                  start_time: Number(seg.start_time ?? seg.start ?? 0),
+                  end_time: Number(seg.end_time ?? seg.end ?? 0),
+                  action: seg.highlight ? 'popup' : 'skip', // highlight 为 true 时为重点
+                  content: typeof seg.description === 'string' ? seg.description : '',
+                  ad_type: seg.ad_type || (seg.highlight ? 'hard_ad' : 'soft_ad'),
+                  is_ai_segment: true, // 标记为 AI 分析的片段
+                  ai_segment_display_type: seg.highlight ? 'high-energy' : 'clip'
+                }, index))
+                .filter(segment => Number.isFinite(segment.start_time) && Number.isFinite(segment.end_time) && segment.end_time > segment.start_time);
 
               // 将 AI 分段添加到侧边栏
               sidebarState.segments = aiSegments;
@@ -1277,6 +1901,13 @@
       if (!segment || segment.action !== 'skip') return;
 
       if (this.skipMode === 'auto') {
+        const segKey = this.getSegmentKey(segment);
+        if (!this.autoSkippedSegments) this.autoSkippedSegments = new Set();
+        
+        // 确保每个片段在一次播放中只会被自动跳过一次
+        if (this.autoSkippedSegments.has(segKey)) return;
+        this.autoSkippedSegments.add(segKey);
+
         this.seekToSegmentEnd(segment);
         this.lastSkipTime = Date.now();
         this.showSkipNotification(segment);
@@ -1288,12 +1919,25 @@
       }
     }
 
-    // 鏇存柊鍚庣殑 checkSkip 鏂规硶
+    // 更新后的 checkSkip 方法
     checkSkip(currentTime) {
       if (this.analysisBvid && this.player.currentBvid && this.analysisBvid !== this.player.currentBvid) {
+        console.log('[AdSkipper] 视频切换检测到！由', this.analysisBvid, '切换为', this.player.currentBvid);
         this.clearKnowledgeDanmuState();
         this.analysisBvid = this.player.currentBvid;
+        this.autoSkippedSegments = new Set();
+        
+        // 当页面未刷新单页跳转时，自动为新视频拉取总结/分析
+        this.refreshAnalysisForBvid(this.player.currentBvid);
       }
+
+      // 新增：检测进度条倒退（倒退超过2秒认为是回放或重播）
+      if (this.lastCheckedTime && currentTime < this.lastCheckedTime - 2) {
+          if (this.autoSkippedSegments) {
+              this.autoSkippedSegments.clear();
+          }
+      }
+      this.lastCheckedTime = currentTime;
 
       if (sidebarState) {
         sidebarState.currentTime = currentTime;
@@ -1306,6 +1950,7 @@
       }
 
       this.handleKnowledgeDanmu(currentTime);
+      this.handleHotWordPopup(currentTime);
 
       if (!this.segments.length) {
         if (sidebarState) {
@@ -1389,8 +2034,8 @@
 
       const toggleBtn = document.createElement('div');
       toggleBtn.id = 'adskipper-toggle';
-      toggleBtn.title = '广告控制';
-      toggleBtn.setAttribute('aria-label', '广告控制');
+      toggleBtn.title = '分段评价';
+      toggleBtn.setAttribute('aria-label', '分段评价');
       toggleBtn.style.cssText = `
         cursor: pointer;
         background-color: #FB7299;
@@ -1406,7 +2051,7 @@
         height: auto;
         min-height: 24px;
       `;
-      toggleBtn.innerHTML = '<span class="adskipper-toggle-text">广告控制</span>';
+      toggleBtn.innerHTML = '<span class="adskipper-toggle-text">分段评价</span>';
       toggleBtn.onclick = (event) => {
         event.stopPropagation();
         self.togglePopover();
@@ -1514,9 +2159,9 @@
       selectType.id = 'adskipper-type';
       selectType.style.cssText = 'width:100%;height:32px;background:#333;color:#fff;border:1px solid #555;border-radius:4px;padding:0 6px;font-size:0.9em;outline:none;cursor:pointer;';
       const types = [
-        { val: 'hard_ad', text: '硬广' },
-        { val: 'soft_ad', text: '软广' },
-        { val: 'product_placement', text: '植入广告' },
+        { val: 'hard_ad', text: '商业内容' },
+        { val: 'soft_ad', text: '推广内容' },
+        { val: 'product_placement', text: '品牌植入' },
         { val: 'intro_ad', text: '片头广告' },
         { val: 'mid_ad', text: '中段广告' }
       ];
@@ -1936,7 +2581,7 @@
 
       const btn = document.createElement('div');
       btn.id = 'adskipper-skip-btn';
-      btn.textContent = '跳过广告';
+      btn.textContent = '跳过分段';
       // 5. 响应式 CSS 定位：使用像素值 + !important 确保位于视频右下角
       // 默认 bottom: 60px，在全屏模式下动态调整
       btn.style.cssText = `
@@ -2026,11 +2671,30 @@
       }
     }
 
-    addSegmentMarkers() {
+    scheduleSegmentMarkerRetry(attempt = 1) {
+      if (this.segmentMarkerRetryTimer) {
+        clearTimeout(this.segmentMarkerRetryTimer);
+        this.segmentMarkerRetryTimer = null;
+      }
+
+      if (attempt > 8) {
+        console.warn('[AdSkipper] progress hover: retry limit reached');
+        return;
+      }
+
+      const delayMs = 250 * attempt;
+      console.log(`[AdSkipper] progress hover: scheduling retry #${attempt} in ${delayMs}ms`);
+      this.segmentMarkerRetryTimer = setTimeout(() => {
+        this.segmentMarkerRetryTimer = null;
+        this.addSegmentMarkers(attempt + 1);
+      }, delayMs);
+    }
+    addSegmentMarkers(retryAttempt = 1) {
       const oldMarkers = document.querySelectorAll('.adskipper-progress-marker');
       oldMarkers.forEach(marker => marker.remove());
 
       if (!this.segments.length) {
+        console.log('[AdSkipper] progress hover: skip binding because segments are empty');
         return;
       }
 
@@ -2038,35 +2702,50 @@
         document.querySelector('.bilibili-player-progress') ||
         document.querySelector('.bpx-player-progress-wrap');
       if (!progressContainer) {
+        console.warn('[AdSkipper] progress hover: progressContainer not found');
+        this.scheduleSegmentMarkerRetry(retryAttempt);
         return;
       }
 
       const duration = this.player.getState().duration;
       if (!duration || duration <= 0) {
+        console.warn('[AdSkipper] progress hover: invalid duration', duration);
+        this.scheduleSegmentMarkerRetry(retryAttempt);
         return;
       }
 
       const progressSlide = progressContainer.querySelector('.bpx-player-progress-slide') ||
         progressContainer.querySelector('.bili-progress-slip') ||
         progressContainer.querySelector('.bpx-player-progress-buffer');
+      const markerHost = progressSlide || progressContainer;
       if (!progressSlide) {
-        return;
+        console.warn('[AdSkipper] progress hover: progressSlide not found, fallback to progressContainer', progressContainer.className || progressContainer.id);
       }
 
-      progressSlide.style.position = progressSlide.style.position || 'relative';
+      if (this.segmentMarkerRetryTimer) {
+        clearTimeout(this.segmentMarkerRetryTimer);
+        this.segmentMarkerRetryTimer = null;
+      }
+
+      markerHost.style.position = markerHost.style.position || 'relative';
+
+      console.log('[AdSkipper] progress hover: binding listeners', {
+        segmentCount: this.segments.length,
+        duration,
+        progressContainer: progressContainer.className || progressContainer.id,
+        progressSlide: progressSlide ? (progressSlide.className || progressSlide.id) : '(fallback:container)'
+      });
+      this.bindProgressHover(progressContainer, markerHost, duration);
 
       this.segments.forEach((segment, index) => {
         const startPercent = (segment.start_time / duration) * 100;
         const endPercent = (segment.end_time / duration) * 100;
         const width = Math.max(endPercent - startPercent, 0.8);
+        const presentation = this.getOfficialProgressPresentation(segment);
 
         const marker = document.createElement('div');
         marker.className = 'adskipper-progress-marker';
         marker.setAttribute('data-segment-id', this.getSegmentKey(segment, index));
-
-        const markerColor = segment.action === 'popup'
-          ? 'rgba(71, 167, 255, 0.88)'
-          : 'rgba(251, 114, 153, 0.82)';
 
         marker.style.cssText = `
           position: absolute;
@@ -2074,19 +2753,18 @@
           top: 0;
           bottom: 0;
           width: ${width}%;
-          background: ${markerColor} !important;
+          background: ${presentation.markerColor} !important;
           pointer-events: none;
           z-index: 999 !important;
           height: 100% !important;
         `;
 
-        const titleContent = segment.action === 'popup' && segment.content
+        const titleContent = presentation.includeContentInMarkerTitle && segment.content
           ? ` | ${segment.content.slice(0, 36)}`
           : '';
-        const actionText = segment.action === 'popup' ? '重点' : '跳过';
-        marker.title = `${segment.start_time.toFixed(1)}s - ${segment.end_time.toFixed(1)}s | ${actionText}${titleContent}`;
+        marker.title = `${segment.start_time.toFixed(1)}s - ${segment.end_time.toFixed(1)}s | ${presentation.actionText}${titleContent}`;
 
-        progressSlide.appendChild(marker);
+        markerHost.appendChild(marker);
       });
     }
 
@@ -2097,5 +2775,12 @@
 
   new AdSkipperCore().init();
 })();
+
+
+
+
+
+
+
 
 

@@ -63,7 +63,7 @@ router.post('/analyze', authenticateToken, async (req, res) => {
         end_time: parseTimeToSeconds(seg.end_time),
         description: seg.description,
         highlight: seg.highlight,
-        ad_type: seg.highlight ? 'hard_ad' : 'soft_ad' // 根据 highlight 判断广告类型
+        ad_type: seg.highlight ? 'hard_ad' : 'soft_ad' // 根据 highlight 判断内容类型
       })) : [],
       knowledge_points: result.analysis.knowledge_points || [],
       hot_words: result.analysis.hot_words || [],

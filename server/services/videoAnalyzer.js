@@ -1,4 +1,4 @@
-const axios = require('axios');
+﻿const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
@@ -157,6 +157,28 @@ class VideoAnalyzer {
   }
 
   /**
+   * 使用ffprobe获取视频关键帧时间戳
+   * @param {string} videoPath - 视频路径
+   * @returns {Promise<number[]>} 关键帧时间戳（秒）
+   */
+  async extractKeyframeTimestamps(videoPath) {
+    try {
+      const command = `"${ffmpegPath.replace(/ffmpeg$/, 'ffprobe')}" -v error -select_streams v -skip_frame nokey -show_entries frame=pkt_pts_time -of csv=p=0 "${videoPath}"`;
+      const { stdout } = await execPromise(command, { shell: true });
+      const timestamps = stdout
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(line => line)
+        .map(line => parseFloat(line))
+        .filter(t => !Number.isNaN(t));
+      return timestamps;
+    } catch (error) {
+      console.warn('[VideoAnalyzer] 提取关键帧时间戳失败，回退到均匀采样', error.message);
+      return [];
+    }
+  }
+
+  /**
    * 使用ffmpeg提取视频关键帧
    * @param {string} videoPath - 视频路径
    * @param {string} bvid - 视频BV号
@@ -174,16 +196,35 @@ class VideoAnalyzer {
       // 获取视频实际时长
       const duration = await this.getVideoDuration(videoPath);
 
-      // 固定每5秒提取一帧
-      const interval = 5;
-      const frameCount = Math.ceil(duration / interval);
+      // 尝试使用ffprobe获取关键帧时间戳（更接近场景切换）
+      let timestamps = await this.extractKeyframeTimestamps(videoPath);
 
-      console.log(`[VideoAnalyzer] 视频时长 ${duration.toFixed(2)}秒，将提取 ${frameCount} 帧，每 5 秒一帧`);
+      // 如果ffprobe失败或者数据过少，退回到均匀采样
+      if (!timestamps || timestamps.length < 2) {
+        const interval = 5;
+        const frameCount = Math.ceil(duration / interval);
+        timestamps = Array.from({ length: frameCount }, (_, i) => i * interval);
+        console.log(`[VideoAnalyzer] 关键帧时间点不足，退回到均匀采样，每 ${interval} 秒一帧`);
+      }
 
-      // 使用ffmpeg提取关键帧
-      const command = `"${ffmpegPath}" -i "${videoPath}" -vf "fps=1/${interval},scale=640:-1" "${framesDir}/frame_%04d.jpg" -frames:v ${frameCount} -y`;
+      // 限制最大帧数，避免发送给大模型太多图像
+      const MAX_FRAMES = 30;
+      if (timestamps.length > MAX_FRAMES) {
+        const step = Math.ceil(timestamps.length / MAX_FRAMES);
+        timestamps = timestamps.filter((_, idx) => idx % step === 0);
+      }
 
-      await execPromise(command, { shell: true });
+      console.log(`[VideoAnalyzer] 将提取 ${timestamps.length} 张关键帧（基于场景/关键帧，间隔可变）`);
+
+      // 提取关键帧截图，文件名包含时间戳（毫秒），便于后续排序和提示
+      for (let i = 0; i < timestamps.length; i++) {
+        const ts = timestamps[i];
+        const ms = Math.round(ts * 1000);
+        const outputPath = path.join(framesDir, `frame_${String(i + 1).padStart(3, '0')}_${ms}.jpg`);
+        const command = `"${ffmpegPath}" -ss ${ts} -i "${videoPath}" -frames:v 1 -q:v 2 -vf "scale=640:-1" "${outputPath}" -y`;
+        await execPromise(command, { shell: true });
+      }
+
       console.log(`[VideoAnalyzer] 关键帧提取完成，保存在: ${framesDir}`);
       return { framesDir, duration };
     } catch (error) {
@@ -536,6 +577,7 @@ ${transcript}
     {
       "word": "从转录文本中直接提取的热词（必须是原文中出现的词）",
       "meaning": "简要解释这个词的含义",
+      "explanation": "简要解释这个词的含义",
       "category": "分类（如：网络梗/流行语/饭圈用语等）",
       "timestamp": "出现时间点(格式必须为MM:SS)。必须直接使用转录文本中的[MM:SS]标记。"
     }
@@ -581,10 +623,17 @@ ${transcript}
     const modelConfig = this.getEffectiveModelConfig(userConfig);
     const client = this.createOpenAIClient(modelConfig);
 
-    // 获取所有帧图片
+    // 获取所有帧图片，并从文件名中解析时间戳（毫秒）
     const frames = fs.readdirSync(framesDir)
       .filter(f => f.endsWith('.jpg'))
-      .sort();
+      .map(f => {
+        const match = f.match(/frame_\d+_(\d+)\.jpg$/);
+        return {
+          file: f,
+          timestampMs: match ? parseInt(match[1], 10) : 0
+        };
+      })
+      .sort((a, b) => a.timestampMs - b.timestampMs);
 
     if (frames.length === 0) {
       throw new Error('没有找到关键帧图片');
@@ -592,11 +641,12 @@ ${transcript}
 
     console.log(`[VideoAnalyzer] 共有 ${frames.length} 张关键帧`);
 
-    // 格式化视频时长
-    const durationText = formatTime(duration);
-
-    // 计算实际提取间隔
-    const actualInterval = Math.floor(duration / frames.length);
+    // 生成时间戳（秒）列表，供提示词使用
+    const frameTimestamps = frames.map(f => f.timestampMs / 1000);
+    const frameTimesText = frameTimestamps
+      .slice(0, 10)
+      .map(t => formatTime(t))
+      .join(', ');
 
     // 构建提示词 - 结合音视频进行综合分析
     const promptText = `请作为一个资深B站用户和百科全书，对这段视频内容进行深度分析。
@@ -607,7 +657,7 @@ ${transcript || '无语音内容'}
 **注意**：上述转录文本中的 [MM:SS] 是精确的时间戳，例如 [0:15] 表示该内容在视频第15秒出现。
 
 关键帧分析（仅用于分段和视觉理解）：
-我已上传 ${frames.length} 张关键帧截图，按时间顺序排列。每张截图代表的时间点约为：${formatTime(actualInterval)} 间隔。
+我已上传 ${frames.length} 张关键帧截图，按时间顺序排列。它们对应的视频时间点会根据场景/画面内容变化（不固定长度）。示例时间点（仅供参考）：${frameTimesText}。
 
 请输出JSON格式报告：
 {
@@ -632,7 +682,7 @@ ${transcript || '无语音内容'}
   "hot_words": [
     {
       "word": "从转录文本中直接提取的热词（必须是原文中出现的词）",
-      "meaning": "简要解释",
+      "explanation": "简要解释该热词或梗的含义",
       "timestamp": "MM:SS (必须直接使用语音转录文本中的[MM:SS]标记)"
     }
   ]
@@ -657,7 +707,7 @@ ${transcript || '无语音内容'}
 
     // 添加图片（使用base64编码）
     for (const frame of frames) {
-      const framePath = path.join(framesDir, frame);
+      const framePath = path.join(framesDir, frame.file);
       const imageBuffer = fs.readFileSync(framePath);
       const base64Image = imageBuffer.toString('base64');
 

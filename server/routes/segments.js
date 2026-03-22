@@ -36,7 +36,7 @@ router.post('/batch', (req, res) => {
   }
 
   try {
-    // 批量查询多个bvid的广告段（优化性能：一次查询）
+    // 批量查询多个bvid的分段评价（优化性能：一次查询）
     const placeholders = bvids.map(() => '?').join(',');
     const segments = db.prepare(`
       SELECT 
