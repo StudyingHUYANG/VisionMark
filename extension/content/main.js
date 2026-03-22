@@ -1,4 +1,7 @@
-﻿(function () {
+﻿import { createChapterTimelineInjector, watchBilibiliSpaRoute } from './chapterRail/inject.js';
+import { ANALYSIS_UPDATED_EVENT } from './events.js';
+
+(function () {
   'use strict';
 
   if (window.adSkipper) return;
@@ -84,11 +87,15 @@
       this.progressHoverCard = null;
       this.hoveredSegmentKey = null;
       this.segmentMarkerRetryTimer = null;
+      this.chapterTimelineController = createChapterTimelineInjector();
+      this.routeWatcherCleanup = null;
+      this.lastRouteBvid = null;
     }
 
     init() {
       console.log("[AdSkipper] 初始化...");
-      
+      this.chapterTimelineController.init();
+
       // 1. Load preferences
       this.initPrefs();
 
@@ -104,6 +111,8 @@
            console.log('[AdSkipper] 暂未找到播放器，Keeper将继续尝试');
            return;
         }
+        this.lastRouteBvid = this.player.currentBvid || null;
+        this.startSpaRouteWatcher();
         this.onPlayerReady();
       });
     }
@@ -178,8 +187,20 @@
            this.refreshAnalysisForBvid(this.player.currentBvid, { forceAnalyze: true });
         }
       });
-      window.addEventListener('visionmark:delete-segment', (e) => this.handleSidebarDelete(Number(e?.detail?.segmentId)));
-      
+      window.addEventListener('visionmark:delete-segment', (event) => {
+        const segmentId = Number(event?.detail?.segmentId);
+        this.handleSidebarDelete(segmentId);
+      });
+
+      window.addEventListener('beforeunload', () => {
+        if (this.routeWatcherCleanup) {
+          this.routeWatcherCleanup();
+          this.routeWatcherCleanup = null;
+        }
+        this.chapterTimelineController.destroy();
+      }, { once: true });
+
+      // 调试：将实例暴露到全局，便于控制台调试
       window.adSkipperDebug = this;
       console.log('[AdSkipper] 调试模式已启用');
     }
@@ -193,6 +214,60 @@
         if (bvid) {
           this.refreshAnalysisForBvid(bvid).then(() => window.adSkipper = this);
         }
+    }
+
+    startSpaRouteWatcher() {
+      if (this.routeWatcherCleanup) return;
+
+      this.routeWatcherCleanup = watchBilibiliSpaRoute(({ bvid }) => {
+        this.handleSpaRouteChange(bvid);
+      });
+    }
+
+    handleSpaRouteChange(nextBvid) {
+      const normalizedBvid = typeof nextBvid === 'string' ? nextBvid : '';
+
+      if (typeof this.player.refreshContext === 'function') {
+        this.player.refreshContext(normalizedBvid || null);
+      } else if (normalizedBvid) {
+        this.player.currentBvid = normalizedBvid;
+      }
+
+      if (!normalizedBvid || normalizedBvid === this.lastRouteBvid) {
+        return;
+      }
+
+      this.lastRouteBvid = normalizedBvid;
+      this.handleVideoSwitch(normalizedBvid).catch((error) => {
+        console.error('[AdSkipper] SPA 视频切换处理失败:', error);
+      });
+    }
+
+    async handleVideoSwitch(nextBvid) {
+      this.hideSkipButton();
+      this.pendingStart = null;
+      this.pendingEnd = null;
+      this.lastSkipTime = 0;
+      this.segments = [];
+      this.allSegments = [];
+      this.currentSegmentIds = [];
+      this.analysisBvid = null;
+      this.clearKnowledgeDanmuState();
+
+      if (sidebarState) {
+        sidebarState.bvid = nextBvid;
+        sidebarState.cid = this.player.currentCid || null;
+        sidebarState.currentTime = 0;
+        sidebarState.aiSummary = '';
+        sidebarState.aiTitle = '';
+        sidebarState.knowledgePoints = [];
+        sidebarState.hotWords = [];
+        sidebarState.loadError = null;
+        sidebarState.segments = [];
+        sidebarState.activeSegmentKey = null;
+      }
+
+      await this.refreshAnalysisForBvid(nextBvid);
     }
 
     async initSidebar() {
@@ -1487,6 +1562,10 @@
         sidebarState.segments = aiSegments;
         sidebarState.activeSegmentKey = null;
       }
+
+      window.dispatchEvent(new CustomEvent(ANALYSIS_UPDATED_EVENT, {
+        detail: { bvid }
+      }));
     }
 
     async analyzeVideoLegacy(bvid) {

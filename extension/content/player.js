@@ -12,22 +12,10 @@ class BilibiliPlayerController {
   }
 
   tryFindVideo(callback, attempts) {
-    const selectors = [
-      'video[src*="bilivideo"]',
-      'video[class*="bilateral-player"]',
-      'bpx-player-video-wrap video',
-      '.bilibili-player-video video',
-      'video'
-    ];
-
-    for (const selector of selectors) {
-      const video = document.querySelector(selector);
-      // Relaxed check: don't require readyState >= 1 immediately for initial detection
-      if (video) {
-        this.video = video;
-        console.log('[AdSkipper] Video found');
-        break;
-      }
+    const video = this.findVideoElement();
+    if (video) {
+      this.video = video;
+      console.log('[AdSkipper] Video found');
     }
 
     if (this.video) {
@@ -45,10 +33,60 @@ class BilibiliPlayerController {
     callback(false);
   }
 
+  findVideoElement() {
+    const selectors = [
+      'video[src*="bilivideo"]',
+      'video[class*="bilateral-player"]',
+      'bpx-player-video-wrap video',
+      '.bilibili-player-video video',
+      'video'
+    ];
+
+    for (const selector of selectors) {
+      const video = document.querySelector(selector);
+      if (video) {
+        return video;
+      }
+    }
+
+    return null;
+  }
+
   extractVideoId() {
-    const match = window.location.pathname.match(/BV[a-zA-Z0-9]+/);
-    this.currentBvid = match ? match[0] : null;
+    const urlMatch = window.location.href.match(/BV[a-zA-Z0-9]+/i);
+
+    if (urlMatch) {
+      this.currentBvid = urlMatch[0];
+      console.log('[AdSkipper] BVID:', this.currentBvid);
+      return;
+    }
+
+    const initialState = window.__INITIAL_STATE__ || {};
+    const candidates = [
+      initialState?.bvid,
+      initialState?.videoData?.bvid,
+      initialState?.epInfo?.bvid,
+      initialState?.mediaInfo?.bvid
+    ];
+
+    const matchedBvid = candidates.find((candidate) => typeof candidate === 'string' && /^BV[a-zA-Z0-9]+$/i.test(candidate));
+    this.currentBvid = matchedBvid || null;
     console.log('[AdSkipper] BVID:', this.currentBvid);
+  }
+
+  refreshContext(nextBvid = null) {
+    const nextVideo = this.findVideoElement();
+    if (nextVideo) {
+      this.video = nextVideo;
+    }
+
+    if (nextBvid) {
+      this.currentBvid = nextBvid;
+    } else {
+      this.extractVideoId();
+    }
+
+    return Boolean(this.video);
   }
 
   setupListeners() {
