@@ -1759,6 +1759,13 @@
       if (!segment || segment.action !== 'skip') return;
 
       if (this.skipMode === 'auto') {
+        const segKey = this.getSegmentKey(segment);
+        if (!this.autoSkippedSegments) this.autoSkippedSegments = new Set();
+        
+        // 确保每个片段在一次播放中只会被自动跳过一次
+        if (this.autoSkippedSegments.has(segKey)) return;
+        this.autoSkippedSegments.add(segKey);
+
         this.seekToSegmentEnd(segment);
         this.lastSkipTime = Date.now();
         this.showSkipNotification(segment);
@@ -1775,6 +1782,7 @@
       if (this.analysisBvid && this.player.currentBvid && this.analysisBvid !== this.player.currentBvid) {
         this.clearKnowledgeDanmuState();
         this.analysisBvid = this.player.currentBvid;
+        this.autoSkippedSegments = new Set();
       }
 
       if (sidebarState) {
