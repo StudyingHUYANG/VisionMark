@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "B站视频分段评价 - 众测版",
+  "name": "视界识VisionMark-多模态视频内容理解助手",
   "version": "1.0.0",
-  "description": "社区驱动的B站视频分段评价插件",
+  "description": "基于多模态大模型的视频内容理解与智能交互助手",
   "permissions": [
     "storage",
     "activeTab",

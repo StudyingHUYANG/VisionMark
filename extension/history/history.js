@@ -12,9 +12,7 @@ const pageSize = 20;
 const typeLabels = {
   'hard_ad': '商业内容',
   'soft_ad': '推广内容',
-  'product_placement': '植入',
-  'intro_ad': '片头',
-  'mid_ad': '中段'
+  'product_placement': '品牌植入'
 };
 
 // Get token
