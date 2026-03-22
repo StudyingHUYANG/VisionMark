@@ -90,9 +90,23 @@ class BilibiliPlayerController {
   }
 
   setupListeners() {
-    if (!this.video) return;
     setInterval(() => {
-      if (this.onTimeUpdate) {
+      // 在 B 站这种 SPA 单页应用中，切换视频时页面不刷新但 URL 会变
+      const match = window.location.pathname.match(/BV[a-zA-Z0-9]+/);
+      const newBvid = match ? match[0] : null;
+      
+      if (newBvid && newBvid !== this.currentBvid) {
+        console.log('[AdSkipper] BVID changed from', this.currentBvid, 'to', newBvid);
+        this.currentBvid = newBvid;
+        
+        // 当视频切换时，原有 video 元素可能被销毁或替换，重新获取
+        const video = document.querySelector('video[src*="bilivideo"], video[class*="bilateral-player"], bpx-player-video-wrap video, .bilibili-player-video video, video');
+        if (video) {
+          this.video = video;
+        }
+      }
+
+      if (this.video && this.onTimeUpdate) {
         this.onTimeUpdate(this.video.currentTime);
       }
     }, 200);
