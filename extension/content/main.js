@@ -1425,7 +1425,7 @@
           position: absolute;
           bottom: 60px; /* 进度条上方 */
           left: 20px;   /* 视频界面左下角 */
-          z-index: 100;
+          z-index: 99999;
           pointer-events: none;
           transition: opacity 0.3s ease, transform 0.3s ease;
           opacity: 0;
@@ -1447,19 +1447,19 @@
       const explanation = item.rawExplanation || '暂无详细解释';
 
       layer.innerHTML = `
-        <div style="background: linear-gradient(145deg, rgba(255, 255, 255, 0.95) 0%, rgba(255, 248, 250, 0.9) 100%);
-                    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
-                    border-radius: 12px; padding: 12px 16px; border: 1px solid rgba(251, 114, 153, 0.4);
-                    box-shadow: 0 4px 16px rgba(251, 114, 153, 0.15); max-width: 320px;
+        <div style="background: rgba(0, 0, 0, 0.3);
+                    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+                    border-radius: 8px; padding: 10px 14px;
+                    max-width: 320px; pointer-events: none;
                     display: flex; flex-direction: column; gap: 6px;">
            <div style="display: flex; align-items: center; gap: 6px;">
              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fb7299" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M12 2c0 0-5 6-5 12a5 5 0 0 0 10 0c0-6-5-12-5-12Z"/>
                 <path d="M12 2v10"/>
              </svg>
-             <span style="font-size: 16px; font-weight: bold; color: #fb7299; margin: 0; text-shadow: 0 1px 2px rgba(251, 114, 153, 0.1);">${this.escapeHtml(word)}</span>
+             <span style="font-size: 16px; font-weight: bold; color: #fb7299; margin: 0; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);">${this.escapeHtml(word)}</span>
            </div>
-           <div style="font-size: 13px; color: #444; line-height: 1.5; font-weight: 500;">${this.escapeHtml(explanation)}</div>
+           <div style="font-size: 13px; color: #fff; line-height: 1.5; font-weight: 500; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);">${this.escapeHtml(explanation)}</div>
         </div>
       `;
       
