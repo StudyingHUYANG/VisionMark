@@ -8,14 +8,15 @@ const OpenAI = require('openai');
 
 const execPromise = util.promisify(exec);
 
-// 通义千问API配置 - 使用OpenAI兼容模式
-const QWEN_API_KEY = process.env.QWEN_API_KEY || 'sk-df7f07a45dee431fb8cc9b6453df5f34';
-
-// 创建OpenAI客户端
-const openaiClient = new OpenAI({
-  apiKey: QWEN_API_KEY,
-  baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-});
+// 系统默认模型配置
+const DEFAULT_MODEL_CONFIG = {
+  provider: 'qwen',
+  apiKey: process.env.QWEN_API_KEY || 'sk-df7f07a45dee431fb8cc9b6453df5f34',
+  baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+  textModel: 'qwen-turbo',
+  visionModel: 'qwen-vl-max',
+  asrModel: 'paraformer-v2'
+};
 
 // 阿里云OSS配置 - 用于上传音频文件
 const OSS = require('ali-oss');
@@ -49,6 +50,28 @@ class VideoAnalyzer {
   constructor() {
     this.downloadDir = path.join(__dirname, '../../downloads');
     this.ensureDownloadDir();
+  }
+
+  getEffectiveModelConfig(userConfig = null) {
+    if (!userConfig) {
+      return { ...DEFAULT_MODEL_CONFIG };
+    }
+
+    return {
+      provider: userConfig.provider || DEFAULT_MODEL_CONFIG.provider,
+      apiKey: userConfig.apiKey || DEFAULT_MODEL_CONFIG.apiKey,
+      baseUrl: userConfig.baseUrl || DEFAULT_MODEL_CONFIG.baseUrl,
+      textModel: userConfig.textModel || userConfig.modelName || DEFAULT_MODEL_CONFIG.textModel,
+      visionModel: userConfig.visionModel || userConfig.modelName || DEFAULT_MODEL_CONFIG.visionModel,
+      asrModel: userConfig.asrModel || DEFAULT_MODEL_CONFIG.asrModel
+    };
+  }
+
+  createOpenAIClient(modelConfig) {
+    return new OpenAI({
+      apiKey: modelConfig.apiKey,
+      baseURL: modelConfig.baseUrl
+    });
   }
 
   ensureDownloadDir() {
@@ -207,8 +230,11 @@ class VideoAnalyzer {
    * @param {string} audioPath - 音频文件路径
    * @param {string} bvid - 视频BV号
    */
-  async transcribeAudio(audioPath, bvid) {
+  async transcribeAudio(audioPath, bvid, userConfig = null) {
     console.log('[VideoAnalyzer] 开始语音识别...');
+
+    const modelConfig = this.getEffectiveModelConfig(userConfig);
+    const asrApiKey = modelConfig.apiKey;
 
     try {
       if (!ossClient) {
@@ -250,7 +276,7 @@ class VideoAnalyzer {
       const submitResponse = await axios.post(
         'https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription',
         {
-          model: 'paraformer-v2',
+          model: modelConfig.asrModel,
           input: {
             file_urls: [audioUrl]
           },
@@ -263,7 +289,7 @@ class VideoAnalyzer {
         },
         {
           headers: {
-            'Authorization': `Bearer ${QWEN_API_KEY}`,
+            'Authorization': `Bearer ${asrApiKey}`,
             'Content-Type': 'application/json',
             'X-DashScope-Async': 'enable'  // 启用异步模式
           }
@@ -291,7 +317,7 @@ class VideoAnalyzer {
             `https://dashscope.aliyuncs.com/api/v1/tasks/${taskId}`,
             {
               headers: {
-                'Authorization': `Bearer ${QWEN_API_KEY}`,
+                'Authorization': `Bearer ${asrApiKey}`,
                 'Content-Type': 'application/json'
               }
             }
@@ -427,14 +453,16 @@ class VideoAnalyzer {
    * 从音频中提取知识点
    * @param {string} transcript - 音频转录文本
    */
-  async extractKnowledgePoints(transcript) {
+  async extractKnowledgePoints(transcript, userConfig = null) {
     if (!transcript) return null;
 
     console.log('[VideoAnalyzer] 提取知识点...');
+    const modelConfig = this.getEffectiveModelConfig(userConfig);
+    const client = this.createOpenAIClient(modelConfig);
 
     try {
-      const response = await openaiClient.chat.completions.create({
-        model: 'qwen-turbo',
+      const response = await client.chat.completions.create({
+        model: modelConfig.textModel,
         messages: [
           {
             role: 'user',
@@ -481,14 +509,17 @@ ${transcript}
    * 识别热词和网络梗（仅提取转录文本中原有的词）
    * @param {string} transcript - 音频转录文本
    */
-  async extractHotWords(transcript) {
+  async extractHotWords(transcript, userConfig = null) {
     if (!transcript) return null;
 
     console.log('[VideoAnalyzer] 识别热词和梗...');
 
+    const modelConfig = this.getEffectiveModelConfig(userConfig);
+    const client = this.createOpenAIClient(modelConfig);
+
     try {
-      const response = await openaiClient.chat.completions.create({
-        model: 'qwen-turbo',
+      const response = await client.chat.completions.create({
+        model: modelConfig.textModel,
         messages: [
           {
             role: 'user',
@@ -545,8 +576,10 @@ ${transcript}
    * @param {number} duration - 视频时长（秒）
    * @param {string} transcript - 音频转录文本（可选）
    */
-  async analyzeWithQwen(videoPath, framesDir, duration, transcript = null) {
+  async analyzeWithQwen(videoPath, framesDir, duration, transcript = null, userConfig = null) {
     console.log('[VideoAnalyzer] 调用通义千问API进行视频分析...');
+    const modelConfig = this.getEffectiveModelConfig(userConfig);
+    const client = this.createOpenAIClient(modelConfig);
 
     // 获取所有帧图片
     const frames = fs.readdirSync(framesDir)
@@ -638,8 +671,8 @@ ${transcript || '无语音内容'}
 
     try {
       // 使用OpenAI兼容模式调用通义千问
-      const completion = await openaiClient.chat.completions.create({
-        model: 'qwen-vl-max',
+      const completion = await client.chat.completions.create({
+        model: modelConfig.visionModel,
         messages: [
           {
             role: 'user',
@@ -753,7 +786,7 @@ ${transcript || '无语音内容'}
   /**
    * 完整的视频分析流程（支持音视频结合分析）
    */
-  async analyzeVideo(url, useAudio = true) {
+  async analyzeVideo(url, useAudio = true, userConfig = null) {
     try {
       // 1. 提取视频信息
       const { bvid } = this.extractBilibiliInfo(url);
@@ -771,14 +804,14 @@ ${transcript || '无语音内容'}
       if (useAudio) {
         try {
           const audioPath = await this.extractAudio(videoPath, bvid);
-          transcript = await this.transcribeAudio(audioPath, bvid);
+          transcript = await this.transcribeAudio(audioPath, bvid, userConfig);
         } catch (error) {
           console.warn('[VideoAnalyzer] 音频处理失败，继续使用画面分析:', error.message);
         }
       }
 
       // 5. AI分析（基于关键帧、时长和音频转录），知识点和热词从分析结果中获取
-      const analysisResult = await this.analyzeWithQwen(videoPath, framesDir, duration, transcript);
+      const analysisResult = await this.analyzeWithQwen(videoPath, framesDir, duration, transcript, userConfig);
 
       // 6. 整合所有分析结果
       const finalResult = {
