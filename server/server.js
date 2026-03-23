@@ -7,12 +7,14 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const config = require('./config.js');
+const modelConfigRouter = require('./routes/modelConfig.js');
 
 const app = express();
 const JWT_SECRET = config.JWT_SECRET;
 
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
+app.use('/api/v1/model-config', modelConfigRouter);
 
 const db = require('./database/db');
 
@@ -40,12 +42,6 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS annotations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     video_id INTEGER NOT NULL,
-    start_time REAL,
-    end_time REAL,
-    ad_type TEXT,
-    contributor_id INTEGER,
-    is_active BOOLEAN DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     source_type TEXT NOT NULL,              -- AI / HUMAN
     submitter_id INTEGER,                   -- HUMAN时是用户id，AI时可为空
     submitter_name TEXT,                    -- HUMAN时是用户名，AI时写'AI'
@@ -56,7 +52,22 @@ db.exec(`
     transcript TEXT,
     score REAL,
     content_json TEXT NOT NULL,             -- 统一存完整JSON
-    model_name TEXT                        -- AI模型名
+    model_name TEXT,                        -- AI模型名
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS user_api_configs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'qwen',
+    api_key TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    is_enabled INTEGER DEFAULT 1,
+    extra_config TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, provider)
   );
 
 `);
