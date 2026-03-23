@@ -2,37 +2,13 @@ const express = require('express');
 const router = express.Router();
 const db = require('../database/db');
 const { authenticateToken } = require('../middlewares/auth.js');
+const { getModelConfigState, getSystemDefaultModelConfig } = require('../services/modelConfigService');
 
 // 获取当前用户模型配置
 router.get('/', authenticateToken, (req, res) => {
   try {
     const userId = req.user.userId;
-
-    const row = db.prepare(`
-      SELECT provider, base_url, model_name, is_enabled, api_key
-      FROM user_api_configs
-      WHERE user_id = ?
-      ORDER BY updated_at DESC
-      LIMIT 1
-    `).get(userId);
-
-    if (!row) {
-      return res.json({
-        configured: false,
-        data: null
-      });
-    }
-
-    res.json({
-      configured: true,
-      data: {
-        provider: row.provider,
-        baseUrl: row.base_url,
-        modelName: row.model_name,
-        isEnabled: !!row.is_enabled,
-        hasApiKey: !!row.api_key
-      }
-    });
+    res.json(getModelConfigState(userId));
   } catch (error) {
     console.error('[ModelConfig] 获取配置失败:', error);
     res.status(500).json({ error: '获取配置失败', message: error.message });
@@ -99,18 +75,20 @@ router.post('/test', authenticateToken, async (req, res) => {
       provider = 'qwen',
       apiKey,
       baseUrl,
-      modelName
+      modelName,
+      useDefaultKey = false
     } = req.body;
 
-    const systemDefaultKey = process.env.QWEN_API_KEY || 'sk-df7f07a45dee431fb8cc9b6453df5f34';
-    const finalApiKey = apiKey || systemDefaultKey;
+    const defaultConfig = getSystemDefaultModelConfig();
+    const trimmedApiKey = typeof apiKey === 'string' ? apiKey.trim() : '';
+    const finalApiKey = trimmedApiKey || (useDefaultKey ? defaultConfig.apiKey : '');
 
     if (!provider || !baseUrl || !modelName) {
       return res.status(400).json({ error: '缺少必要字段' });
     }
 
     if (!finalApiKey) {
-      return res.status(400).json({ error: '缺少 apiKey，且系统默认 key 不存在' });
+      return res.status(400).json({ error: '缺少 apiKey' });
     }
 
     if (provider !== 'qwen') {

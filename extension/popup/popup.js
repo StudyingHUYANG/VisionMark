@@ -7,6 +7,7 @@ const NETWORK_ERROR_CODE = 'NETWORK_UNAVAILABLE';
 const NETWORK_COOLDOWN_MS = 30000;
 const NETWORK_TIMEOUT_MS = 6000;
 const USER_CACHE_TTL_MS = 5000;
+const SUPPORTED_VIDEO_URL_PATTERN = /^https:\/\/www\.bilibili\.com\/video\//i;
 
 const networkState = {
   offlineUntil: 0,
@@ -388,24 +389,50 @@ function setSkipMode(mode) {
   });
 }
 
-// 刷新功能
-async function refreshAllData() {
-  const refreshBtn = document.getElementById('refresh-btn');
-  const originalText = refreshBtn.innerHTML;
-  refreshBtn.innerHTML = '🔄 刷新中...';
-  refreshBtn.disabled = true;
-  
-  try {
-    await refreshUserInfo();
-    showError('✓ 数据已刷新');
-  } catch(err) {
-    showError('刷新失败: ' + err.message);
-  } finally {
-    setTimeout(() => {
-      refreshBtn.innerHTML = originalText;
-      refreshBtn.disabled = false;
-    }, 1000);
-  }
+function isSupportedVideoTab(tab) {
+  return Boolean(tab && typeof tab.url === 'string' && SUPPORTED_VIDEO_URL_PATTERN.test(tab.url));
+}
+
+function resetModelConfigButton(button, originalText) {
+  if (!button) return;
+  button.innerHTML = originalText;
+  button.disabled = false;
+}
+
+function openModelConfigModal() {
+  const modelConfigBtn = document.getElementById('model-config-btn');
+  if (!modelConfigBtn) return;
+
+  const originalText = modelConfigBtn.innerHTML;
+  modelConfigBtn.innerHTML = '⚙️ 打开中...';
+  modelConfigBtn.disabled = true;
+
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const currentTab = Array.isArray(tabs) ? tabs[0] : null;
+
+    if (!isSupportedVideoTab(currentTab)) {
+      resetModelConfigButton(modelConfigBtn, originalText);
+      showError('请在 B 站视频页打开自定义 API 设置');
+      return;
+    }
+
+    if (!Number.isInteger(currentTab.id)) {
+      resetModelConfigButton(modelConfigBtn, originalText);
+      showError('当前页面暂不支持打开自定义 API 设置');
+      return;
+    }
+
+    chrome.tabs.sendMessage(currentTab.id, { action: 'openModelConfigModal' }, (response) => {
+      if (chrome.runtime.lastError || !response?.success) {
+        console.warn('[Popup] 打开自定义 API 弹窗失败:', chrome.runtime.lastError || response?.error);
+        resetModelConfigButton(modelConfigBtn, originalText);
+        showError('请在 B 站视频页打开自定义 API 设置');
+        return;
+      }
+
+      window.close();
+    });
+  });
 }
 
 // 初始化
@@ -424,8 +451,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('switch-text').onclick = toggleMode;
   document.getElementById('logout-btn').onclick = logout;
   document.getElementById('history-btn').onclick = openHistoryPage;
-  // 绑定刷新按钮
-  document.getElementById('refresh-btn').onclick = refreshAllData;
+  document.getElementById('model-config-btn').onclick = openModelConfigModal;
 
   // 绑定登录后面板的跳过模式切换按钮
   document.getElementById('user-mode-auto').onclick = () => setSkipMode('auto');
