@@ -141,7 +141,14 @@ app.get('/api/v1/segments', (req, res) => {
   const segments = annotations
     .flatMap(row => {
       const content = safeParseContent(row.content_json);
-      return extractLegacyAdSegments(content);
+      return extractLegacyAdSegments(content).map((seg) => {
+        const shouldPopup = inferPopupAction(seg);
+        return {
+          ...seg,
+          action: shouldPopup ? 'popup' : 'skip',
+          content: typeof seg.content === 'string' ? seg.content : (typeof seg.description === 'string' ? seg.description : null)
+        };
+      });
     })
     .sort((a, b) => a.start_time - b.start_time);
 
@@ -253,6 +260,36 @@ function extractLegacyAdSegments(content) {
   }
 
   return [];
+}
+
+function inferPopupAction(segment) {
+  if (!segment || typeof segment !== 'object') return false;
+
+  if (typeof segment.action === 'string') {
+    const action = segment.action.trim().toLowerCase();
+    if (action === 'popup') return true;
+    if (action === 'skip') return false;
+  }
+
+  const highlightValue = typeof segment.highlight === 'string'
+    ? segment.highlight.trim().toLowerCase()
+    : segment.highlight;
+
+  if (
+    highlightValue === true ||
+    highlightValue === 1 ||
+    highlightValue === '1' ||
+    highlightValue === 'true' ||
+    highlightValue === 'yes' ||
+    highlightValue === 'y' ||
+    highlightValue === 'popup' ||
+    highlightValue === 'high-energy' ||
+    highlightValue === 'high_energy'
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 // 引入路由文件

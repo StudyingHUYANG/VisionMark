@@ -610,7 +610,23 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       const start = Number(segment.start ?? segment.start_time ?? 0);
       const end = Number(segment.end ?? segment.end_time ?? 0);
       const candidateAction = typeof segment.action === 'string' ? segment.action.toLowerCase() : '';
-      const action = candidateAction === 'popup' || candidateAction === 'skip' ? candidateAction : 'skip';
+      const hasLegacyHighlight = segment.highlight !== undefined && segment.highlight !== null;
+      const legacyHighlightValue = typeof segment.highlight === 'string'
+        ? segment.highlight.trim().toLowerCase()
+        : segment.highlight;
+      const legacyPopup =
+        legacyHighlightValue === true ||
+        legacyHighlightValue === 1 ||
+        legacyHighlightValue === '1' ||
+        legacyHighlightValue === 'true' ||
+        legacyHighlightValue === 'yes' ||
+        legacyHighlightValue === 'y' ||
+        legacyHighlightValue === 'popup' ||
+        legacyHighlightValue === 'high-energy' ||
+        legacyHighlightValue === 'high_energy';
+      const action = candidateAction === 'popup' || candidateAction === 'skip'
+        ? candidateAction
+        : (legacyPopup ? 'popup' : 'skip');
       const isAiSegment = Boolean(segment.is_ai_segment);
       const aiSegmentDisplayType = isAiSegment
         ? (segment.ai_segment_display_type === 'high-energy' || segment.ai_segment_display_type === 'clip'
@@ -618,7 +634,9 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           : (action === 'popup' ? 'high-energy' : 'clip'))
         : null;
 
-      const rawContent = typeof segment.content === 'string' ? segment.content.trim() : null;
+      const rawContent = typeof segment.content === 'string'
+        ? segment.content.trim()
+        : (typeof segment.description === 'string' ? segment.description.trim() : null);
       const content = isAiSegment
         ? (rawContent || null)
         : (action === 'popup' ? (rawContent || null) : null);
@@ -635,7 +653,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         is_ai_segment: isAiSegment,
         ai_segment_display_type: aiSegmentDisplayType,
         ad_type: segment.ad_type || (action === 'skip' ? 'hard_ad' : 'mid_ad'),
-        hasActionField: typeof segment.action === 'string'
+        hasActionField: typeof segment.action === 'string' || hasLegacyHighlight
       };
     }
 
