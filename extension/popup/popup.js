@@ -136,6 +136,7 @@ function showPanel(panelId) {
   document.getElementById('auth-form').style.display = panelId === 'auth-form' ? 'block' : 'none';
   document.getElementById('user-panel').style.display = panelId === 'user-panel' ? 'block' : 'none';
   document.getElementById('model-config-panel').style.display = panelId === 'model-config-panel' ? 'block' : 'none';
+  document.body.classList.toggle('popup-mode-model-config', panelId === 'model-config-panel');
 }
 
 function getStoredUser() {
@@ -435,6 +436,7 @@ function getModelConfigElements() {
     modelName: document.getElementById('model-name'),
     apiKey: document.getElementById('model-api-key'),
     toggle: document.getElementById('model-enabled-toggle'),
+    headerStatePill: document.getElementById('model-enabled-state-pill'),
     status: document.getElementById('model-config-status'),
     statusMeta: document.getElementById('model-config-status-meta'),
     apiKeyStatus: document.getElementById('model-api-key-status'),
@@ -514,11 +516,18 @@ function renderModelConfigPanel() {
 
   const formDisabled = modelConfigState.loading || modelConfigState.saving || modelConfigState.testing;
   const isBusy = modelConfigState.saving || modelConfigState.testing;
+  const trimmedApiKey = String(modelConfigState.form.apiKey || '').trim();
+  const testingSystemDefault = modelConfigState.effectiveSource === 'system_default' && !trimmedApiKey;
 
   elements.provider.value = modelConfigState.form.provider;
   elements.baseUrl.value = modelConfigState.form.baseUrl;
   elements.modelName.value = modelConfigState.form.modelName;
   elements.apiKey.value = modelConfigState.form.apiKey;
+
+  elements.panel.dataset.source = modelConfigState.effectiveSource;
+  elements.panel.dataset.configured = String(modelConfigState.configured);
+  elements.panel.dataset.custom = String(modelConfigState.hasCustomConfig);
+  elements.panel.dataset.enabled = String(modelConfigState.form.isEnabled);
 
   elements.status.textContent = getModelConfigStatusLabel();
   elements.statusMeta.textContent = getModelConfigStatusMeta();
@@ -528,6 +537,22 @@ function renderModelConfigPanel() {
   elements.apiKeyBadge.textContent = modelConfigState.hasApiKey ? '已配置' : '未配置';
   elements.apiKeyBadge.classList.toggle('active', modelConfigState.hasApiKey);
   elements.apiKeyHint.textContent = getModelConfigApiKeyHint();
+
+  if (elements.headerStatePill) {
+    let stateLabel = '待配置';
+    let isInactive = true;
+
+    if (modelConfigState.hasCustomConfig) {
+      stateLabel = modelConfigState.form.isEnabled ? '当前启用' : '已暂停';
+      isInactive = !modelConfigState.form.isEnabled;
+    } else if (modelConfigState.effectiveSource === 'system_default') {
+      stateLabel = '默认兜底';
+      isInactive = false;
+    }
+
+    elements.headerStatePill.textContent = stateLabel;
+    elements.headerStatePill.classList.toggle('inactive', isInactive);
+  }
 
   elements.toggle.classList.toggle('active', modelConfigState.form.isEnabled);
   elements.toggle.setAttribute('aria-checked', String(modelConfigState.form.isEnabled));
@@ -541,8 +566,16 @@ function renderModelConfigPanel() {
   elements.saveBtn.disabled = formDisabled;
   elements.backBtn.disabled = isBusy;
 
-  elements.testBtn.textContent = modelConfigState.testing ? '测试中...' : '测试连接';
-  elements.saveBtn.textContent = modelConfigState.saving ? '保存中...' : '保存配置';
+  elements.testBtn.textContent = modelConfigState.testing
+    ? '测试中...'
+    : testingSystemDefault
+      ? '测试默认连接'
+      : '测试连接';
+  elements.saveBtn.textContent = modelConfigState.saving
+    ? '保存中...'
+    : modelConfigState.hasCustomConfig
+      ? '保存配置'
+      : '保存为自定义配置';
 
   elements.feedback.className = 'panel-feedback';
   elements.feedback.textContent = '';
