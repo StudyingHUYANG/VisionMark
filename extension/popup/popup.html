@@ -22,10 +22,8 @@
     }
 
     body.popup-mode-model-config {
-      background:
-        radial-gradient(circle at top right, rgba(251, 114, 153, 0.18), transparent 26%),
-        linear-gradient(180deg, #fff6f8 0%, #fff0f3 100%);
-      color: #2f2338;
+      background: #d3cbd1;
+      color: #241b29;
     }
 
     .header {
@@ -267,27 +265,24 @@
     }
 
     .model-config-panel {
-      --panel-bg: linear-gradient(180deg, rgba(255, 252, 250, 0.98), rgba(255, 243, 246, 0.99));
-      --panel-card: rgba(255, 255, 255, 0.84);
-      --panel-card-strong: rgba(255, 247, 249, 0.92);
-      --panel-line: rgba(227, 129, 163, 0.14);
-      --panel-text: #2f2338;
-      --panel-muted: #75677d;
-      --panel-accent: #e45d8e;
-      --panel-accent-soft: rgba(228, 93, 142, 0.14);
-      --panel-success: #2e9c71;
+      --panel-bg: rgba(241, 236, 239, 0.98);
+      --panel-card: rgba(246, 242, 244, 0.92);
+      --panel-card-strong: rgba(240, 235, 238, 0.94);
+      --panel-line: rgba(118, 105, 114, 0.16);
+      --panel-text: #241b29;
+      --panel-muted: #4f4550;
+      --panel-accent: #8d6174;
+      --panel-accent-soft: rgba(141, 97, 116, 0.08);
+      --panel-success: #466657;
       display: none;
       position: relative;
       padding: 18px 16px 16px;
       border-radius: 24px;
-      border: 1px solid rgba(227, 129, 163, 0.16);
-      background:
-        radial-gradient(circle at top right, rgba(251, 114, 153, 0.18), transparent 34%),
-        radial-gradient(circle at 12% 16%, rgba(255, 202, 110, 0.18), transparent 24%),
-        var(--panel-bg);
+      border: 1px solid rgba(118, 105, 114, 0.16);
+      background: var(--panel-bg);
       box-shadow:
-        0 22px 48px rgba(168, 108, 133, 0.18),
-        inset 0 1px 0 rgba(255, 255, 255, 0.78);
+        0 14px 30px rgba(84, 61, 76, 0.1),
+        inset 0 1px 0 rgba(255, 255, 255, 0.4);
       overflow: hidden;
     }
 
@@ -295,14 +290,12 @@
       content: "";
       position: absolute;
       inset: 0;
-      background:
-        linear-gradient(120deg, rgba(255, 255, 255, 0.36), transparent 40%),
-        linear-gradient(180deg, transparent 0%, rgba(255, 255, 255, 0.14) 100%);
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.12), transparent 28%);
       pointer-events: none;
     }
 
     .model-config-panel[data-source="user_custom"] {
-      --panel-accent-soft: rgba(46, 156, 113, 0.14);
+      --panel-accent-soft: rgba(70, 102, 87, 0.08);
     }
 
     .panel-header,
@@ -327,20 +320,20 @@
       height: 40px;
       flex-shrink: 0;
       border-radius: 14px;
-      background: rgba(255, 255, 255, 0.82);
-      border: 1px solid rgba(228, 93, 142, 0.14);
-      color: #3a2d44;
+      background: rgba(236, 231, 234, 0.96);
+      border: 1px solid rgba(118, 105, 114, 0.14);
+      color: #2b2130;
       font-size: 20px;
       line-height: 1;
       padding: 0;
       backdrop-filter: blur(8px);
       box-shadow:
-        0 10px 22px rgba(209, 157, 178, 0.16),
-        inset 0 1px 0 rgba(255, 255, 255, 0.72);
+        0 6px 14px rgba(102, 77, 92, 0.08),
+        inset 0 1px 0 rgba(255, 255, 255, 0.32);
     }
 
     .panel-back:hover {
-      background: rgba(255, 255, 255, 0.96);
+      background: rgba(242, 238, 240, 0.98);
     }
 
     .panel-copy {
@@ -354,8 +347,8 @@
       gap: 6px;
       padding: 4px 10px;
       border-radius: 999px;
-      background: rgba(228, 93, 142, 0.1);
-      color: #b14f76;
+      background: rgba(118, 105, 114, 0.08);
+      color: #5f5360;
       font-size: 10px;
       letter-spacing: 0.08em;
       text-transform: uppercase;
@@ -384,17 +377,17 @@
       min-width: 66px;
       padding: 6px 10px;
       border-radius: 999px;
-      background: rgba(46, 156, 113, 0.12);
-      border: 1px solid rgba(46, 156, 113, 0.18);
-      color: #287554;
+      background: rgba(70, 102, 87, 0.12);
+      border: 1px solid rgba(70, 102, 87, 0.16);
+      color: #3f5d50;
       font-size: 11px;
       font-weight: 700;
     }
 
     .panel-state-pill.inactive {
-      background: rgba(116, 103, 125, 0.08);
-      border-color: rgba(116, 103, 125, 0.12);
-      color: #665a70;
+      background: rgba(93, 81, 96, 0.06);
+      border-color: rgba(93, 81, 96, 0.1);
+      color: #574b5b;
     }
 
     .panel-description {
@@ -408,30 +401,24 @@
       margin-bottom: 12px;
       padding: 16px;
       border-radius: 18px;
-      background:
-        linear-gradient(135deg, rgba(251, 114, 153, 0.16), rgba(255, 184, 115, 0.16)),
-        rgba(255, 255, 255, 0.82);
-      border: 1px solid rgba(227, 129, 163, 0.16);
+      background: rgba(236, 231, 234, 0.94);
+      border: 1px solid rgba(118, 105, 114, 0.14);
       box-shadow:
-        0 14px 28px rgba(226, 170, 191, 0.14),
-        inset 0 1px 0 rgba(255, 255, 255, 0.62);
+        0 8px 18px rgba(100, 74, 87, 0.08),
+        inset 0 1px 0 rgba(255, 255, 255, 0.32);
     }
 
     .model-config-panel[data-source="user_custom"] .panel-status-hero {
-      background:
-        linear-gradient(135deg, rgba(123, 224, 176, 0.14), rgba(83, 175, 224, 0.12)),
-        rgba(255, 255, 255, 0.82);
+      background: rgba(232, 236, 233, 0.94);
     }
 
     .model-config-panel[data-source="none"] .panel-status-hero {
-      background:
-        linear-gradient(135deg, rgba(255, 235, 241, 0.8), rgba(255, 246, 236, 0.85)),
-        rgba(255, 255, 255, 0.86);
+      background: rgba(236, 231, 234, 0.94);
     }
 
     .panel-status-hero-label {
       display: block;
-      color: #8a6577;
+      color: #6b5c68;
       font-size: 11px;
       letter-spacing: 0.08em;
       text-transform: uppercase;
@@ -448,7 +435,7 @@
 
     .panel-status-hero-meta {
       display: block;
-      color: #6d5d73;
+      color: #544753;
       font-size: 12px;
       line-height: 1.5;
       margin-top: 6px;
@@ -464,17 +451,17 @@
     .panel-status-card {
       padding: 12px 13px;
       border-radius: 16px;
-      background: rgba(255, 255, 255, 0.74);
-      border: 1px solid rgba(227, 129, 163, 0.12);
+      background: rgba(245, 241, 243, 0.94);
+      border: 1px solid rgba(118, 105, 114, 0.12);
       backdrop-filter: blur(8px);
       box-shadow:
-        0 10px 24px rgba(226, 176, 194, 0.1),
-        inset 0 1px 0 rgba(255, 255, 255, 0.8);
+        0 6px 14px rgba(96, 71, 84, 0.06),
+        inset 0 1px 0 rgba(255, 255, 255, 0.28);
     }
 
     .panel-status-label {
       display: block;
-      color: #927085;
+      color: #6c5e69;
       font-size: 11px;
       margin-bottom: 7px;
       letter-spacing: 0.04em;
@@ -482,7 +469,7 @@
 
     .panel-status-value {
       display: block;
-      color: #fff;
+      color: var(--panel-text);
       font-size: 13px;
       font-weight: 700;
       line-height: 1.45;
@@ -490,7 +477,7 @@
 
     .panel-status-meta {
       display: block;
-      color: #7c6b80;
+      color: #574a57;
       font-size: 11px;
       margin-top: 4px;
       line-height: 1.5;
@@ -509,34 +496,34 @@
 
     .panel-feedback--info {
       display: block;
-      color: #305d9a;
-      background: rgba(88, 143, 234, 0.1);
-      border-color: rgba(88, 143, 234, 0.16);
+      color: #234879;
+      background: rgba(88, 143, 234, 0.08);
+      border-color: rgba(88, 143, 234, 0.12);
     }
 
     .panel-feedback--success {
       display: block;
-      color: #266f54;
-      background: rgba(46, 156, 113, 0.1);
-      border-color: rgba(46, 156, 113, 0.16);
+      color: #1d5a44;
+      background: rgba(46, 156, 113, 0.08);
+      border-color: rgba(46, 156, 113, 0.12);
     }
 
     .panel-feedback--error {
       display: block;
-      color: #a33959;
-      background: rgba(221, 91, 130, 0.1);
-      border-color: rgba(221, 91, 130, 0.16);
+      color: #8a2d49;
+      background: rgba(221, 91, 130, 0.08);
+      border-color: rgba(221, 91, 130, 0.12);
     }
 
     .panel-section {
       margin-bottom: 14px;
       padding: 14px;
       border-radius: 18px;
-      background: rgba(255, 255, 255, 0.72);
-      border: 1px solid rgba(227, 129, 163, 0.12);
+      background: rgba(238, 232, 236, 0.94);
+      border: 1px solid rgba(118, 105, 114, 0.12);
       box-shadow:
-        0 14px 28px rgba(226, 176, 194, 0.1),
-        inset 0 1px 0 rgba(255, 255, 255, 0.72);
+        0 6px 14px rgba(100, 74, 87, 0.06),
+        inset 0 1px 0 rgba(255, 255, 255, 0.28);
     }
 
     .panel-section-header {
@@ -548,7 +535,7 @@
     }
 
     .panel-section-title {
-      color: #342838;
+      color: #271e2d;
       font-size: 13px;
       font-weight: 700;
       letter-spacing: 0.04em;
@@ -556,7 +543,7 @@
 
     .panel-section-note {
       max-width: 180px;
-      color: #7a6a7e;
+      color: #5f5360;
       font-size: 11px;
       line-height: 1.5;
       text-align: right;
@@ -570,9 +557,9 @@
     .field-card {
       padding: 12px;
       border-radius: 16px;
-      background: rgba(255, 255, 255, 0.88);
-      border: 1px solid rgba(227, 129, 163, 0.1);
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.88);
+      background: rgba(247, 243, 245, 0.98);
+      border: 1px solid rgba(118, 105, 114, 0.1);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.34);
     }
 
     .field-card label {
@@ -580,7 +567,7 @@
       align-items: center;
       justify-content: space-between;
       gap: 8px;
-      color: #7b6070;
+      color: #5c4f5a;
       font-size: 11px;
       letter-spacing: 0.08em;
       text-transform: uppercase;
@@ -592,8 +579,8 @@
       align-items: center;
       padding: 3px 8px;
       border-radius: 999px;
-      background: rgba(243, 232, 238, 0.92);
-      color: #8a6c80;
+      background: rgba(224, 216, 221, 0.92);
+      color: #6b5d69;
       font-size: 10px;
       font-weight: 700;
       letter-spacing: normal;
@@ -604,10 +591,10 @@
     .model-config-panel select {
       width: 100%;
       padding: 12px 14px;
-      background: rgba(255, 255, 255, 0.96);
-      border: 1px solid rgba(223, 199, 211, 0.92);
+      background: #f8f5f6;
+      border: 1px solid rgba(156, 143, 151, 0.92);
       border-radius: 12px;
-      color: #32273b;
+      color: #241b29;
       font-size: 13px;
       outline: none;
       transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
@@ -615,18 +602,18 @@
 
     .model-config-panel input::placeholder,
     .model-config-panel select:invalid {
-      color: #9d8a9b;
+      color: #766874;
     }
 
     .model-config-panel input:focus,
     .model-config-panel select:focus {
-      border-color: rgba(228, 93, 142, 0.52);
-      background: #fff;
-      box-shadow: 0 0 0 4px rgba(228, 93, 142, 0.14);
+      border-color: rgba(141, 97, 116, 0.48);
+      background: #fbf9fa;
+      box-shadow: 0 0 0 3px rgba(141, 97, 116, 0.08);
     }
 
     .field-note {
-      color: #7d6f81;
+      color: #584d58;
       font-size: 11px;
       line-height: 1.55;
       margin-top: 8px;
@@ -636,7 +623,7 @@
       display: flex;
       align-items: center;
       gap: 8px;
-      color: #6d6172;
+      color: #4f4550;
       font-size: 11px;
       margin-top: 9px;
       line-height: 1.6;
@@ -648,16 +635,16 @@
       justify-content: center;
       padding: 3px 9px;
       border-radius: 999px;
-      background: rgba(242, 233, 238, 0.96);
-      color: #6e6171;
+      background: rgba(224, 216, 221, 0.96);
+      color: #574b57;
       font-size: 11px;
       font-weight: 700;
       white-space: nowrap;
     }
 
     .panel-badge.active {
-      background: rgba(228, 93, 142, 0.14);
-      color: #a54870;
+      background: rgba(141, 97, 116, 0.12);
+      color: #6b4756;
     }
 
     .panel-switch-row {
@@ -668,8 +655,8 @@
       padding: 14px;
       margin-top: 12px;
       border-radius: 16px;
-      background: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(252, 241, 246, 0.92));
-      border: 1px solid rgba(227, 129, 163, 0.12);
+      background: rgba(236, 231, 234, 0.94);
+      border: 1px solid rgba(118, 105, 114, 0.12);
     }
 
     .panel-switch-copy {
@@ -678,13 +665,13 @@
     }
 
     .panel-switch-title {
-      color: #342838;
+      color: #271e2d;
       font-size: 13px;
       font-weight: 700;
     }
 
     .panel-switch-hint {
-      color: #7d6e82;
+      color: #564a57;
       font-size: 11px;
       line-height: 1.55;
       margin-top: 4px;
@@ -697,15 +684,15 @@
       flex-shrink: 0;
       padding: 0;
       border-radius: 999px;
-      background: rgba(209, 196, 203, 0.9);
-      border: 1px solid rgba(193, 172, 183, 0.9);
-      box-shadow: inset 0 1px 3px rgba(94, 66, 81, 0.12);
+      background: rgba(184, 174, 181, 0.92);
+      border: 1px solid rgba(145, 134, 141, 0.9);
+      box-shadow: inset 0 1px 3px rgba(73, 54, 63, 0.12);
     }
 
     .switch-control.active {
-      background: linear-gradient(135deg, #FB7299, #ff9c80);
-      border-color: rgba(255, 184, 160, 0.25);
-      box-shadow: 0 10px 20px rgba(251, 114, 153, 0.18);
+      background: #8d6174;
+      border-color: rgba(141, 97, 116, 0.28);
+      box-shadow: 0 6px 14px rgba(95, 70, 83, 0.12);
     }
 
     .switch-thumb {
@@ -730,7 +717,7 @@
       gap: 10px;
       margin-top: 18px;
       padding-top: 14px;
-      border-top: 1px solid rgba(227, 129, 163, 0.12);
+      border-top: 1px solid rgba(118, 105, 114, 0.12);
     }
 
     .panel-actions button {
@@ -738,17 +725,17 @@
       padding: 12px 14px;
       font-size: 13px;
       letter-spacing: 0.02em;
-      box-shadow: 0 14px 26px rgba(201, 152, 173, 0.14);
+      box-shadow: 0 8px 18px rgba(95, 70, 83, 0.08);
     }
 
     .panel-actions .secondary {
-      background: rgba(255, 255, 255, 0.92);
-      border: 1px solid rgba(223, 199, 211, 0.92);
-      color: #382d43;
+      background: rgba(242, 237, 239, 0.96);
+      border: 1px solid rgba(156, 143, 151, 0.9);
+      color: #281f2d;
     }
 
     .panel-actions .secondary:hover {
-      background: #fff;
+      background: rgba(246, 242, 244, 0.98);
     }
 
     @media (max-width: 380px) {
