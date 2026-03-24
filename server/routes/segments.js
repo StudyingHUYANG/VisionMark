@@ -1,11 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const path = require('path');
-const Database = require('better-sqlite3');
-
-// 连接数据库（和server.js保持一致）
-const db = new Database(path.join(__dirname, '../database', 'app.db'));
-db.pragma('journal_mode = WAL');
+const db = require('../database/db');
 
 // 从独立的auth.js引入中间件（关键修复！）
 const { authenticateToken, checkContributor } = require('../middlewares/auth.js');
@@ -18,7 +13,7 @@ router.delete('/:id', authenticateToken, checkContributor, (req, res) => {
   try {
     // 级联删除：先删除标注（表中无投票记录，暂只删标注）
     const result = db.prepare(`
-      DELETE FROM ad_segments WHERE id = ?
+      DELETE FROM annotations WHERE id = ?
     `).run(segmentId);
 
     if (result.changes === 0) {
@@ -41,7 +36,7 @@ router.post('/batch', (req, res) => {
   }
 
   try {
-    // 批量查询多个bvid的广告段（优化性能：一次查询）
+    // 批量查询多个bvid的分段评价（优化性能：一次查询）
     const placeholders = bvids.map(() => '?').join(',');
     const segments = db.prepare(`
       SELECT 

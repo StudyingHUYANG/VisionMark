@@ -10,11 +10,9 @@ const pageSize = 20;
 
 // Ad type labels
 const typeLabels = {
-  'hard_ad': '硬广',
-  'soft_ad': '软广',
-  'product_placement': '植入',
-  'intro_ad': '片头',
-  'mid_ad': '中段'
+  'hard_ad': '商业内容',
+  'soft_ad': '推广内容',
+  'product_placement': '品牌植入'
 };
 
 // Get token
@@ -174,7 +172,7 @@ function jumpToVideo(bvid, startTime) {
   } catch (error) {
     alert('删除失败: ' + error.message);
   }
-}
+
 
 // Event listeners
 document.addEventListener('DOMContentLoaded', () => {

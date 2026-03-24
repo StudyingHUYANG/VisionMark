@@ -7,6 +7,7 @@ const express = require('express');
 const router = express.Router();
 const VideoAnalyzer = require('../services/videoAnalyzer');
 const { authenticateToken } = require('../middlewares/auth.js');
+const db = require('../database/db');
 
 // 创建视频分析器实例
 const videoAnalyzer = new VideoAnalyzer();
@@ -24,12 +25,30 @@ router.post('/analyze', authenticateToken, async (req, res) => {
     }
 
     console.log(`[API] 开始分析视频: ${bvid}`);
+    const userId = req.user.userId;
+
+    const configRow = db.prepare(`
+      SELECT provider, api_key, base_url, model_name, is_enabled
+      FROM user_api_configs
+      WHERE user_id = ? AND is_enabled = 1
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `).get(userId);
+
+    const userConfig = configRow ? {
+      provider: configRow.provider,
+      apiKey: configRow.api_key,
+      baseUrl: configRow.base_url,
+      modelName: configRow.model_name
+    } : null;
 
     // 构建B站视频URL
     const videoUrl = `https://www.bilibili.com/video/${bvid}`;
 
     // 调用新的 VideoAnalyzer
-    const result = await videoAnalyzer.analyzeVideo(videoUrl, true);
+    // 暂时禁用用户自定义 API 配置，当前分析统一走系统默认配置
+    // const result = await videoAnalyzer.analyzeVideo(videoUrl, true, userConfig);
+    const result = await videoAnalyzer.analyzeVideo(videoUrl, true, null);
 
     // 转换数据格式以适配前端
     const adaptedData = {
@@ -44,12 +63,72 @@ router.post('/analyze', authenticateToken, async (req, res) => {
         end_time: parseTimeToSeconds(seg.end_time),
         description: seg.description,
         highlight: seg.highlight,
-        ad_type: seg.highlight ? 'hard_ad' : 'soft_ad' // 根据 highlight 判断广告类型
+        ad_type: seg.highlight ? 'hard_ad' : 'soft_ad' // 根据 highlight 判断内容类型
       })) : [],
       knowledge_points: result.analysis.knowledge_points || [],
       hot_words: result.analysis.hot_words || [],
       analyzed_at: result.analyzed_at
     };
+
+    let video = db.prepare("SELECT id FROM videos WHERE bvid = ?").get(result.bvid);
+    if (!video) {
+      const r = db.prepare("INSERT INTO videos (bvid, cid) VALUES (?, ?)").run(result.bvid, null);
+      video = { id: r.lastInsertRowid };
+    }
+
+    const normalizedContent = {
+      meta: {
+        bvid: result.bvid,
+        title: result.analysis.title || null
+    },
+      content_analysis: {
+        summary: result.analysis.summary || null,
+        transcript: result.analysis.transcript || null,
+        knowledge_points: result.analysis.knowledge_points || [],
+        hot_words: result.analysis.hot_words || [],
+        tags: result.analysis.tags || [],
+        analyzed_at: result.analyzed_at || null,
+        ad_segments: result.analysis.segments
+          ? result.analysis.segments.map(seg => ({
+              start_time: parseTimeToSeconds(seg.start_time),
+              end_time: parseTimeToSeconds(seg.end_time),
+              ad_type: seg.highlight ? 'hard_ad' : 'soft_ad',
+              description: seg.description || null,
+              highlight: !!seg.highlight
+            }))
+          : []
+      }
+    };
+
+    db.prepare(`
+      INSERT INTO annotations (
+        video_id,
+        source_type,
+        submitter_id,
+        submitter_name,
+        parent_id,
+        annotation_type,
+        title,
+        summary,
+        transcript,
+        score,
+        content_json,
+        model_name
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      video.id,
+      'AI',
+      null,
+      'AI',
+      null,
+      'full_analysis',
+      adaptedData.title || null,
+      adaptedData.summary || null,
+      adaptedData.transcript || null,
+      null,
+      JSON.stringify(normalizedContent),
+      userConfig?.modelName || 'qwen-vl-max'
+    );
 
     res.json({
       success: true,
@@ -105,10 +184,30 @@ router.post('/batch', authenticateToken, async (req, res) => {
     console.log(`[API] 开始批量分析 ${videos.length} 个视频`);
 
     const results = [];
+
+    const userId = req.user.userId;
+
+    const configRow = db.prepare(`
+      SELECT provider, api_key, base_url, model_name, is_enabled
+      FROM user_api_configs
+      WHERE user_id = ? AND is_enabled = 1
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `).get(userId);
+
+    const userConfig = configRow ? {
+      provider: configRow.provider,
+      apiKey: configRow.api_key,
+      baseUrl: configRow.base_url,
+      modelName: configRow.model_name
+    } : null;
+
     for (const video of videos) {
       try {
         const videoUrl = `https://www.bilibili.com/video/${video.bvid}`;
-        const result = await videoAnalyzer.analyzeVideo(videoUrl, true);
+        // 暂时禁用用户自定义 API 配置，当前分析统一走系统默认配置
+        // const result = await videoAnalyzer.analyzeVideo(videoUrl, true, userConfig);
+        const result = await videoAnalyzer.analyzeVideo(videoUrl, true, null);
 
         // 转换数据格式
         const adaptedData = {
