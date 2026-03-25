@@ -1,4 +1,4 @@
-﻿import { createChapterTimelineInjector, watchBilibiliSpaRoute } from './chapterRail/inject.js';
+﻿﻿import { createChapterTimelineInjector, watchBilibiliSpaRoute } from './chapterRail/inject.js';
 import { ANALYSIS_UPDATED_EVENT } from './events.js';
 
 (function () {
@@ -626,7 +626,6 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         }
 
         this.addSegmentMarkers();
-      this.scheduleSegmentMarkerRetry(2);
       } catch (error) {
         if (error.code !== 'NETWORK_UNAVAILABLE') {
           console.error('[AdSkipper] 加载片段失败:', error);
@@ -835,11 +834,35 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       if (!card) {
         card = document.createElement('div');
         card.id = 'visionmark-progress-hover-card';
-        document.body.appendChild(card);
       }
+
+      const host = this.getProgressHoverCardHost();
+      if (card.parentNode !== host) {
+        host.appendChild(card);
+      }
+
+      card.style.position = host === document.body ? 'fixed' : 'absolute';
 
       this.progressHoverCard = card;
       return card;
+    }
+
+    getProgressHoverCardHost() {
+      const fullscreenHost = document.fullscreenElement
+        || document.webkitFullscreenElement
+        || document.mozFullScreenElement
+        || document.msFullscreenElement;
+
+      if (fullscreenHost instanceof HTMLElement) {
+        const computedStyle = window.getComputedStyle(fullscreenHost);
+        if (computedStyle.position === 'static') {
+          fullscreenHost.dataset.visionmarkHoverHost = 'true';
+          fullscreenHost.style.position = 'relative';
+        }
+        return fullscreenHost;
+      }
+
+      return document.body;
     }
 
     hideProgressHoverCard() {
@@ -962,8 +985,18 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
     }
 
     positionProgressHoverCard(card, anchorClientX, progressRect) {
-      const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
-      const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+      const host = this.getProgressHoverCardHost();
+      const isBodyHost = host === document.body;
+      const hostRect = isBodyHost
+        ? {
+            left: 0,
+            top: 0,
+            width: window.innerWidth || document.documentElement.clientWidth || 0,
+            height: window.innerHeight || document.documentElement.clientHeight || 0
+          }
+        : host.getBoundingClientRect();
+      const viewportWidth = hostRect.width || window.innerWidth || document.documentElement.clientWidth || 0;
+      const viewportHeight = hostRect.height || window.innerHeight || document.documentElement.clientHeight || 0;
       const preview = this.findNativeProgressPreview();
       const cardRect = card.getBoundingClientRect();
       const gap = 16;
@@ -989,6 +1022,11 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       }
       if (top + cardRect.height > viewportHeight - 12) {
         top = Math.max(12, viewportHeight - cardRect.height - 12);
+      }
+
+      if (!isBodyHost) {
+        left -= hostRect.left;
+        top -= hostRect.top;
       }
 
       card.style.left = `${Math.round(left)}px`;
@@ -1768,7 +1806,6 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       this.currentSegmentIds = [];
       this.updateKnowledgeDanmuSource(allDanmuItems, bvid);
       this.addSegmentMarkers();
-        this.scheduleSegmentMarkerRetry(2);
 
       if (sidebarState) {
         sidebarState.aiSummary = this.aiSummary || '暂无总结';
@@ -2775,9 +2812,6 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         progressContainer.querySelector('.bili-progress-slip') ||
         progressContainer.querySelector('.bpx-player-progress-buffer');
       const markerHost = progressSlide || progressContainer;
-      if (!progressSlide) {
-        console.warn('[AdSkipper] progress hover: progressSlide not found, fallback to progressContainer', progressContainer.className || progressContainer.id);
-      }
 
       if (this.segmentMarkerRetryTimer) {
         clearTimeout(this.segmentMarkerRetryTimer);
