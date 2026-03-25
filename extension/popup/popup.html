@@ -11,11 +11,19 @@
     }
 
     body {
-      width: 320px;
+      width: 360px;
+      max-height: 640px;
+      overflow-y: auto;
       padding: 20px;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background: #1e1e2e;
       color: #fff;
+      transition: background 0.22s ease, color 0.22s ease;
+    }
+
+    body.popup-mode-model-config {
+      background: #d3cbd1;
+      color: #241b29;
     }
 
     .header {
@@ -53,7 +61,8 @@
       margin-bottom: 5px;
     }
 
-    input {
+    input,
+    select {
       width: 100%;
       padding: 10px;
       background: #333;
@@ -64,7 +73,8 @@
       outline: none;
     }
 
-    input:focus {
+    input:focus,
+    select:focus {
       border-color: #FB7299;
     }
 
@@ -193,8 +203,8 @@
       background: #444;
     }
 
-    /* 刷新按钮样式 */
-    .refresh-btn {
+    /* 二级操作按钮样式 */
+    .panel-action-btn {
       background: #444;
       border: 1px solid #666;
       color: #fff;
@@ -207,7 +217,7 @@
       margin-right: auto;
     }
 
-    .refresh-btn:hover {
+    .panel-action-btn:hover {
       background: #555;
     }
 
@@ -252,6 +262,491 @@
       font-size: 11px;
       margin-top: 8px;
       text-align: center;
+    }
+
+    .model-config-panel {
+      --panel-bg: rgba(241, 236, 239, 0.98);
+      --panel-card: rgba(246, 242, 244, 0.92);
+      --panel-card-strong: rgba(240, 235, 238, 0.94);
+      --panel-line: rgba(118, 105, 114, 0.16);
+      --panel-text: #241b29;
+      --panel-muted: #4f4550;
+      --panel-accent: #8d6174;
+      --panel-accent-soft: rgba(141, 97, 116, 0.08);
+      --panel-success: #466657;
+      display: none;
+      position: relative;
+      padding: 18px 16px 16px;
+      border-radius: 24px;
+      border: 1px solid rgba(118, 105, 114, 0.16);
+      background: var(--panel-bg);
+      box-shadow:
+        0 14px 30px rgba(84, 61, 76, 0.1),
+        inset 0 1px 0 rgba(255, 255, 255, 0.4);
+      overflow: hidden;
+    }
+
+    .model-config-panel::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.12), transparent 28%);
+      pointer-events: none;
+    }
+
+    .model-config-panel[data-source="user_custom"] {
+      --panel-accent-soft: rgba(70, 102, 87, 0.08);
+    }
+
+    .panel-header,
+    .panel-section,
+    .panel-status-grid,
+    .panel-actions,
+    .panel-feedback,
+    .panel-status-hero {
+      position: relative;
+      z-index: 1;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .panel-back {
+      width: 40px;
+      height: 40px;
+      flex-shrink: 0;
+      border-radius: 14px;
+      background: rgba(236, 231, 234, 0.96);
+      border: 1px solid rgba(118, 105, 114, 0.14);
+      color: #2b2130;
+      font-size: 20px;
+      line-height: 1;
+      padding: 0;
+      backdrop-filter: blur(8px);
+      box-shadow:
+        0 6px 14px rgba(102, 77, 92, 0.08),
+        inset 0 1px 0 rgba(255, 255, 255, 0.32);
+    }
+
+    .panel-back:hover {
+      background: rgba(242, 238, 240, 0.98);
+    }
+
+    .panel-copy {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .panel-eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(118, 105, 114, 0.08);
+      color: #5f5360;
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .panel-title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .panel-title {
+      color: var(--panel-text);
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    .panel-state-pill {
+      flex-shrink: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 66px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(70, 102, 87, 0.12);
+      border: 1px solid rgba(70, 102, 87, 0.16);
+      color: #3f5d50;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .panel-state-pill.inactive {
+      background: rgba(93, 81, 96, 0.06);
+      border-color: rgba(93, 81, 96, 0.1);
+      color: #574b5b;
+    }
+
+    .panel-description {
+      color: var(--panel-muted);
+      font-size: 12px;
+      line-height: 1.6;
+      margin-top: 8px;
+    }
+
+    .panel-status-hero {
+      margin-bottom: 12px;
+      padding: 16px;
+      border-radius: 18px;
+      background: rgba(236, 231, 234, 0.94);
+      border: 1px solid rgba(118, 105, 114, 0.14);
+      box-shadow:
+        0 8px 18px rgba(100, 74, 87, 0.08),
+        inset 0 1px 0 rgba(255, 255, 255, 0.32);
+    }
+
+    .model-config-panel[data-source="user_custom"] .panel-status-hero {
+      background: rgba(232, 236, 233, 0.94);
+    }
+
+    .model-config-panel[data-source="none"] .panel-status-hero {
+      background: rgba(236, 231, 234, 0.94);
+    }
+
+    .panel-status-hero-label {
+      display: block;
+      color: #6b5c68;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .panel-status-hero-value {
+      display: block;
+      margin-top: 10px;
+      color: var(--panel-text);
+      font-size: 18px;
+      font-weight: 700;
+      line-height: 1.35;
+    }
+
+    .panel-status-hero-meta {
+      display: block;
+      color: #544753;
+      font-size: 12px;
+      line-height: 1.5;
+      margin-top: 6px;
+    }
+
+    .panel-status-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+
+    .panel-status-card {
+      padding: 12px 13px;
+      border-radius: 16px;
+      background: rgba(245, 241, 243, 0.94);
+      border: 1px solid rgba(118, 105, 114, 0.12);
+      backdrop-filter: blur(8px);
+      box-shadow:
+        0 6px 14px rgba(96, 71, 84, 0.06),
+        inset 0 1px 0 rgba(255, 255, 255, 0.28);
+    }
+
+    .panel-status-label {
+      display: block;
+      color: #6c5e69;
+      font-size: 11px;
+      margin-bottom: 7px;
+      letter-spacing: 0.04em;
+    }
+
+    .panel-status-value {
+      display: block;
+      color: var(--panel-text);
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.45;
+    }
+
+    .panel-status-meta {
+      display: block;
+      color: #574a57;
+      font-size: 11px;
+      margin-top: 4px;
+      line-height: 1.5;
+    }
+
+    .panel-feedback {
+      display: none;
+      margin-bottom: 14px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      font-size: 12px;
+      line-height: 1.6;
+      border: 1px solid transparent;
+      backdrop-filter: blur(10px);
+    }
+
+    .panel-feedback--info {
+      display: block;
+      color: #234879;
+      background: rgba(88, 143, 234, 0.08);
+      border-color: rgba(88, 143, 234, 0.12);
+    }
+
+    .panel-feedback--success {
+      display: block;
+      color: #1d5a44;
+      background: rgba(46, 156, 113, 0.08);
+      border-color: rgba(46, 156, 113, 0.12);
+    }
+
+    .panel-feedback--error {
+      display: block;
+      color: #8a2d49;
+      background: rgba(221, 91, 130, 0.08);
+      border-color: rgba(221, 91, 130, 0.12);
+    }
+
+    .panel-section {
+      margin-bottom: 14px;
+      padding: 14px;
+      border-radius: 18px;
+      background: rgba(238, 232, 236, 0.94);
+      border: 1px solid rgba(118, 105, 114, 0.12);
+      box-shadow:
+        0 6px 14px rgba(100, 74, 87, 0.06),
+        inset 0 1px 0 rgba(255, 255, 255, 0.28);
+    }
+
+    .panel-section-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .panel-section-title {
+      color: #271e2d;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+    }
+
+    .panel-section-note {
+      max-width: 180px;
+      color: #5f5360;
+      font-size: 11px;
+      line-height: 1.5;
+      text-align: right;
+    }
+
+    .field-stack {
+      display: grid;
+      gap: 12px;
+    }
+
+    .field-card {
+      padding: 12px;
+      border-radius: 16px;
+      background: rgba(247, 243, 245, 0.98);
+      border: 1px solid rgba(118, 105, 114, 0.1);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.34);
+    }
+
+    .field-card label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      color: #5c4f5a;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    .field-label-tag {
+      display: inline-flex;
+      align-items: center;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: rgba(224, 216, 221, 0.92);
+      color: #6b5d69;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: normal;
+      text-transform: none;
+    }
+
+    .model-config-panel input,
+    .model-config-panel select {
+      width: 100%;
+      padding: 12px 14px;
+      background: #f8f5f6;
+      border: 1px solid rgba(156, 143, 151, 0.92);
+      border-radius: 12px;
+      color: #241b29;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+    }
+
+    .model-config-panel input::placeholder,
+    .model-config-panel select:invalid {
+      color: #766874;
+    }
+
+    .model-config-panel input:focus,
+    .model-config-panel select:focus {
+      border-color: rgba(141, 97, 116, 0.48);
+      background: #fbf9fa;
+      box-shadow: 0 0 0 3px rgba(141, 97, 116, 0.08);
+    }
+
+    .field-note {
+      color: #584d58;
+      font-size: 11px;
+      line-height: 1.55;
+      margin-top: 8px;
+    }
+
+    .panel-inline-hint {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #4f4550;
+      font-size: 11px;
+      margin-top: 9px;
+      line-height: 1.6;
+    }
+
+    .panel-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3px 9px;
+      border-radius: 999px;
+      background: rgba(224, 216, 221, 0.96);
+      color: #574b57;
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .panel-badge.active {
+      background: rgba(141, 97, 116, 0.12);
+      color: #6b4756;
+    }
+
+    .panel-switch-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px;
+      margin-top: 12px;
+      border-radius: 16px;
+      background: rgba(236, 231, 234, 0.94);
+      border: 1px solid rgba(118, 105, 114, 0.12);
+    }
+
+    .panel-switch-copy {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .panel-switch-title {
+      color: #271e2d;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .panel-switch-hint {
+      color: #564a57;
+      font-size: 11px;
+      line-height: 1.55;
+      margin-top: 4px;
+    }
+
+    .switch-control {
+      position: relative;
+      width: 56px;
+      height: 32px;
+      flex-shrink: 0;
+      padding: 0;
+      border-radius: 999px;
+      background: rgba(184, 174, 181, 0.92);
+      border: 1px solid rgba(145, 134, 141, 0.9);
+      box-shadow: inset 0 1px 3px rgba(73, 54, 63, 0.12);
+    }
+
+    .switch-control.active {
+      background: #8d6174;
+      border-color: rgba(141, 97, 116, 0.28);
+      box-shadow: 0 6px 14px rgba(95, 70, 83, 0.12);
+    }
+
+    .switch-thumb {
+      position: absolute;
+      top: 3px;
+      left: 4px;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: #fff;
+      transition: transform 0.22s ease;
+      box-shadow: 0 4px 10px rgba(98, 72, 85, 0.18);
+    }
+
+    .switch-control.active .switch-thumb {
+      transform: translateX(24px);
+    }
+
+    .panel-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid rgba(118, 105, 114, 0.12);
+    }
+
+    .panel-actions button {
+      border-radius: 14px;
+      padding: 12px 14px;
+      font-size: 13px;
+      letter-spacing: 0.02em;
+      box-shadow: 0 8px 18px rgba(95, 70, 83, 0.08);
+    }
+
+    .panel-actions .secondary {
+      background: rgba(242, 237, 239, 0.96);
+      border: 1px solid rgba(156, 143, 151, 0.9);
+      color: #281f2d;
+    }
+
+    .panel-actions .secondary:hover {
+      background: rgba(246, 242, 244, 0.98);
+    }
+
+    @media (max-width: 380px) {
+      .panel-section-header {
+        flex-direction: column;
+      }
+
+      .panel-section-note {
+        max-width: none;
+        text-align: left;
+      }
     }
   </style>
 </head>
@@ -322,8 +817,114 @@
     </div>
 
     <button class="history-btn" id="history-btn">📊 查看标注历史</button>
-    <button class="refresh-btn" id="refresh-btn">🔄 刷新数据</button>
+    <button class="panel-action-btn" id="model-config-btn">⚙️ 自定义API</button>
     <button class="logout-btn" id="logout-btn">退出登录</button>
+  </div>
+
+  <div id="model-config-panel" class="model-config-panel">
+    <div class="panel-header">
+      <button class="panel-back" id="model-config-back" type="button" aria-label="返回">‹</button>
+      <div class="panel-copy">
+        <div class="panel-eyebrow">Model Access</div>
+        <div class="panel-title-row">
+          <div class="panel-title">自定义 API</div>
+          <span class="panel-state-pill" id="model-enabled-state-pill">当前启用</span>
+        </div>
+        <div class="panel-description">把你自己的视觉模型接进插件，系统默认能力仍然会作为兜底配置保留。</div>
+      </div>
+    </div>
+
+    <div class="panel-status-hero">
+      <span class="panel-status-hero-label">Configuration status</span>
+      <strong class="panel-status-hero-value" id="model-config-status">未配置</strong>
+      <span class="panel-status-hero-meta" id="model-config-status-meta"></span>
+    </div>
+
+    <div class="panel-status-grid">
+      <div class="panel-status-card">
+        <span class="panel-status-label">API Key</span>
+        <strong class="panel-status-value" id="model-api-key-status">未配置</strong>
+        <span class="panel-status-meta">明文不会回显，只展示是否已就绪。</span>
+      </div>
+      <div class="panel-status-card">
+        <span class="panel-status-label">当前生效</span>
+        <strong class="panel-status-value" id="model-effective-source">暂无可用配置</strong>
+        <span class="panel-status-meta">分析时会优先选择可用且启用中的配置。</span>
+      </div>
+    </div>
+
+    <div id="model-config-feedback" class="panel-feedback"></div>
+
+    <div class="panel-section">
+      <div class="panel-section-header">
+        <div class="panel-section-title">连接配置</div>
+        <div class="panel-section-note">当前先支持 Qwen，provider 结构已经预留好扩展位。</div>
+      </div>
+
+      <div class="field-stack">
+        <div class="field-card">
+          <label for="model-provider">
+            <span>Provider</span>
+            <span class="field-label-tag">For future expansion</span>
+          </label>
+          <select id="model-provider">
+            <option value="qwen">Qwen</option>
+          </select>
+        </div>
+
+        <div class="field-card">
+          <label for="model-base-url">
+            <span>Base URL</span>
+            <span class="field-label-tag">Endpoint</span>
+          </label>
+          <input type="text" id="model-base-url" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1">
+          <div class="field-note">默认走 DashScope 兼容接口，也可以切换到你自己的兼容服务地址。</div>
+        </div>
+
+        <div class="field-card">
+          <label for="model-name">
+            <span>Model Name</span>
+            <span class="field-label-tag">Runtime</span>
+          </label>
+          <input type="text" id="model-name" placeholder="qwen-vl-max">
+          <div class="field-note">这里填写实际调用的视觉模型名，保存后会用于后续分析请求。</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel-section">
+      <div class="panel-section-header">
+        <div class="panel-section-title">鉴权与运行</div>
+        <div class="panel-section-note">输入新 Key 才会替换旧值，空值不会覆盖已有配置。</div>
+      </div>
+
+      <div class="field-card">
+        <label for="model-api-key">
+          <span>API Key</span>
+          <span class="field-label-tag">Secure</span>
+        </label>
+        <input type="password" id="model-api-key" placeholder="请输入 API Key" autocomplete="new-password">
+        <div class="panel-inline-hint">
+          <span class="panel-badge" id="model-api-key-badge">未配置</span>
+          <span id="model-api-key-hint">首次保存前必须填写 API Key。</span>
+        </div>
+      </div>
+
+      <div class="panel-switch-row">
+        <div class="panel-switch-copy">
+          <div class="panel-switch-title">启用当前配置</div>
+          <div class="panel-switch-hint">关闭后会保留你的设置，但运行时会回退系统默认配置。</div>
+        </div>
+        <button id="model-enabled-toggle" class="switch-control active" type="button" role="switch" aria-checked="true">
+          <span class="switch-thumb"></span>
+        </button>
+      </div>
+    </div>
+
+    <div class="panel-actions">
+      <button id="model-test-btn" class="secondary" type="button">测试连接</button>
+      <button id="model-save-btn" type="button">保存配置</button>
+    </div>
   </div>
 
   <script src="../content/config.local.js"></script>

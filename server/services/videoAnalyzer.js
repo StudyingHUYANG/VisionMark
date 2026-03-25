@@ -5,18 +5,9 @@ const { exec } = require('child_process');
 const util = require('util');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const OpenAI = require('openai');
+const { buildEffectiveModelConfig } = require('./modelConfigService');
 
 const execPromise = util.promisify(exec);
-
-// 系统默认模型配置
-const DEFAULT_MODEL_CONFIG = {
-  provider: 'qwen',
-  apiKey: process.env.QWEN_API_KEY || 'sk-df7f07a45dee431fb8cc9b6453df5f34',
-  baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-  textModel: 'qwen-turbo',
-  visionModel: 'qwen-vl-max',
-  asrModel: 'paraformer-v2'
-};
 
 // 阿里云OSS配置 - 用于上传音频文件
 const OSS = require('ali-oss');
@@ -53,18 +44,7 @@ class VideoAnalyzer {
   }
 
   getEffectiveModelConfig(userConfig = null) {
-    if (!userConfig) {
-      return { ...DEFAULT_MODEL_CONFIG };
-    }
-
-    return {
-      provider: userConfig.provider || DEFAULT_MODEL_CONFIG.provider,
-      apiKey: userConfig.apiKey || DEFAULT_MODEL_CONFIG.apiKey,
-      baseUrl: userConfig.baseUrl || DEFAULT_MODEL_CONFIG.baseUrl,
-      textModel: userConfig.textModel || userConfig.modelName || DEFAULT_MODEL_CONFIG.textModel,
-      visionModel: userConfig.visionModel || userConfig.modelName || DEFAULT_MODEL_CONFIG.visionModel,
-      asrModel: userConfig.asrModel || DEFAULT_MODEL_CONFIG.asrModel
-    };
+    return buildEffectiveModelConfig(userConfig);
   }
 
   createOpenAIClient(modelConfig) {

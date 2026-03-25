@@ -90,6 +90,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       this.lastRouteBvid = null;
       this.hotWordPopupLayer = null;
       this.currentHotWordId = null;
+      this.runtimeMessageListenerBound = false;
     }
 
     init() {
@@ -103,6 +104,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       this.startUiKeeper();
 
       // 3. Init global event listeners
+      this.initRuntimeMessageListener();
       this.initGlobalListeners();
 
       // 4. Initialize player connection
@@ -174,6 +176,9 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       });
       document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
+          if (sidebarState?.modelConfigVisible) {
+            return;
+          }
           this.togglePopover(false);
           if (this.sidebarController) this.sidebarController.hide();
         }
@@ -203,6 +208,32 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       // 调试：将实例暴露到全局，便于控制台调试
       window.adSkipperDebug = this;
       console.log('[AdSkipper] 调试模式已启用');
+    }
+
+    initRuntimeMessageListener() {
+      if (this.runtimeMessageListenerBound) return;
+
+      chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+        if (message?.action !== 'openModelConfigModal') {
+          return false;
+        }
+
+        this.openModelConfigModal()
+          .then(() => {
+            sendResponse({ success: true });
+          })
+          .catch((error) => {
+            console.error('[AdSkipper] 打开自定义 API 弹窗失败:', error);
+            sendResponse({
+              success: false,
+              error: error?.message || '打开失败'
+            });
+          });
+
+        return true;
+      });
+
+      this.runtimeMessageListenerBound = true;
     }
 
     onPlayerReady() {
@@ -378,6 +409,18 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         console.error('[AdSkipper] ensureSidebarReady failed:', error);
       }
       return Boolean(this.sidebarController);
+    }
+
+    async openModelConfigModal() {
+      if (!await this.ensureSidebarReady()) {
+        throw new Error('设置面板初始化失败');
+      }
+
+      if (typeof this.sidebarController.showModelConfig !== 'function') {
+        throw new Error('设置面板暂不可用');
+      }
+
+      this.sidebarController.showModelConfig();
     }
 
     async refreshAnalysisForBvid(bvid, options = {}) {

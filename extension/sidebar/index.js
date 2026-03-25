@@ -5,6 +5,7 @@ import './styles/variables.css';
 // Shared state - exported for main.js to access directly
 const sidebarState = reactive({
   isVisible: false,
+  modelConfigVisible: false,
   isLoading: false,
   loadError: null,
   bvid: null,
@@ -37,10 +38,14 @@ export function createSidebar(container) {
         hotWords: sidebarState.hotWords,
         segments: sidebarState.segments,
         activeKey: sidebarState.activeSegmentKey,
+        modelConfigVisible: sidebarState.modelConfigVisible,
         loading: sidebarState.isLoading,
         error: sidebarState.loadError,
         'onUpdate:visible': (value) => {
           sidebarState.isVisible = value;
+        },
+        'onUpdate:modelConfigVisible': (value) => {
+          sidebarState.modelConfigVisible = value;
         },
         onSeek: (time) => {
           window.dispatchEvent(new CustomEvent('visionmark:seek', {
@@ -70,6 +75,8 @@ export function createSidebar(container) {
     show: () => { sidebarState.isVisible = true; },
     hide: () => { sidebarState.isVisible = false; },
     toggle: () => { sidebarState.isVisible = !sidebarState.isVisible; },
+    showModelConfig: () => { sidebarState.modelConfigVisible = true; },
+    hideModelConfig: () => { sidebarState.modelConfigVisible = false; },
     updateData: (data) => {
       if (data.bvid !== undefined) sidebarState.bvid = data.bvid;
       if (data.cid !== undefined) sidebarState.cid = data.cid;

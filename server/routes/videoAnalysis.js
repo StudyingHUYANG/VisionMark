@@ -8,6 +8,7 @@ const router = express.Router();
 const VideoAnalyzer = require('../services/videoAnalyzer');
 const { authenticateToken } = require('../middlewares/auth.js');
 const db = require('../database/db');
+const { getLatestEnabledUserModelConfig } = require('../services/modelConfigService');
 
 // 创建视频分析器实例
 const videoAnalyzer = new VideoAnalyzer();
@@ -26,29 +27,14 @@ router.post('/analyze', authenticateToken, async (req, res) => {
 
     console.log(`[API] 开始分析视频: ${bvid}`);
     const userId = req.user.userId;
-
-    const configRow = db.prepare(`
-      SELECT provider, api_key, base_url, model_name, is_enabled
-      FROM user_api_configs
-      WHERE user_id = ? AND is_enabled = 1
-      ORDER BY updated_at DESC
-      LIMIT 1
-    `).get(userId);
-
-    const userConfig = configRow ? {
-      provider: configRow.provider,
-      apiKey: configRow.api_key,
-      baseUrl: configRow.base_url,
-      modelName: configRow.model_name
-    } : null;
+    const userConfig = getLatestEnabledUserModelConfig(userId);
+    const runtimeModelConfig = videoAnalyzer.getEffectiveModelConfig(userConfig);
 
     // 构建B站视频URL
     const videoUrl = `https://www.bilibili.com/video/${bvid}`;
 
     // 调用新的 VideoAnalyzer
-    // 暂时禁用用户自定义 API 配置，当前分析统一走系统默认配置
-    // const result = await videoAnalyzer.analyzeVideo(videoUrl, true, userConfig);
-    const result = await videoAnalyzer.analyzeVideo(videoUrl, true, null);
+    const result = await videoAnalyzer.analyzeVideo(videoUrl, true, userConfig);
 
     // 转换数据格式以适配前端
     const adaptedData = {
@@ -127,7 +113,7 @@ router.post('/analyze', authenticateToken, async (req, res) => {
       adaptedData.transcript || null,
       null,
       JSON.stringify(normalizedContent),
-      userConfig?.modelName || 'qwen-vl-max'
+      runtimeModelConfig.visionModel
     );
 
     res.json({
@@ -186,28 +172,12 @@ router.post('/batch', authenticateToken, async (req, res) => {
     const results = [];
 
     const userId = req.user.userId;
-
-    const configRow = db.prepare(`
-      SELECT provider, api_key, base_url, model_name, is_enabled
-      FROM user_api_configs
-      WHERE user_id = ? AND is_enabled = 1
-      ORDER BY updated_at DESC
-      LIMIT 1
-    `).get(userId);
-
-    const userConfig = configRow ? {
-      provider: configRow.provider,
-      apiKey: configRow.api_key,
-      baseUrl: configRow.base_url,
-      modelName: configRow.model_name
-    } : null;
+    const userConfig = getLatestEnabledUserModelConfig(userId);
 
     for (const video of videos) {
       try {
         const videoUrl = `https://www.bilibili.com/video/${video.bvid}`;
-        // 暂时禁用用户自定义 API 配置，当前分析统一走系统默认配置
-        // const result = await videoAnalyzer.analyzeVideo(videoUrl, true, userConfig);
-        const result = await videoAnalyzer.analyzeVideo(videoUrl, true, null);
+        const result = await videoAnalyzer.analyzeVideo(videoUrl, true, userConfig);
 
         // 转换数据格式
         const adaptedData = {
