@@ -142,28 +142,58 @@ app.get('/api/v1/segments', (req, res) => {
 
   if (!video) return res.json({ segments: [] });
 
-  const annotations = db.prepare(`
+  const allAnnotations = db.prepare(`
     SELECT *
     FROM annotations
     WHERE video_id = ?
+    ORDER BY id DESC
   `).all(video.id);
 
-  // 🔥 从 annotations 提取所有广告段
-  const segments = annotations
+  let ai_title = '';
+  let ai_summary = '';
+  let knowledge_points = [];
+  let hot_words = [];
+
+  const aiAnnotation = allAnnotations.find(row => row.source_type === 'AI' && row.annotation_type === 'full_analysis');
+  if (aiAnnotation) {
+    const content = safeParseContent(aiAnnotation.content_json);
+    if (content.meta) {
+      ai_title = content.meta.title || aiAnnotation.title || '';
+    }
+    if (content.content_analysis) {
+      ai_summary = content.content_analysis.summary || aiAnnotation.summary || '';
+      knowledge_points = content.content_analysis.knowledge_points || [];
+      hot_words = content.content_analysis.hot_words || [];
+    }
+  }
+
+  // 只保留最新的一条完整AI分析，或者人工标注
+  const validAnnotations = allAnnotations.filter(row => {
+    if (row.source_type === 'AI' && row.annotation_type === 'full_analysis') {
+      return aiAnnotation && row.id === aiAnnotation.id;
+    }
+    return true; // 保留所有 HUMAN/手工标注
+  });
+
+  // 🔥 从 validAnnotations 提取所有广告段，避免同个视频的多次AI分析产生大重负片段
+  const segments = validAnnotations
     .flatMap(row => {
       const content = safeParseContent(row.content_json);
       return extractLegacyAdSegments(content).map((seg) => {
         const shouldPopup = inferPopupAction(seg);
+        const segmentContent = resolveSegmentContent(seg, row);
         return {
           ...seg,
           action: shouldPopup ? 'popup' : 'skip',
-          content: typeof seg.content === 'string' ? seg.content : (typeof seg.description === 'string' ? seg.description : null)
+          is_ai_segment: row.source_type === 'AI',
+          content: segmentContent,
+          description: segmentContent
         };
       });
     })
     .sort((a, b) => a.start_time - b.start_time);
 
-    res.json({ segments });
+    res.json({ segments, ai_title, ai_summary, knowledge_points, hot_words });
   });
 
 app.post('/api/v1/segments', authenticateToken, (req, res) => {
@@ -303,6 +333,45 @@ function inferPopupAction(segment) {
   return false;
 }
 
+function pickText(...candidates) {
+  for (const value of candidates) {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+      continue;
+    }
+
+    if (value && typeof value === 'object') {
+      const nestedText = pickText(
+        value.text,
+        value.content,
+        value.description,
+        value.desc,
+        value.explanation,
+        value.reason,
+        value.note,
+        value.summary,
+        value.title
+      );
+      if (nestedText) return nestedText;
+    }
+  }
+
+  return null;
+}
+
+function resolveSegmentContent(segment, annotationRow) {
+  return pickText(
+    segment?.content,
+    segment?.description,
+    segment?.desc,
+    segment?.explanation,
+    segment?.reason,
+    segment?.note,
+    segment?.text
+  );
+}
+
 // 引入路由文件
 const statsRouter = require('./routes/stats.js');
 const segmentsRouter = require('./routes/segments.js');
@@ -366,20 +435,27 @@ app.get('/api/v1/video-view', authenticateToken, (req, res) => {
       });
     }
 
-    const annotations = db.prepare(`
+    const allAnnotations = db.prepare(`
       SELECT *
       FROM annotations
       WHERE video_id = ?
       ORDER BY id DESC
     `).all(video.id);
 
-    const latestAI = annotations.find(row => row.source_type === 'AI') || null;
+    const latestAI = allAnnotations.find(row => row.source_type === 'AI') || null;
 
     const aiContent = latestAI ? safeParseContent(latestAI.content_json) : null;
     const aiAnalysis = aiContent?.content_analysis || {};
 
+    const validAnnotations = allAnnotations.filter(row => {
+      if (row.source_type === 'AI' && row.annotation_type === 'full_analysis') {
+        return latestAI && row.id === latestAI.id;
+      }
+      return true;
+    });
+
     // 收集所有广告段，按时间顺序返回
-    const allAdSegments = annotations
+    const allAdSegments = validAnnotations
       .flatMap(row => {
         const content = safeParseContent(row.content_json);
         const segments = extractLegacyAdSegments(content);
@@ -387,9 +463,10 @@ app.get('/api/v1/video-view', authenticateToken, (req, res) => {
         return segments.map(seg => ({
           start_time: typeof seg.start_time === 'number' ? seg.start_time : 0,
           end_time: typeof seg.end_time === 'number' ? seg.end_time : 0,
-          description: seg.description || null,
+          description: resolveSegmentContent(seg, row),
           highlight: !!seg.highlight,
-          ad_type: seg.ad_type || 'soft_ad'
+          ad_type: seg.ad_type || 'soft_ad',
+          is_ai_segment: row.source_type === 'AI'
         }));
       })
       .sort((a, b) => a.start_time - b.start_time);
