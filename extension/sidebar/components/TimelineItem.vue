@@ -35,7 +35,7 @@
         {{ segment.content || '视频片段' }}
       </p>
       <p v-else class="vm-timeline-item__desc vm-timeline-item__desc--skip">
-        该片段将在自动模式下快进
+        {{ segment.content || '该片段将在自动模式下快进' }}
       </p>
     </div>
   </div>

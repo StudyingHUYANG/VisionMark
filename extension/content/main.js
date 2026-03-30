@@ -426,7 +426,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
     async refreshAnalysisForBvid(bvid, options = {}) {
       if (!bvid) return;
       await this.loadSegments(bvid);
-      const shouldAnalyze = Boolean(options.forceAnalyze) || this.segments.length === 0 || !this.aiSummary;
+      const shouldAnalyze = Boolean(options.forceAnalyze) || !this.aiSummary;
       if (shouldAnalyze) {
         await this.analyzeVideo(bvid);
       }
@@ -679,9 +679,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       const rawContent = typeof segment.content === 'string'
         ? segment.content.trim()
         : (typeof segment.description === 'string' ? segment.description.trim() : null);
-      const content = isAiSegment
-        ? (rawContent || null)
-        : (action === 'popup' ? (rawContent || null) : null);
+      const content = rawContent || null;
 
       return {
         ...segment,
