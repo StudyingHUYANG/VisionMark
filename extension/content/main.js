@@ -1,4 +1,4 @@
-﻿﻿import { createChapterTimelineInjector, watchBilibiliSpaRoute } from './chapterRail/inject.js';
+import { createChapterTimelineInjector, watchBilibiliSpaRoute } from './chapterRail/inject.js';
 import { ANALYSIS_UPDATED_EVENT } from './events.js';
 
 (function () {
@@ -91,6 +91,8 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       this.hotWordPopupLayer = null;
       this.currentHotWordId = null;
       this.runtimeMessageListenerBound = false;
+      this.analysisProgressPollTimer = null;
+      this.analysisProgressBvid = null;
     }
 
     init() {
@@ -198,6 +200,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       });
 
       window.addEventListener('beforeunload', () => {
+        this.stopAnalysisProgressPolling();
         if (this.routeWatcherCleanup) {
           this.routeWatcherCleanup();
           this.routeWatcherCleanup = null;
@@ -283,6 +286,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       this.allSegments = [];
       this.currentSegmentIds = [];
       this.analysisBvid = null;
+      this.stopAnalysisProgressPolling();
       this.clearKnowledgeDanmuState();
 
       if (sidebarState) {
@@ -294,6 +298,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         sidebarState.knowledgePoints = [];
         sidebarState.hotWords = [];
         sidebarState.loadError = null;
+        sidebarState.analysisProgress = null;
         sidebarState.segments = [];
         sidebarState.activeSegmentKey = null;
       }
@@ -562,6 +567,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       if (sidebarState) {
         sidebarState.isLoading = true;
         sidebarState.loadError = null;
+        sidebarState.analysisProgress = null;
       }
 
       try {
@@ -1728,12 +1734,106 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       }
     }
 
+    normalizeAnalysisProgress(progress, fallback = {}) {
+      const percent = Number(progress?.percent);
+      const status = progress?.status || fallback.status || 'running';
+      const stage = progress?.stage || fallback.stage || 'prepare';
+      const stageChanged = stage !== fallback.stage || status !== fallback.status;
+      const localStageStartedAt = stageChanged ? Date.now() : (fallback.localStageStartedAt || Date.now());
+      let normalizedPercent = Number.isFinite(percent)
+        ? Math.max(0, Math.min(100, Math.round(percent)))
+        : (fallback.percent || 0);
+
+      if (status === 'running' && stage === 'model') {
+        const elapsedMs = Math.max(0, Date.now() - localStageStartedAt);
+        const estimatedModelPercent = Math.round(42 + (54 * (1 - Math.exp(-elapsedMs / 90000))));
+        normalizedPercent = Math.max(
+          normalizedPercent,
+          fallback.stage === 'model' ? (fallback.percent || 0) : 0,
+          Math.min(96, estimatedModelPercent)
+        );
+      }
+
+      return {
+        status,
+        stage,
+        percent: normalizedPercent,
+        message: progress?.message || fallback.message || '准备分析视频',
+        detail: progress?.detail || fallback.detail || null,
+        updatedAt: progress?.updatedAt || fallback.updatedAt || null,
+        localStageStartedAt
+      };
+    }
+
+    setAnalysisProgress(progress) {
+      if (!sidebarState) return;
+      sidebarState.analysisProgress = progress
+        ? this.normalizeAnalysisProgress(progress, sidebarState.analysisProgress || {})
+        : null;
+    }
+
+    stopAnalysisProgressPolling() {
+      if (this.analysisProgressPollTimer) {
+        clearInterval(this.analysisProgressPollTimer);
+        this.analysisProgressPollTimer = null;
+      }
+      this.analysisProgressBvid = null;
+    }
+
+    async requestAnalysisProgress(bvid, token) {
+      const encodedBvid = encodeURIComponent(bvid);
+      const url = `${VIDEO_ANALYSIS_BASE}/video-analysis/status/${encodedBvid}`;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+      try {
+        const res = await fetch(url, {
+          headers: {
+            'Authorization': 'Bearer ' + token
+          },
+          signal: controller.signal
+        });
+
+        if (!res.ok) return null;
+        const payload = await res.json();
+        return payload?.data || null;
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    }
+
+    startAnalysisProgressPolling(bvid, token) {
+      this.stopAnalysisProgressPolling();
+      if (!bvid || !token) return;
+
+      this.analysisProgressBvid = bvid;
+      const poll = async () => {
+        if (this.analysisProgressBvid !== bvid) return;
+
+        try {
+          const progress = await this.requestAnalysisProgress(bvid, token);
+          if (this.analysisProgressBvid !== bvid) return;
+          if (!progress || progress.status === 'idle') return;
+          this.setAnalysisProgress(progress);
+
+          if (progress.status === 'completed' || progress.status === 'failed') {
+            this.stopAnalysisProgressPolling();
+          }
+        } catch (error) {
+          console.warn('[AdSkipper] 获取分析进度失败:', error);
+        }
+      };
+
+      poll();
+      this.analysisProgressPollTimer = setInterval(poll, 1000);
+    }
+
 
     async requestAnalysis(bvid, token) {
       const url = VIDEO_ANALYSIS_BASE + "/video-analysis/analyze";
       console.log('[AdSkipper] 请求URL:', url);
       console.log('[AdSkipper] 请求体:', JSON.stringify({ bvid }));
-      console.log('[AdSkipper] 注意：视频分析无超时限制，可能需要几分钟时间');
+      console.log('[AdSkipper] 注意：视频分析无超时限制');
 
       // 直接使用原生 fetch，不设置超时
       // 视频分析需要很长时间（下载、提取、AI分析），不能有超时限制
@@ -1940,9 +2040,16 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         if (sidebarState) {
           sidebarState.isLoading = true;
           sidebarState.loadError = null;
+          sidebarState.analysisProgress = this.normalizeAnalysisProgress({
+            status: 'running',
+            stage: 'prepare',
+            percent: 1,
+            message: '准备分析视频'
+          });
         }
 
         console.log('[AdSkipper] 开始请求分析API...');
+        this.startAnalysisProgressPolling(bvid, token);
         const result = await this.requestAnalysis(bvid, token);
         console.log('[AdSkipper] API返回:', result);
 
@@ -1952,6 +2059,12 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
 
         this.applyAnalysisData(bvid, result.data);
         if (sidebarState) {
+          sidebarState.analysisProgress = this.normalizeAnalysisProgress({
+            status: 'completed',
+            stage: 'completed',
+            percent: 100,
+            message: '分析完成'
+          }, sidebarState.analysisProgress || {});
           sidebarState.isLoading = false;
         }
         console.log('[AdSkipper] ========== 视频分析完成 ==========');
@@ -1963,9 +2076,17 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           stack: error.stack
         });
         if (sidebarState) {
+          sidebarState.analysisProgress = this.normalizeAnalysisProgress({
+            status: 'failed',
+            stage: 'failed',
+            percent: 100,
+            message: error.message || '分析失败'
+          }, sidebarState.analysisProgress || {});
           sidebarState.isLoading = false;
           sidebarState.loadError = '分析失败: ' + error.message;
         }
+      } finally {
+        this.stopAnalysisProgressPolling();
       }
     }
 

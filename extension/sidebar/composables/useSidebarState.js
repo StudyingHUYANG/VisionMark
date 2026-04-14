@@ -9,6 +9,7 @@ const state = reactive({
   aiSummary: '',
   segments: [],
   activeSegmentKey: null,
+  analysisProgress: null,
   currentTime: 0
 });
 

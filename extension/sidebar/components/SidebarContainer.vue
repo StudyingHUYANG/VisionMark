@@ -12,6 +12,11 @@
     />
 
     <div class="vm-sidebar__content">
+      <AnalysisProgress
+        v-if="loading && analysisProgress"
+        :progress="analysisProgress"
+      />
+
       <SummaryCard
         :summary="summary"
         :loading="loading"
@@ -52,6 +57,7 @@
 <script setup>
 import { ref, computed, watch } from 'vue';
 import SidebarHeader from './SidebarHeader.vue';
+import AnalysisProgress from './AnalysisProgress.vue';
 import SummaryCard from './SummaryCard.vue';
 import AIAnalysisDetails from './AIAnalysisDetails.vue';
 import TimelineList from './TimelineList.vue';
@@ -105,6 +111,10 @@ const props = defineProps({
   },
   activeKey: {
     type: String,
+    default: null
+  },
+  analysisProgress: {
+    type: Object,
     default: null
   },
   modelConfigVisible: {

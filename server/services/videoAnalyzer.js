@@ -1,7 +1,7 @@
 ﻿const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const util = require('util');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const OpenAI = require('openai');
@@ -37,6 +37,12 @@ function formatTime(seconds) {
   return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
 
+function clampPercent(percent) {
+  const numericPercent = Number(percent);
+  if (!Number.isFinite(numericPercent)) return null;
+  return Math.max(0, Math.min(100, Math.round(numericPercent)));
+}
+
 class VideoAnalyzer {
   constructor() {
     this.downloadDir = path.join(__dirname, '../../downloads');
@@ -52,6 +58,21 @@ class VideoAnalyzer {
       apiKey: modelConfig.apiKey,
       baseURL: modelConfig.baseUrl
     });
+  }
+
+  reportProgress(onProgress, stage, percent, message, detail = null) {
+    if (typeof onProgress !== 'function') return;
+    try {
+      onProgress({
+        stage,
+        percent: clampPercent(percent),
+        message,
+        detail,
+        updatedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      console.warn('[VideoAnalyzer] 进度上报失败:', error.message);
+    }
   }
 
   ensureDownloadDir() {
@@ -75,7 +96,7 @@ class VideoAnalyzer {
   /**
    * 使用yt-dlp下载B站视频
    */
-  async downloadVideo(bvid, url) {
+  async downloadVideo(bvid, url, onProgress = null) {
     const outputTemplate = path.join(this.downloadDir, `${bvid}.%(ext)s`);
 
     // 检查是否已下载（查找匹配的文件）
@@ -83,17 +104,69 @@ class VideoAnalyzer {
     if (existingFiles.length > 0) {
       const existingPath = path.join(this.downloadDir, existingFiles[0]);
       console.log(`[VideoAnalyzer] 视频已存在: ${existingPath}`);
+      this.reportProgress(onProgress, 'download', 20, '视频已缓存，跳过下载');
       return existingPath;
     }
 
     console.log(`[VideoAnalyzer] 开始下载视频 ${bvid}...`);
+    this.reportProgress(onProgress, 'download', 5, '正在下载 0%');
 
     try {
-      // 使用yt-dlp下载（使用shell:true来确保找到正确的命令）
+      // 使用yt-dlp下载，并解析实时进度输出。
       // 使用 @ffmpeg-installer/ffmpeg 提供的路径，避免依赖系统 ffmpeg
-      const command = `python -m yt_dlp --ffmpeg-location "${ffmpegPath}" -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${outputTemplate}" "${url}"`;
+      const args = [
+        '-m',
+        'yt_dlp',
+        '--newline',
+        '--ffmpeg-location',
+        ffmpegPath,
+        '-f',
+        'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        '-o',
+        outputTemplate,
+        url
+      ];
 
-      await execPromise(command, { shell: true });
+      await new Promise((resolve, reject) => {
+        const child = spawn('python', args, { windowsHide: true });
+        let outputTail = '';
+        let lastReportedPercent = -1;
+
+        const appendOutput = (text) => {
+          outputTail = `${outputTail}${text}`.slice(-6000);
+        };
+
+        const handleOutput = (chunk) => {
+          const text = chunk.toString();
+          appendOutput(text);
+
+          const matches = [...text.matchAll(/\[download\]\s+(\d+(?:\.\d+)?)%/g)];
+          if (matches.length === 0) return;
+
+          const rawPercent = Number(matches[matches.length - 1][1]);
+          if (!Number.isFinite(rawPercent)) return;
+
+          const downloadPercent = Math.max(0, Math.min(100, rawPercent));
+          const wholePercent = Math.floor(downloadPercent);
+          if (wholePercent === lastReportedPercent) return;
+
+          lastReportedPercent = wholePercent;
+          const mappedPercent = 5 + (downloadPercent / 100) * 15;
+          this.reportProgress(onProgress, 'download', mappedPercent, `正在下载 ${wholePercent}%`);
+        };
+
+        child.stdout.on('data', handleOutput);
+        child.stderr.on('data', handleOutput);
+        child.on('error', reject);
+        child.on('close', (code) => {
+          if (code === 0) {
+            this.reportProgress(onProgress, 'download', 20, '视频下载完成');
+            resolve();
+            return;
+          }
+          reject(new Error(`yt-dlp退出码 ${code}: ${outputTail || '无输出'}`));
+        });
+      });
 
       // 查找下载的视频文件
       const downloadedFiles = fs.readdirSync(this.downloadDir).filter(f => f.startsWith(bvid) && f.endsWith('.mp4'));
@@ -163,7 +236,7 @@ class VideoAnalyzer {
    * @param {string} videoPath - 视频路径
    * @param {string} bvid - 视频BV号
    */
-  async extractFrames(videoPath, bvid) {
+  async extractFrames(videoPath, bvid, onProgress = null) {
     const framesDir = path.join(this.downloadDir, `${bvid}_frames`);
 
     if (!fs.existsSync(framesDir)) {
@@ -171,10 +244,12 @@ class VideoAnalyzer {
     }
 
     console.log(`[VideoAnalyzer] 提取视频关键帧...`);
+    this.reportProgress(onProgress, 'frames', 22, '正在准备抽帧');
 
     try {
       // 获取视频实际时长
       const duration = await this.getVideoDuration(videoPath);
+      this.reportProgress(onProgress, 'frames', 24, '正在定位关键帧');
 
       // 尝试使用ffprobe获取关键帧时间戳（更接近场景切换）
       let timestamps = await this.extractKeyframeTimestamps(videoPath);
@@ -195,6 +270,7 @@ class VideoAnalyzer {
       }
 
       console.log(`[VideoAnalyzer] 将提取 ${timestamps.length} 张关键帧（基于场景/关键帧，间隔可变）`);
+      this.reportProgress(onProgress, 'frames', 25, `正在抽帧 0/${timestamps.length}`);
 
       // 提取关键帧截图，文件名包含时间戳（毫秒），便于后续排序和提示
       for (let i = 0; i < timestamps.length; i++) {
@@ -203,9 +279,12 @@ class VideoAnalyzer {
         const outputPath = path.join(framesDir, `frame_${String(i + 1).padStart(3, '0')}_${ms}.jpg`);
         const command = `"${ffmpegPath}" -ss ${ts} -i "${videoPath}" -frames:v 1 -q:v 2 -vf "scale=640:-1" "${outputPath}" -y`;
         await execPromise(command, { shell: true });
+        const framePercent = 25 + ((i + 1) / Math.max(timestamps.length, 1)) * 15;
+        this.reportProgress(onProgress, 'frames', framePercent, `正在抽帧 ${i + 1}/${timestamps.length}`);
       }
 
       console.log(`[VideoAnalyzer] 关键帧提取完成，保存在: ${framesDir}`);
+      this.reportProgress(onProgress, 'frames', 40, '关键帧提取完成');
       return { framesDir, duration };
     } catch (error) {
       console.error('[VideoAnalyzer] 关键帧提取失败:', error);
@@ -218,20 +297,23 @@ class VideoAnalyzer {
    * @param {string} videoPath - 视频路径
    * @param {string} bvid - 视频BV号
    */
-  async extractAudio(videoPath, bvid) {
+  async extractAudio(videoPath, bvid, onProgress = null) {
     const audioPath = path.join(this.downloadDir, `${bvid}.wav`);
 
     // 检查是否已提取（同时检查旧的.mp3文件）
     const oldMp3Path = path.join(this.downloadDir, `${bvid}.mp3`);
     if (fs.existsSync(audioPath)) {
       console.log(`[VideoAnalyzer] 音频已存在: ${audioPath}`);
+      this.reportProgress(onProgress, 'audio', 44, '音频已缓存，准备识别');
       return audioPath;
     } else if (fs.existsSync(oldMp3Path)) {
       console.log(`[VideoAnalyzer] 找到旧的MP3音频，将使用: ${oldMp3Path}`);
+      this.reportProgress(onProgress, 'audio', 44, '音频已缓存，准备识别');
       return oldMp3Path;
     }
 
     console.log(`[VideoAnalyzer] 提取音频为WAV格式...`);
+    this.reportProgress(onProgress, 'audio', 42, '正在提取音频');
 
     try {
       // 使用ffmpeg提取音频，采样率16000Hz，单声道，使用WAV格式（更兼容paraformer-v2）
@@ -239,6 +321,7 @@ class VideoAnalyzer {
       await execPromise(command, { shell: true });
 
       console.log(`[VideoAnalyzer] 音频提取完成: ${audioPath}`);
+      this.reportProgress(onProgress, 'audio', 44, '音频提取完成');
       return audioPath;
     } catch (error) {
       console.error('[VideoAnalyzer] 音频提取失败:', error);
@@ -251,8 +334,9 @@ class VideoAnalyzer {
    * @param {string} audioPath - 音频文件路径
    * @param {string} bvid - 视频BV号
    */
-  async transcribeAudio(audioPath, bvid, userConfig = null) {
+  async transcribeAudio(audioPath, bvid, userConfig = null, onProgress = null) {
     console.log('[VideoAnalyzer] 开始语音识别...');
+    this.reportProgress(onProgress, 'speech', 45, '正在准备语音识别');
 
     const modelConfig = this.getEffectiveModelConfig(userConfig);
     const asrApiKey = modelConfig.apiKey;
@@ -260,6 +344,7 @@ class VideoAnalyzer {
     try {
       if (!ossClient) {
         console.warn('[VideoAnalyzer] OSS client unavailable, skip transcription.');
+        this.reportProgress(onProgress, 'speech', 58, '跳过语音识别，继续画面分析');
         return null;
       }
 
@@ -270,6 +355,7 @@ class VideoAnalyzer {
       // WAV文件较大，限制100MB（大约对应5-10分钟视频）
       if (fileSizeMB > 100) {
         console.warn(`[VideoAnalyzer] 音频文件过大(${fileSizeMB.toFixed(2)}MB)，跳过语音识别`);
+        this.reportProgress(onProgress, 'speech', 58, '音频较大，跳过语音识别');
         return null;
       }
 
@@ -277,6 +363,7 @@ class VideoAnalyzer {
 
       // 1. 上传音频到阿里云OSS
       console.log('[VideoAnalyzer] 上传音频到OSS...');
+      this.reportProgress(onProgress, 'speech', 47, '正在上传音频');
       const ossObjectName = `audio/${bvid}/${path.basename(audioPath)}`;
 
       try {
@@ -294,6 +381,7 @@ class VideoAnalyzer {
 
       // Step 1: 提交异步任务
       console.log('[VideoAnalyzer] 提交语音识别任务...');
+      this.reportProgress(onProgress, 'speech', 49, '正在提交语音识别任务');
       const submitResponse = await axios.post(
         'https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription',
         {
@@ -323,6 +411,7 @@ class VideoAnalyzer {
 
       const taskId = submitResponse.data.output.task_id;
       console.log('[VideoAnalyzer] 任务已提交，task_id:', taskId);
+      this.reportProgress(onProgress, 'speech', 50, '正在等待语音识别结果');
 
       // Step 2: 轮询任务结果
       console.log('[VideoAnalyzer] 等待任务完成...');
@@ -347,6 +436,8 @@ class VideoAnalyzer {
           const taskStatus = resultResponse.data.output?.task_status;
 
           console.log(`[VideoAnalyzer] 任务状态: ${taskStatus} (${attempts}/${maxAttempts})`);
+          const speechPercent = 50 + (attempts / maxAttempts) * 8;
+          this.reportProgress(onProgress, 'speech', speechPercent, `正在识别音频 ${attempts}/${maxAttempts}`);
 
           if (taskStatus === 'SUCCEEDED') {
             // 任务成功完成
@@ -422,6 +513,7 @@ class VideoAnalyzer {
 
                   console.log('[VideoAnalyzer] 语音识别完成（从transcription_url下载）');
                   console.log('[VideoAnalyzer] 转录内容预览:', transcriptText.substring(0, 500).replace(/\n/g, ' '));
+                  this.reportProgress(onProgress, 'speech', 58, '语音识别完成');
                   return transcriptText;
                 } catch (error) {
                   console.error('[VideoAnalyzer] 下载转录结果失败:', error.message);
@@ -441,10 +533,12 @@ class VideoAnalyzer {
 
                 console.log('[VideoAnalyzer] 语音识别完成');
                 console.log('[VideoAnalyzer] 转录内容预览:', transcript.substring(0, 500).replace(/\n/g, ' '));
+                this.reportProgress(onProgress, 'speech', 58, '语音识别完成');
                 return transcript;
               }
             }
             console.warn('[VideoAnalyzer] 任务成功但没有返回转录结果');
+            this.reportProgress(onProgress, 'speech', 58, '语音识别完成，未获得转录文本');
             return null;
           } else if (taskStatus === 'FAILED') {
             throw new Error('语音识别任务失败: ' + JSON.stringify(resultResponse.data.output?.message));
@@ -466,6 +560,7 @@ class VideoAnalyzer {
     } catch (error) {
       console.error('[VideoAnalyzer] 语音识别失败:', error.response?.data || error.message);
       // 如果识别失败，返回null，继续使用画面分析
+      this.reportProgress(onProgress, 'speech', 58, '语音识别失败，继续画面分析');
       return null;
     }
   }
@@ -598,8 +693,12 @@ ${transcript}
    * @param {number} duration - 视频时长（秒）
    * @param {string} transcript - 音频转录文本（可选）
    */
-  async analyzeWithQwen(videoPath, framesDir, duration, transcript = null, userConfig = null) {
+  async analyzeWithQwen(videoPath, framesDir, duration, transcript = null, userConfig = null, onProgress = null, progressOptions = {}) {
     console.log('[VideoAnalyzer] 调用通义千问API进行视频分析...');
+    const modelStartPercent = Number.isFinite(Number(progressOptions.modelStartPercent))
+      ? Number(progressOptions.modelStartPercent)
+      : 42;
+    this.reportProgress(onProgress, 'model', modelStartPercent, '正在整理关键帧与分析上下文');
     const modelConfig = this.getEffectiveModelConfig(userConfig);
     const client = this.createOpenAIClient(modelConfig);
 
@@ -620,6 +719,7 @@ ${transcript}
     }
 
     console.log(`[VideoAnalyzer] 共有 ${frames.length} 张关键帧`);
+    this.reportProgress(onProgress, 'model', modelStartPercent + 2, `正在准备 ${frames.length} 张关键帧`);
 
     // 生成时间戳（秒）列表，供提示词使用
     const frameTimestamps = frames.map(f => f.timestampMs / 1000);
@@ -700,6 +800,7 @@ ${transcript || '无语音内容'}
     }
 
     try {
+      this.reportProgress(onProgress, 'model', modelStartPercent + 4, '大模型分析中');
       // 使用OpenAI兼容模式调用通义千问
       const completion = await client.chat.completions.create({
         model: modelConfig.visionModel,
@@ -717,6 +818,7 @@ ${transcript || '无语音内容'}
         const aiResponse = completion.choices[0].message.content;
         console.log('[VideoAnalyzer] AI分析完成');
         console.log('[VideoAnalyzer] AI完整返回内容:\n', aiResponse);
+        this.reportProgress(onProgress, 'model', 96, '大模型分析完成');
 
         // 尝试解析JSON
         try {
@@ -816,34 +918,43 @@ ${transcript || '无语音内容'}
   /**
    * 完整的视频分析流程（支持音视频结合分析）
    */
-  async analyzeVideo(url, useAudio = true, userConfig = null) {
+  async analyzeVideo(url, useAudio = true, userConfig = null, options = {}) {
+    const onProgress = typeof options === 'function' ? options : options?.onProgress;
     try {
       // 1. 提取视频信息
       const { bvid } = this.extractBilibiliInfo(url);
       console.log(`[VideoAnalyzer] 开始分析视频: ${bvid}`);
+      this.reportProgress(onProgress, 'prepare', 2, '准备分析视频');
 
       // 2. 下载视频
-      const videoPath = await this.downloadVideo(bvid, url);
+      const videoPath = await this.downloadVideo(bvid, url, onProgress);
 
       // 3. 提取关键帧（用于视觉理解）
-      const { framesDir, duration } = await this.extractFrames(videoPath, bvid);
+      const { framesDir, duration } = await this.extractFrames(videoPath, bvid, onProgress);
 
       // 4. 提取音频并进行语音识别（可选）
       let transcript = null;
+      const shouldAnalyzeAudio = Boolean(useAudio && hasOssConfig);
 
-      if (useAudio) {
+      if (shouldAnalyzeAudio) {
         try {
-          const audioPath = await this.extractAudio(videoPath, bvid);
-          transcript = await this.transcribeAudio(audioPath, bvid, userConfig);
+          const audioPath = await this.extractAudio(videoPath, bvid, onProgress);
+          transcript = await this.transcribeAudio(audioPath, bvid, userConfig, onProgress);
         } catch (error) {
           console.warn('[VideoAnalyzer] 音频处理失败，继续使用画面分析:', error.message);
+          this.reportProgress(onProgress, 'speech', 58, '音频处理失败，继续画面分析');
         }
+      } else {
+        this.reportProgress(onProgress, 'model', 42, '跳过音频，准备大模型分析');
       }
 
       // 5. AI分析（基于关键帧、时长和音频转录），知识点和热词从分析结果中获取
-      const analysisResult = await this.analyzeWithQwen(videoPath, framesDir, duration, transcript, userConfig);
+      const analysisResult = await this.analyzeWithQwen(videoPath, framesDir, duration, transcript, userConfig, onProgress, {
+        modelStartPercent: shouldAnalyzeAudio ? 60 : 42
+      });
 
       // 6. 整合所有分析结果
+      this.reportProgress(onProgress, 'finalize', 98, '正在整理分析结果');
       const finalResult = {
         ...analysisResult,
         // 添加音频转录文本（如果有）

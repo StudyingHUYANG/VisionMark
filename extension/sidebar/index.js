@@ -16,6 +16,7 @@ const sidebarState = reactive({
   hotWords: [],
   segments: [],
   activeSegmentKey: null,
+  analysisProgress: null,
   currentTime: 0
 });
 
@@ -38,6 +39,7 @@ export function createSidebar(container) {
         hotWords: sidebarState.hotWords,
         segments: sidebarState.segments,
         activeKey: sidebarState.activeSegmentKey,
+        analysisProgress: sidebarState.analysisProgress,
         modelConfigVisible: sidebarState.modelConfigVisible,
         loading: sidebarState.isLoading,
         error: sidebarState.loadError,
@@ -87,6 +89,7 @@ export function createSidebar(container) {
       if (data.segments !== undefined) sidebarState.segments = data.segments;
       if (data.isLoading !== undefined) sidebarState.isLoading = data.isLoading;
       if (data.loadError !== undefined) sidebarState.loadError = data.loadError;
+      if (data.analysisProgress !== undefined) sidebarState.analysisProgress = data.analysisProgress;
     },
     setActiveSegment: (key) => {
       sidebarState.activeSegmentKey = key;
