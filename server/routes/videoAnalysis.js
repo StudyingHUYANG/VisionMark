@@ -12,6 +12,73 @@ const { getLatestEnabledUserModelConfig } = require('../services/modelConfigServ
 
 // 创建视频分析器实例
 const videoAnalyzer = new VideoAnalyzer();
+const analysisProgressStore = new Map();
+const PROGRESS_TTL_MS = 15 * 60 * 1000;
+
+function clampPercent(percent) {
+  const numericPercent = Number(percent);
+  if (!Number.isFinite(numericPercent)) return 0;
+  return Math.max(0, Math.min(100, Math.round(numericPercent)));
+}
+
+function getProgressKey(userId, bvid) {
+  return `${userId || 'anonymous'}:${String(bvid || '').trim()}`;
+}
+
+function pruneProgressStore() {
+  const now = Date.now();
+  analysisProgressStore.forEach((progress, key) => {
+    const updatedMs = progress.updatedMs || 0;
+    if (now - updatedMs > PROGRESS_TTL_MS) {
+      analysisProgressStore.delete(key);
+    }
+  });
+}
+
+function setAnalysisProgress(userId, bvid, update = {}) {
+  pruneProgressStore();
+
+  const key = getProgressKey(userId, bvid);
+  const previous = analysisProgressStore.get(key) || {};
+  const nowIso = new Date().toISOString();
+  const next = {
+    bvid,
+    status: update.status || previous.status || 'running',
+    stage: update.stage || previous.stage || 'prepare',
+    percent: clampPercent(update.percent ?? previous.percent ?? 0),
+    message: update.message || previous.message || '准备分析视频',
+    detail: update.detail !== undefined ? update.detail : previous.detail || null,
+    startedAt: update.startedAt || previous.startedAt || nowIso,
+    updatedAt: update.updatedAt || nowIso,
+    finishedAt: update.finishedAt !== undefined ? update.finishedAt : previous.finishedAt || null,
+    updatedMs: Date.now()
+  };
+
+  analysisProgressStore.set(key, next);
+  return next;
+}
+
+function getAnalysisProgress(userId, bvid) {
+  pruneProgressStore();
+
+  const progress = analysisProgressStore.get(getProgressKey(userId, bvid));
+  if (progress) {
+    const { updatedMs, ...publicProgress } = progress;
+    return publicProgress;
+  }
+
+  return {
+    bvid,
+    status: 'idle',
+    stage: 'idle',
+    percent: 0,
+    message: '等待分析',
+    detail: null,
+    startedAt: null,
+    updatedAt: null,
+    finishedAt: null
+  };
+}
 
 /**
  * POST /api/v1/video-analysis/analyze
@@ -29,12 +96,28 @@ router.post('/analyze', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const userConfig = getLatestEnabledUserModelConfig(userId);
     const runtimeModelConfig = videoAnalyzer.getEffectiveModelConfig(userConfig);
+    setAnalysisProgress(userId, bvid, {
+      status: 'running',
+      stage: 'prepare',
+      percent: 1,
+      message: '准备分析视频',
+      startedAt: new Date().toISOString(),
+      finishedAt: null
+    });
+    const reportProgress = (progress) => {
+      setAnalysisProgress(userId, bvid, {
+        ...progress,
+        status: 'running'
+      });
+    };
 
     // 构建B站视频URL
     const videoUrl = `https://www.bilibili.com/video/${bvid}`;
 
     // 调用新的 VideoAnalyzer
-    const result = await videoAnalyzer.analyzeVideo(videoUrl, true, userConfig);
+    const result = await videoAnalyzer.analyzeVideo(videoUrl, true, userConfig, {
+      onProgress: reportProgress
+    });
 
     // 转换数据格式以适配前端
     const adaptedData = {
@@ -115,6 +198,13 @@ router.post('/analyze', authenticateToken, async (req, res) => {
       JSON.stringify(normalizedContent),
       runtimeModelConfig.visionModel
     );
+    setAnalysisProgress(userId, bvid, {
+      status: 'completed',
+      stage: 'completed',
+      percent: 100,
+      message: '分析完成',
+      finishedAt: new Date().toISOString()
+    });
 
     res.json({
       success: true,
@@ -122,6 +212,15 @@ router.post('/analyze', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     console.error('[API] 视频分析失败:', error);
+    if (req.body?.bvid && req.user?.userId) {
+      setAnalysisProgress(req.user.userId, req.body.bvid, {
+        status: 'failed',
+        stage: 'failed',
+        percent: 100,
+        message: error.message || '视频分析失败',
+        finishedAt: new Date().toISOString()
+      });
+    }
     res.status(500).json({
       error: '视频分析失败',
       message: error.message
@@ -220,10 +319,9 @@ router.post('/batch', authenticateToken, async (req, res) => {
  * 获取视频分析状态（如果实现了任务队列）
  */
 router.get('/status/:bvid', authenticateToken, (req, res) => {
-  // TODO: 实现任务状态查询
   res.json({
-    status: 'not_implemented',
-    message: '任务状态查询功能待实现'
+    success: true,
+    data: getAnalysisProgress(req.user.userId, req.params.bvid)
   });
 });
 
