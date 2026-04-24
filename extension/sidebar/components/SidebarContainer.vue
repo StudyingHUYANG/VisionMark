@@ -17,6 +17,12 @@
         :progress="analysisProgress"
       />
 
+      <SemanticSearch
+        v-if="!loading && !error && summary"
+        :bvid="bvid"
+        @seek="handleSeek"
+      />
+
       <SummaryCard
         :summary="summary"
         :loading="loading"
@@ -57,6 +63,7 @@
 <script setup>
 import { ref, computed, watch } from 'vue';
 import SidebarHeader from './SidebarHeader.vue';
+import SemanticSearch from './SemanticSearch.vue';
 import AnalysisProgress from './AnalysisProgress.vue';
 import SummaryCard from './SummaryCard.vue';
 import AIAnalysisDetails from './AIAnalysisDetails.vue';

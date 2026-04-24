@@ -11,6 +11,11 @@ db.pragma('journal_mode = WAL');
 // JWT密钥（和server.js一致）
 const JWT_SECRET = config.JWT_SECRET;
 
+// 添加日志去重缓存
+let lastAuthLogToken = '';
+let lastAuthLogTime = 0;
+const AUTH_LOG_DEBOUNCE_MS = 5000; // 5秒内相同token只记录一次
+
 // 1. 登录验证中间件（原server.js里的authenticateToken）
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -21,7 +26,13 @@ function authenticateToken(req, res, next) {
     return res.status(401).json({ error: '未登录，请先在插件中登录' });
   }
 
-  console.log('[Auth] 收到token:', token.substring(0, 20) + '...');
+  // 日志去重：相同token在5秒内只记录一次
+  const now = Date.now();
+  if (token !== lastAuthLogToken || now - lastAuthLogTime > AUTH_LOG_DEBOUNCE_MS) {
+    console.log('[Auth] 收到token:', token.substring(0, 20) + '...');
+    lastAuthLogToken = token;
+    lastAuthLogTime = now;
+  }
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) {
@@ -31,7 +42,14 @@ function authenticateToken(req, res, next) {
       }
       return res.status(403).json({ error: 'Token无效，请重新登录' });
     }
-    console.log('[Auth] Token验证成功, 用户:', user.username);
+    
+    // 验证成功日志也做去重
+    if (token !== lastAuthLogToken || now - lastAuthLogTime > AUTH_LOG_DEBOUNCE_MS) {
+      console.log('[Auth] Token验证成功, 用户:', user.username);
+      lastAuthLogToken = token;
+      lastAuthLogTime = now;
+    }
+    
     req.user = user;
     next();
   });

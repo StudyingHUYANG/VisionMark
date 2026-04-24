@@ -8,13 +8,51 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const config = require('./config.js');
 const modelConfigRouter = require('./routes/modelConfig.js');
+const http = require('http');
+const WebSocket = require('ws');
 
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 const JWT_SECRET = config.JWT_SECRET;
 
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
 app.use('/api/v1/model-config', modelConfigRouter);
+
+// WebSocket 连接处理
+wss.on('connection', (ws, req) => {
+  console.log('[WS] Client connected');
+
+  // 心跳检测
+  ws.isAlive = true;
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+
+  ws.on('message', (message) => {
+    console.log('[WS] Received:', message.toString());
+    // 这里可以添加消息处理逻辑，例如广播给其他客户端或处理特定业务
+    // ws.send(JSON.stringify({ type: 'echo', data: message }));
+  });
+
+  ws.on('close', () => {
+    console.log('[WS] Client disconnected');
+  });
+});
+
+// 定期发送 ping 以检测死连接
+const interval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
+wss.on('close', () => {
+  clearInterval(interval);
+});
 
 const db = require('./database/db');
 
@@ -375,10 +413,13 @@ function resolveSegmentContent(segment, annotationRow) {
 // 引入路由文件
 const statsRouter = require('./routes/stats.js');
 const segmentsRouter = require('./routes/segments.js');
-const videoAnalysisRouter = require('./routes/videoAnalysis.js');
+const createVideoAnalysisRouter = require('./routes/videoAnalysis.js');
+const videoAnalysisRouter = createVideoAnalysisRouter(wss);
+const searchRouter = require('./routes/search.js');
 
 // 注册路由
 app.use('/api/v1/stats', statsRouter);
+app.use('/api/v1/search', searchRouter);
 // app.use('/api/v1/segments', segmentsRouter); // 已在上面定义了 segments 相关 API，这里注释掉路由注册
 app.use('/video-analysis', videoAnalysisRouter); // AI视频分析路由
 
@@ -497,7 +538,8 @@ app.get('/api/v1/video-view', authenticateToken, (req, res) => {
 });
 
 // 使用配置文件的端口
-app.listen(config.PORT, '0.0.0.0', () => {
+server.listen(config.PORT, '0.0.0.0', () => {
   console.log('[Server] http://localhost:' + config.PORT);
+  console.log('[WS] WebSocket server is running');
   console.log('[Auth] admin/admin 登录');
 });
