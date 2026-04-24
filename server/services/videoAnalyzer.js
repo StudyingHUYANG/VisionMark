@@ -9,13 +9,59 @@ const OpenAI = require('openai');
 const execPromise = util.promisify(exec);
 
 // 通义千问API配置 - 使用OpenAI兼容模式
-const QWEN_API_KEY = process.env.QWEN_API_KEY || 'sk-df7f07a45dee431fb8cc9b6453df5f34';
+const QWEN_API_KEY = process.env.QWEN_API_KEY;
 
-// 创建OpenAI客户端
-const openaiClient = new OpenAI({
-  apiKey: QWEN_API_KEY,
-  baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-});
+if (!QWEN_API_KEY) {
+  console.warn('[VideoAnalyzer] 缺少环境变量 QWEN_API_KEY，AI 分析功能已临时禁用');
+}
+
+// ✅ 修复：没有密钥时不创建客户端，避免崩溃
+let openaiClient = null;
+if (QWEN_API_KEY) {
+  openaiClient = new OpenAI({
+    apiKey: QWEN_API_KEY,
+    baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+  });
+}
+
+function extractMessageContent(messageContent) {
+  if (!messageContent) return '';
+  if (typeof messageContent === 'string') {
+    return messageContent;
+  }
+  if (Array.isArray(messageContent)) {
+    return messageContent
+      .map(item => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object') {
+          return item.text || item.content || '';
+        }
+        return '';
+      })
+      .join('');
+  }
+  if (typeof messageContent === 'object') {
+    return messageContent.text || messageContent.content || '';
+  }
+  return String(messageContent);
+}
+
+function extractJsonString(text) {
+  if (!text || typeof text !== 'string') return null;
+
+  const codeBlockMatch = text.match(/```json\s*([\s\S]*?)\s*```/i);
+  if (codeBlockMatch) {
+    return codeBlockMatch[1];
+  }
+
+  const firstBrace = text.indexOf('{');
+  const lastBrace = text.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    return text.substring(firstBrace, lastBrace + 1);
+  }
+
+  return null;
+}
 
 // 阿里云OSS配置 - 用于上传音频文件
 const OSS = require('ali-oss');
@@ -687,6 +733,10 @@ ${transcript || '无语音内容'}
 
     try {
       // 使用OpenAI兼容模式调用通义千问
+      if (!QWEN_API_KEY) {
+        throw new Error('缺少 QWEN_API_KEY，无法调用 AI 服务');
+      }
+
       const completion = await openaiClient.chat.completions.create({
         model: 'qwen-vl-max',
         messages: [
@@ -700,18 +750,14 @@ ${transcript || '无语音内容'}
       });
 
       if (completion && completion.choices && completion.choices[0]) {
-        const aiResponse = completion.choices[0].message.content;
+        const aiResponse = extractMessageContent(completion.choices[0].message.content);
         console.log('[VideoAnalyzer] AI分析完成');
         console.log('[VideoAnalyzer] AI完整返回内容:\n', aiResponse);
 
         // 尝试解析JSON
         try {
-          // 提取JSON部分（AI可能返回markdown格式的json）
-          const jsonMatch = aiResponse.match(/```json\n([\s\S]*?)\n```/) ||
-                           aiResponse.match(/\{[\s\S]*\}/);
-
-          if (jsonMatch) {
-            const jsonStr = jsonMatch[1] || jsonMatch[0];
+          const jsonStr = extractJsonString(aiResponse);
+          if (jsonStr) {
             const parsed = JSON.parse(jsonStr);
 
             // 确保所有必需字段都存在

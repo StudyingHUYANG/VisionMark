@@ -3,7 +3,7 @@ import os
 import shutil
 import zipfile
 
-base = r"E:\BiliVideoEvaluation\ChromeExtention"
+base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 my_ip = "10.129.79.124"  # 你的IP
 
 # 1. 确认配置正确

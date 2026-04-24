@@ -2,7 +2,7 @@
 import os
 import shutil
 
-base = r"E:\BiliVideoEvaluation\ChromeExtention"
+base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 db_path = os.path.join(base, "server", "database", "app.db")
 
 # 删除旧数据库

@@ -1,5 +1,5 @@
 // 从本地配置文件读取（优先）或使用默认值
-window.API_BASE = (window.LOCAL_CONFIG?.API_BASE || 'http://localhost:8080') + '/' + (window.LOCAL_CONFIG?.API_VERSION || 'api/v1');
+window.API_BASE = (window.LOCAL_CONFIG?.API_BASE || 'http://localhost:3000') + '/' + (window.LOCAL_CONFIG?.API_VERSION || 'api/v1');
 
 window.CONFIG = {
   CHECK_INTERVAL: 200,

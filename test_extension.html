@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>VisionMark 扩展测试</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .test-section { margin: 20px 0; padding: 15px; border: 1px solid #ccc; border-radius: 5px; }
+        .success { background-color: #d4edda; border-color: #c3e6cb; }
+        .error { background-color: #f8d7da; border-color: #f5c6cb; }
+        .warning { background-color: #fff3cd; border-color: #ffeaa7; }
+        button { padding: 10px 15px; margin: 5px; cursor: pointer; }
+        pre { background: #f5f5f5; padding: 10px; border-radius: 3px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>VisionMark 扩展测试页面</h1>
+
+    <div id="extension-status" class="test-section warning">
+        <h3>🔍 扩展状态检查</h3>
+        <p id="extension-check">正在检查扩展...</p>
+    </div>
+
+    <div id="api-test" class="test-section">
+        <h3>🌐 API连接测试</h3>
+        <button onclick="testHealthAPI()">测试健康检查API</button>
+        <button onclick="testSegmentsAPI()">测试标注API</button>
+        <button onclick="testVideoAnalysisAPI()">测试视频分析API</button>
+        <pre id="api-result">点击按钮开始测试</pre>
+    </div>
+
+    <div id="extension-test" class="test-section">
+        <h3>🔧 扩展功能测试</h3>
+        <button onclick="testExtensionConstants()">测试扩展常量</button>
+        <button onclick="testExtensionFunctions()">测试扩展函数</button>
+        <pre id="extension-result">点击按钮开始测试</pre>
+    </div>
+
+    <script>
+        // 检查扩展是否加载
+        function checkExtension() {
+            const statusDiv = document.getElementById('extension-check');
+
+            if (typeof window.adSkipper !== 'undefined') {
+                statusDiv.className = 'test-section success';
+                statusDiv.innerHTML = '<h3>✅ 扩展已加载</h3><p>VisionMark扩展正常运行</p>';
+                console.log('扩展检测: 已加载');
+                console.log('扩展版本:', window.adSkipper ? '可用' : '不可用');
+            } else {
+                statusDiv.className = 'test-section error';
+                statusDiv.innerHTML = '<h3>❌ 扩展未加载</h3><p>请检查Chrome扩展是否已启用并重新加载</p>';
+                console.log('扩展检测: 未加载');
+            }
+        }
+
+        // 测试API连接
+        async function testAPI(url, method = 'GET', body = null) {
+            try {
+                const options = {
+                    method,
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                };
+                if (body) options.body = JSON.stringify(body);
+
+                const response = await fetch(url, options);
+                const result = {
+                    status: response.status,
+                    statusText: response.statusText,
+                    contentType: response.headers.get('content-type'),
+                    data: null,
+                    error: null
+                };
+
+                if (response.ok && result.contentType && result.contentType.includes('application/json')) {
+                    result.data = await response.json();
+                } else {
+                    result.error = `HTTP ${response.status}: ${response.statusText}`;
+                    if (!result.contentType || !result.contentType.includes('application/json')) {
+                        result.error += ' (非JSON响应)';
+                    }
+                }
+
+                return result;
+            } catch (error) {
+                return {
+                    status: 0,
+                    statusText: 'Network Error',
+                    error: error.message,
+                    data: null
+                };
+            }
+        }
+
+        async function testHealthAPI() {
+            const resultDiv = document.getElementById('api-result');
+            resultDiv.textContent = '正在测试健康检查API...';
+
+            const result = await testAPI('http://localhost:3000/api/v1/health');
+            displayResult(result, '健康检查API');
+        }
+
+        async function testSegmentsAPI() {
+            const resultDiv = document.getElementById('api-result');
+            resultDiv.textContent = '正在测试标注API...';
+
+            const result = await testAPI('http://localhost:3000/api/v1/segments?bvid=BV1xx411c7mD&page=1');
+            displayResult(result, '标注API');
+        }
+
+        async function testVideoAnalysisAPI() {
+            const resultDiv = document.getElementById('api-result');
+            resultDiv.textContent = '正在测试视频分析API...';
+
+            // 先获取token（如果有的话）
+            let token = null;
+            try {
+                if (window.localStorage) {
+                    token = localStorage.getItem('visionmark_token');
+                }
+            } catch (e) {
+                console.log('无法获取token:', e.message);
+            }
+
+            const headers = { 'Content-Type': 'application/json' };
+            if (token) {
+                headers['Authorization'] = `Bearer ${token}`;
+            }
+
+            const result = await testAPI('http://localhost:3000/api/v1/video-analysis/analyze', 'POST', { bvid: 'BV1xx411c7mD' });
+            displayResult(result, '视频分析API');
+        }
+
+        function displayResult(result, apiName) {
+            const resultDiv = document.getElementById('api-result');
+            let output = `${apiName} 测试结果:\n`;
+            output += `状态: ${result.status} ${result.statusText}\n`;
+
+            if (result.contentType) {
+                output += `内容类型: ${result.contentType}\n`;
+            }
+
+            if (result.data) {
+                output += `数据: ${JSON.stringify(result.data, null, 2)}\n`;
+            }
+
+            if (result.error) {
+                output += `错误: ${result.error}\n`;
+            }
+
+            resultDiv.textContent = output;
+            console.log(`${apiName}测试结果:`, result);
+        }
+
+        function testExtensionConstants() {
+            const resultDiv = document.getElementById('extension-result');
+            let output = '扩展常量测试:\n';
+
+            try {
+                // 检查API_BASE常量
+                if (typeof window.API_BASE !== 'undefined') {
+                    output += `✅ API_BASE: ${window.API_BASE}\n`;
+                } else {
+                    output += `❌ API_BASE: 未定义\n`;
+                }
+
+                // 检查LOCAL_CONFIG
+                if (typeof window.LOCAL_CONFIG !== 'undefined') {
+                    output += `✅ LOCAL_CONFIG: ${JSON.stringify(window.LOCAL_CONFIG)}\n`;
+                } else {
+                    output += `❌ LOCAL_CONFIG: 未定义\n`;
+                }
+
+                // 检查adSkipper实例
+                if (typeof window.adSkipper !== 'undefined') {
+                    output += `✅ adSkipper实例: 可用\n`;
+                } else {
+                    output += `❌ adSkipper实例: 不可用\n`;
+                }
+
+            } catch (error) {
+                output += `测试出错: ${error.message}\n`;
+            }
+
+            resultDiv.textContent = output;
+        }
+
+        function testExtensionFunctions() {
+            const resultDiv = document.getElementById('extension-result');
+            let output = '扩展函数测试:\n';
+
+            try {
+                if (window.adSkipper) {
+                    output += `✅ adSkipper实例存在\n`;
+
+                    // 检查关键方法
+                    const methods = ['getToken', 'loadSegments', 'analyzeVideo'];
+                    methods.forEach(method => {
+                        if (typeof window.adSkipper[method] === 'function') {
+                            output += `✅ ${method} 方法: 可用\n`;
+                        } else {
+                            output += `❌ ${method} 方法: 不可用\n`;
+                        }
+                    });
+                } else {
+                    output += `❌ adSkipper实例不存在\n`;
+                }
+            } catch (error) {
+                output += `测试出错: ${error.message}\n`;
+            }
+
+            resultDiv.textContent = output;
+        }
+
+        // 页面加载时自动检查扩展状态
+        window.addEventListener('load', function() {
+            setTimeout(checkExtension, 1000);
+        });
+    </script>
+</body>
+</html>

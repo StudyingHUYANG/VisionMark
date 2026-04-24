@@ -7,8 +7,8 @@
   let sidebarState = null;
 
   // API 基础路径
-  const API_BASE = window.API_BASE || 'http://localhost:8080/api/v1';
-  const VIDEO_ANALYSIS_BASE = window.LOCAL_CONFIG?.API_BASE || 'http://localhost:8080';
+  const API_BASE = window.API_BASE || 'http://localhost:3000/api/v1';
+  const VIDEO_ANALYSIS_BASE = window.LOCAL_CONFIG?.API_BASE || 'http://localhost:3000/api/v1';
   const DANMU_TRIGGER_WINDOW_SEC = 0.3;
   const DANMU_REWIND_RESET_SEC = 1.0;
   const DANMU_MAX_CONCURRENT = 3;
@@ -252,7 +252,7 @@
       button.onclick = (event) => {
         event.stopPropagation();
         this.toggleSidebar().catch((error) => {
-          console.error('[AdSkipper] 切换侧边栏失败:', error);
+        console.error('[AdSkipper] 切换侧边栏失败:', error.message || error);
           this.showToast('视频总结面板加载失败', 'error');
         });
       };
@@ -283,7 +283,7 @@
       try {
         await this.initSidebar();
       } catch (error) {
-        console.error('[AdSkipper] ensureSidebarReady failed:', error);
+        console.error('[AdSkipper] ensureSidebarReady failed:', error.message || error);
       }
       return Boolean(this.sidebarController);
     }
@@ -364,7 +364,8 @@
       this.networkState.offlineUntil = Date.now() + this.networkCooldownMs;
       this.networkState.wasOffline = true;
       if (!this.networkState.hasLoggedOffline) {
-        console.warn(`[AdSkipper] 后端在 ${context} 时不可达，暂停请求 30 秒。`, error);
+        const message = error?.message || String(error);
+        console.warn(`[AdSkipper] 后端在 ${context} 时不可达，暂停请求 30 秒。`, message, error);
         this.networkState.hasLoggedOffline = true;
       }
     }
@@ -402,6 +403,8 @@
 
       try {
         const response = await fetch(url, {
+          mode: 'cors',
+          cache: 'no-cache',
           ...options,
           signal: options.signal || (controller ? controller.signal : undefined)
         });
@@ -411,10 +414,13 @@
         return response;
       } catch (error) {
         clearTimeout(timeoutId);
-        console.error(`[AdSkipper] safeFetch: 请求失败`, error);
+        const message = error?.message || String(error);
+        console.error(`[AdSkipper] safeFetch: 请求失败`, message, error);
         if (this.isNetworkFailure(error)) {
           this.markNetworkOffline(context, error);
-          throw this.createNetworkUnavailableError();
+          const networkError = this.createNetworkUnavailableError();
+          networkError.message = `网络不可用：${message}`;
+          throw networkError;
         }
         throw error;
       }
@@ -436,7 +442,19 @@
         const url = API_BASE + "/segments?bvid=" + bvid + "&page=" + this.getPage();
         const res = await this.safeFetch(url, {}, 'load segments');
         if (!res.ok) {
-          throw new Error('加载片段失败：' + res.status);
+          let errorMsg = '加载片段失败：' + res.status;
+          if (res.status === 404) {
+            errorMsg = '接口不存在 (404): /segments';
+          } else if (res.status >= 500) {
+            errorMsg = `服务器错误 (${res.status}): /segments`;
+          }
+          throw new Error(errorMsg);
+        }
+
+        // 检查Content-Type
+        const contentType = res.headers.get('content-type');
+        if (!contentType || !contentType.includes('application/json')) {
+          throw new Error('服务器返回格式错误（可能后端未启动）');
         }
 
         const data = await res.json();
@@ -494,7 +512,7 @@
       this.scheduleSegmentMarkerRetry(2);
       } catch (error) {
         if (error.code !== 'NETWORK_UNAVAILABLE') {
-          console.error('[AdSkipper] 加载片段失败:', error);
+          console.error('[AdSkipper] 加载片段失败:', error.message || error);
         }
         this.segments = [];
         this.allSegments = [];
@@ -1403,13 +1421,25 @@
 
       console.log('[AdSkipper] 响应状态:', res.status, res.statusText);
 
+      // 检查Content-Type
+      const contentType = res.headers.get('content-type');
+      if (!contentType || !contentType.includes('application/json')) {
+        let errorMsg = '服务器返回格式错误（可能后端未启动）';
+        if (res.status === 404) {
+          errorMsg = '接口不存在 (404): /video-analysis/analyze';
+        } else if (res.status >= 500) {
+          errorMsg = `服务器错误 (${res.status}): /video-analysis/analyze`;
+        }
+        throw new Error(errorMsg);
+      }
+
       let payload = null;
       try {
         payload = await res.json();
         console.log('[AdSkipper] 响应数据:', payload);
       } catch (error) {
-        console.error('[AdSkipper] 解析JSON失败:', error);
-        payload = null;
+        console.error('[AdSkipper] 解析JSON失败:', error.message || error);
+        throw new Error('服务器返回无效的JSON格式');
       }
 
       if (!res.ok) {
@@ -1498,6 +1528,18 @@
           body: JSON.stringify({ bvid })
         });
 
+        // 检查Content-Type
+        const contentType = res.headers.get('content-type');
+        if (!contentType || !contentType.includes('application/json')) {
+          let errorMsg = '服务器返回格式错误（可能后端未启动）';
+          if (res.status === 404) {
+            errorMsg = '接口不存在 (404): /video-analysis/analyze';
+          } else if (res.status >= 500) {
+            errorMsg = `服务器错误 (${res.status}): /video-analysis/analyze`;
+          }
+          throw new Error(errorMsg);
+        }
+
         const result = await res.json();
 
         if (!res.ok) {
@@ -1559,7 +1601,7 @@
           }
         }
       } catch (error) {
-        console.error("[AdSkipper] 分析视频出错:", error);
+        console.error("[AdSkipper] 分析视频出错:", error.message || error);
         if (sidebarState) {
           sidebarState.isLoading = false;
           sidebarState.loadError = '分析失败: ' + error.message;
@@ -1604,7 +1646,7 @@
         }
         console.log('[AdSkipper] ========== 视频分析完成 ==========');
       } catch (error) {
-        console.error('[AdSkipper] 视频分析异常:', error);
+        console.error('[AdSkipper] 视频分析异常:', error.message || error);
         console.error('[AdSkipper] 错误详情:', {
           message: error.message,
           code: error.code,

@@ -1,7 +1,7 @@
 // 使用配置文件中的 API 地址（如果配置文件存在）
 const API_BASE = window.LOCAL_CONFIG
   ? window.LOCAL_CONFIG.API_BASE + '/' + window.LOCAL_CONFIG.API_VERSION
-  : 'http://localhost:8080/api/v1';
+  : 'http://localhost:3000/api/v1';
 
 const NETWORK_ERROR_CODE = 'NETWORK_UNAVAILABLE';
 const NETWORK_COOLDOWN_MS = 30000;
@@ -40,7 +40,8 @@ function markNetworkOffline(error) {
   networkState.offlineUntil = Date.now() + NETWORK_COOLDOWN_MS;
   networkState.wasOffline = true;
   if (!networkState.hasLoggedOffline) {
-    console.warn('[Popup] 后端不可达，暂停请求 30 秒。', error);
+    const message = error?.message || String(error);
+    console.warn('[Popup] 后端不可达，暂停请求 30 秒。', message, error);
     networkState.hasLoggedOffline = true;
   }
 }
@@ -56,6 +57,8 @@ function markNetworkOnline() {
 
 async function safeFetch(url, options = {}) {
   if (Date.now() < networkState.offlineUntil) {
+    const remainingSec = Math.ceil((networkState.offlineUntil - Date.now()) / 1000);
+    console.warn(`[Popup] safeFetch: 网络冷却中，还需等待 ${remainingSec} 秒`);
     throw createNetworkUnavailableError();
   }
 
@@ -66,6 +69,8 @@ async function safeFetch(url, options = {}) {
 
   try {
     const response = await fetch(url, {
+      mode: 'cors',
+      cache: 'no-cache',
       ...options,
       signal: options.signal || (controller ? controller.signal : undefined)
     });
@@ -74,9 +79,13 @@ async function safeFetch(url, options = {}) {
     return response;
   } catch (error) {
     clearTimeout(timeoutId);
+    const message = error?.message || String(error);
+    console.error('[Popup] safeFetch: 请求失败', message, error);
     if (isNetworkFailure(error)) {
       markNetworkOffline(error);
-      throw createNetworkUnavailableError();
+      const networkError = createNetworkUnavailableError();
+      networkError.message = `网络不可用：${message}`;
+      throw networkError;
     }
     throw error;
   }
@@ -116,24 +125,33 @@ async function apiRequest(endpoint, options = {}) {
       ...options.headers
     };
     if (token) headers['Authorization'] = 'Bearer ' + token;
-    
+
     const res = await safeFetch(API_BASE + endpoint, {
       ...options,
       headers
     });
-    
+
     // 检查Content-Type
     const contentType = res.headers.get('content-type');
     if (!contentType || !contentType.includes('application/json')) {
-      throw new Error('服务器返回格式错误（可能后端未启动）');
+      let errorMsg = '服务器返回格式错误（可能后端未启动）';
+      if (res.status === 404) {
+        errorMsg = `接口不存在 (404): ${endpoint}`;
+      } else if (res.status >= 500) {
+        errorMsg = `服务器错误 (${res.status}): ${endpoint}`;
+      }
+      throw new Error(errorMsg);
     }
-    
+
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || '请求失败');
+    if (!res.ok) {
+      const errorMsg = data.error || `请求失败 (${res.status})`;
+      throw new Error(errorMsg);
+    }
     return data;
   } catch(err) {
     if (err.code !== NETWORK_ERROR_CODE) {
-      console.error('API Error:', err);
+      console.error('API Error:', err.message || err);
     }
     throw err;
   }
@@ -227,7 +245,7 @@ async function loadUserContributionCount() {
     }
   } catch(err) {
     if (err.code !== NETWORK_ERROR_CODE) {
-      console.error('[Popup] 获取标注数量失败:', err);
+      console.error('[Popup] 获取标注数量失败:', err.message || err);
     }
     document.getElementById('display-count').textContent = '0';
   }
@@ -332,7 +350,7 @@ async function handleAuth() {
       toggleMode();
     }
   } catch(err) {
-    showError(err.message || '网络错误，请检查后端是否启动 (localhost:8080)');
+    showError(err.message || '网络错误，请检查后端是否启动 (localhost:3000)');
   } finally {
     btn.disabled = false;
     btn.textContent = originalText;
@@ -438,7 +456,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 检查后端健康状态
   apiRequest('/health')
     .then(() => console.log('后端连接正常'))
-    .catch(() => showError('警告：无法连接后端，请确保localhost:8080运行中'));
+    .catch(() => showError('警告：无法连接后端，请确保localhost:3000运行中'));
 });
 
 // 打开标注历史页面
@@ -448,7 +466,9 @@ function openHistoryPage() {
     if (tabs[0]) {
       chrome.tabs.sendMessage(tabs[0].id, {action: 'showSegmentMarkers'}, (response) => {
         if (chrome.runtime.lastError) {
-          console.error('[Popup] 发送消息失败:', chrome.runtime.lastError);
+          const err = chrome.runtime.lastError;
+          const message = err.message || JSON.stringify(err);
+          console.error('[Popup] 发送消息失败:', message, err);
           showError('请在B站视频页面使用此功能');
         } else {
           // 显示成功提示

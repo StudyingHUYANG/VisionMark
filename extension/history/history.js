@@ -1,6 +1,6 @@
 const API_BASE = window.LOCAL_CONFIG
   ? window.LOCAL_CONFIG.API_BASE + '/' + window.LOCAL_CONFIG.API_VERSION
-  : 'http://localhost:8080/api/v1';
+  : 'http://localhost:3000/api/v1';
 
 // State
 let allSegments = [];
@@ -61,7 +61,7 @@ async function loadSegments() {
     updateStats();
 
   } catch (error) {
-    console.error('加载失败:', error);
+    console.error('加载失败:', error.message || error);
     document.getElementById('segments-body').innerHTML =
       '<tr><td colspan="5" class="empty">加载失败: ' + error.message + '</td></tr>';
   }

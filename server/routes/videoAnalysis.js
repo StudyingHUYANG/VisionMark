@@ -117,7 +117,7 @@ router.post('/analyze', authenticateToken, async (req, res) => {
       data: adaptedData
     });
   } catch (error) {
-    console.error('[API] 视频分析失败:', error);
+    console.error('[API] 视频分析失败:', error.message || error);
     res.status(500).json({
       error: '视频分析失败',
       message: error.message
@@ -199,7 +199,7 @@ router.post('/batch', authenticateToken, async (req, res) => {
       data: results
     });
   } catch (error) {
-    console.error('[API] 批量分析失败:', error);
+    console.error('[API] 批量分析失败:', error.message || error);
     res.status(500).json({
       error: '批量分析失败',
       message: error.message
@@ -242,7 +242,7 @@ router.post('/extract-keyframes', authenticateToken, async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('[API] 关键帧提取失败:', error);
+    console.error('[API] 关键帧提取失败:', error.message || error);
     res.status(500).json({
       error: '关键帧提取失败',
       message: error.message
