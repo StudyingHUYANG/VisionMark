@@ -1,4 +1,4 @@
-﻿const axios = require('axios');
+const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const { exec, spawn } = require('child_process');
@@ -6,29 +6,12 @@ const util = require('util');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const OpenAI = require('openai');
 const { buildEffectiveModelConfig } = require('./modelConfigService');
+const { ossClient, hasOssConfig } = require('../utils/oss');
+const EmbeddingService = require('./embeddingService');
+const vectorDb = require('./vectorDb');
+const BilibiliDownloader = require('./bilibiliDownloader');
 
 const execPromise = util.promisify(exec);
-
-// 阿里云OSS配置 - 用于上传音频文件
-const OSS = require('ali-oss');
-
-const hasOssConfig = Boolean(
-  process.env.OSS_ACCESS_KEY_ID &&
-  process.env.OSS_ACCESS_KEY_SECRET &&
-  process.env.OSS_BUCKET
-);
-
-let ossClient = null;
-if (hasOssConfig) {
-  ossClient = new OSS({
-    region: process.env.OSS_REGION || 'oss-cn-beijing',
-    accessKeyId: process.env.OSS_ACCESS_KEY_ID,
-    accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET,
-    bucket: process.env.OSS_BUCKET
-  });
-} else {
-  console.warn('[VideoAnalyzer] OSS config missing, audio transcription upload will be skipped.');
-}
 
 // 时间格式化辅助函数
 function formatTime(seconds) {
@@ -44,8 +27,9 @@ function clampPercent(percent) {
 }
 
 class VideoAnalyzer {
-  constructor() {
-    this.downloadDir = path.join(__dirname, '../../downloads');
+  constructor(downloadDir, wss = null) {
+    this.downloadDir = downloadDir || path.join(__dirname, '../../downloads');
+    this.wss = wss; // WebSocket 服务器实例
     this.ensureDownloadDir();
   }
 
@@ -61,17 +45,37 @@ class VideoAnalyzer {
   }
 
   reportProgress(onProgress, stage, percent, message, detail = null) {
-    if (typeof onProgress !== 'function') return;
-    try {
-      onProgress({
-        stage,
-        percent: clampPercent(percent),
-        message,
-        detail,
-        updatedAt: new Date().toISOString()
+    const progressData = {
+      stage,
+      percent: clampPercent(percent),
+      message,
+      detail,
+      updatedAt: new Date().toISOString()
+    };
+    
+    // 通过 WebSocket 推送给所有连接的客户端
+    if (this.wss) {
+      this.wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          try {
+            client.send(JSON.stringify({
+              type: 'progress',
+              data: progressData
+            }));
+          } catch (error) {
+            console.warn('[VideoAnalyzer] WebSocket 推送失败:', error.message);
+          }
+        }
       });
-    } catch (error) {
-      console.warn('[VideoAnalyzer] 进度上报失败:', error.message);
+    }
+    
+    // 保持原有的回调方式兼容
+    if (typeof onProgress === 'function') {
+      try {
+        onProgress(progressData);
+      } catch (error) {
+        console.warn('[VideoAnalyzer] 进度上报失败:', error.message);
+      }
     }
   }
 
@@ -94,9 +98,9 @@ class VideoAnalyzer {
   }
 
   /**
-   * 使用yt-dlp下载B站视频
+   * 使用yt-dlp下载B站视频（支持手动cookies文件）
    */
-  async downloadVideo(bvid, url, onProgress = null) {
+  async downloadVideo(bvid, url, onProgress = null, cookiesPath = null) {
     const outputTemplate = path.join(this.downloadDir, `${bvid}.%(ext)s`);
 
     // 检查是否已下载（查找匹配的文件）
@@ -111,62 +115,115 @@ class VideoAnalyzer {
     console.log(`[VideoAnalyzer] 开始下载视频 ${bvid}...`);
     this.reportProgress(onProgress, 'download', 5, '正在下载 0%');
 
-    try {
-      // 使用yt-dlp下载，并解析实时进度输出。
-      // 使用 @ffmpeg-installer/ffmpeg 提供的路径，避免依赖系统 ffmpeg
-      const args = [
-        '-m',
-        'yt_dlp',
-        '--newline',
-        '--ffmpeg-location',
-        ffmpegPath,
-        '-f',
-        'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        '-o',
-        outputTemplate,
-        url
-      ];
+    // 构建基础参数（避免过多浏览器专有请求头触发风控）
+    const commonArgs = [
+      '-m', 'yt_dlp',
+      '--newline',
+      '--ffmpeg-location', ffmpegPath,
+      '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      '--referer', 'https://www.bilibili.com/',
+      '--no-check-certificate',
+      '--ignore-config',
+      '--no-warnings'
+    ];
 
-      await new Promise((resolve, reject) => {
-        const child = spawn('python', args, { windowsHide: true });
-        let outputTail = '';
-        let lastReportedPercent = -1;
+    const primaryArgs = [
+      ...commonArgs,
+      '--extractor-args', 'bilibili:use_wbi=true',
+      '--add-header', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      '--add-header', 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8',
+      '--extractor-retries', '2',
+      '--retries', '2',
+      '--fragment-retries', '2'
+    ];
 
-        const appendOutput = (text) => {
-          outputTail = `${outputTail}${text}`.slice(-6000);
-        };
+    const fallbackArgs = [
+      ...commonArgs,
+      '--extractor-args', 'bilibili:use_wbi=false',
+      '--extractor-retries', '3',
+      '--retries', '3',
+      '--fragment-retries', '3'
+    ];
 
-        const handleOutput = (chunk) => {
-          const text = chunk.toString();
-          appendOutput(text);
+    const hasCookies = Boolean(cookiesPath && fs.existsSync(cookiesPath));
 
-          const matches = [...text.matchAll(/\[download\]\s+(\d+(?:\.\d+)?)%/g)];
-          if (matches.length === 0) return;
+    // 如果有cookies文件，添加 --cookies 参数
+    if (hasCookies) {
+      primaryArgs.push('--cookies', cookiesPath);
+      fallbackArgs.push('--cookies', cookiesPath);
+      console.log('[VideoAnalyzer] 使用临时 cookies 文件进行下载');
 
-          const rawPercent = Number(matches[matches.length - 1][1]);
-          if (!Number.isFinite(rawPercent)) return;
+      try {
+        const cookiesContent = fs.readFileSync(cookiesPath, 'utf8');
+        const requiredCookies = ['SESSDATA', 'bili_jct', 'DedeUserID'];
+        const missing = requiredCookies.filter(name => !new RegExp(`(?:^|\\n)[^\\n]*\\t${name}\\t`).test(cookiesContent));
+        if (missing.length > 0) {
+          console.warn(`[VideoAnalyzer] cookies 可能不完整，缺少: ${missing.join(', ')}`);
+        }
+      } catch (error) {
+        console.warn('[VideoAnalyzer] 读取 cookies 文件失败，继续尝试下载:', error.message);
+      }
+    } else {
+      console.log('[VideoAnalyzer] 无 cookies 文件，使用无认证模式下载');
+    }
 
-          const downloadPercent = Math.max(0, Math.min(100, rawPercent));
-          const wholePercent = Math.floor(downloadPercent);
-          if (wholePercent === lastReportedPercent) return;
+    primaryArgs.push('-o', outputTemplate, url);
+    fallbackArgs.push('-o', outputTemplate, url);
 
-          lastReportedPercent = wholePercent;
-          const mappedPercent = 5 + (downloadPercent / 100) * 15;
-          this.reportProgress(onProgress, 'download', mappedPercent, `正在下载 ${wholePercent}%`);
-        };
+    const runYtDlp = (args, modeLabel) => new Promise((resolve, reject) => {
+      const child = spawn('python', args, { windowsHide: true });
+      let outputTail = '';
+      let lastReportedPercent = -1;
 
-        child.stdout.on('data', handleOutput);
-        child.stderr.on('data', handleOutput);
-        child.on('error', reject);
-        child.on('close', (code) => {
-          if (code === 0) {
-            this.reportProgress(onProgress, 'download', 20, '视频下载完成');
-            resolve();
-            return;
-          }
-          reject(new Error(`yt-dlp退出码 ${code}: ${outputTail || '无输出'}`));
-        });
+      const appendOutput = (text) => {
+        outputTail = `${outputTail}${text}`.slice(-8000);
+      };
+
+      const handleOutput = (chunk) => {
+        const text = chunk.toString();
+        appendOutput(text);
+
+        const matches = [...text.matchAll(/\[download\]\s+(\d+(?:\.\d+)?)%/g)];
+        if (matches.length === 0) return;
+
+        const rawPercent = Number(matches[matches.length - 1][1]);
+        if (!Number.isFinite(rawPercent)) return;
+
+        const downloadPercent = Math.max(0, Math.min(100, rawPercent));
+        const wholePercent = Math.floor(downloadPercent);
+        if (wholePercent === lastReportedPercent) return;
+
+        lastReportedPercent = wholePercent;
+        const mappedPercent = 5 + (downloadPercent / 100) * 15;
+        this.reportProgress(onProgress, 'download', mappedPercent, `正在下载 ${wholePercent}%`);
+      };
+
+      child.stdout.on('data', handleOutput);
+      child.stderr.on('data', handleOutput);
+      child.on('error', reject);
+      child.on('close', (code) => {
+        if (code === 0) {
+          this.reportProgress(onProgress, 'download', 20, '视频下载完成');
+          resolve();
+          return;
+        }
+        reject(new Error(`yt-dlp退出码 ${code}(${modeLabel}): ${outputTail || '无输出'}`));
       });
+    });
+
+    try {
+      try {
+        await runYtDlp(primaryArgs, 'primary');
+      } catch (firstError) {
+        const firstMessage = String(firstError?.message || '');
+        const isLikely412 = /412|Precondition Failed/i.test(firstMessage);
+        if (!isLikely412) throw firstError;
+
+        console.warn('[VideoAnalyzer] 检测到 B 站风控 412，切换兼容参数重试一次');
+        this.reportProgress(onProgress, 'download', 8, '检测到风控，正在重试下载');
+        await runYtDlp(fallbackArgs, 'fallback');
+      }
 
       // 查找下载的视频文件
       const downloadedFiles = fs.readdirSync(this.downloadDir).filter(f => f.startsWith(bvid) && f.endsWith('.mp4'));
@@ -176,10 +233,48 @@ class VideoAnalyzer {
 
       const videoPath = path.join(this.downloadDir, downloadedFiles[0]);
       console.log(`[VideoAnalyzer] 视频下载完成: ${videoPath}`);
+      
+      if (cookiesPath && fs.existsSync(cookiesPath)) {
+        console.log('[VideoAnalyzer] 成功使用 cookies 下载高画质视频');
+      } else {
+        console.log('[VideoAnalyzer] 使用无 cookies 模式下载（可能为低画质）');
+      }
+      
       return videoPath;
     } catch (error) {
       console.error('[VideoAnalyzer] 下载失败:', error);
-      throw new Error(`视频下载失败: ${error.message}`);
+      
+      if (!hasCookies) {
+        const finalError = new Error(`视频下载失败: ${error.message}。建议：请确保已登录 Bilibili 账号以获得最佳分析体验。`);
+        console.error('[VideoAnalyzer] 下载失败详情:', finalError);
+        throw finalError;
+      } else {
+        const finalError = new Error(`视频下载失败: ${error.message}。即使使用了 cookies 仍然失败，请刷新 Bilibili 登录状态、更新 yt-dlp 后重试。`);
+        console.error('[VideoAnalyzer] 下载失败详情:', finalError);
+        throw finalError;
+      }
+    }
+  }
+
+  /**
+   * 混合下载策略：优先使用 Bilibili 专用下载器，失败后回退到 yt-dlp
+   */
+  async downloadVideoHybrid(bvid, url, onProgress = null, cookiesPath = null) {
+    // 先尝试 Bilibili 专用下载器
+    try {
+      console.log('[VideoAnalyzer] 尝试使用 Bilibili 专用下载器...');
+      const bilibiliDownloader = new BilibiliDownloader();
+      const result = await bilibiliDownloader.downloadVideo(url, (progress) => {
+        this.reportProgress(onProgress, progress.stage, progress.percent, progress.message);
+      });
+      console.log('[VideoAnalyzer] Bilibili 专用下载器成功');
+      return result;
+    } catch (bilibiliError) {
+      console.warn('[VideoAnalyzer] Bilibili 专用下载器失败:', bilibiliError.message);
+      
+      // 回退到 yt-dlp
+      console.log('[VideoAnalyzer] 回退到 yt-dlp 下载器...');
+      return await this.downloadVideo(bvid, url, onProgress, cookiesPath);
     }
   }
 
@@ -822,7 +917,7 @@ ${transcript || '无语音内容'}
 
         // 尝试解析JSON
         try {
-          // 提取JSON部分（AI可能返回markdown格式的json）
+          // 提取JSON部分（AI可能返回``json\n``）
           const jsonMatch = aiResponse.match(/```json\n([\s\S]*?)\n```/) ||
                            aiResponse.match(/\{[\s\S]*\}/);
 
@@ -916,23 +1011,123 @@ ${transcript || '无语音内容'}
   }
 
   /**
+   * 将提取的帧转存为向量DB
+   */
+  async storeFrameVectors(bvid, framesDir, onVectorProgress = null) {
+    // 跳过图像向量提取，因为多模态API不稳定
+    console.log('[VideoAnalyzer] 跳过图像向量提取（多模态API暂时禁用）');
+    if (onVectorProgress) {
+      onVectorProgress(100, 'completed', '图像向量提取已禁用');
+    }
+    return;
+    
+    /* 
+    // 原始代码已注释
+    if (!vectorDb.isReady()) {
+      console.warn('[VideoAnalyzer] VectorDB 未初始化，跳过帧向量提取');
+      if (onVectorProgress) onVectorProgress(100, 'error', 'VectorDB 未初始化，跳过帧向量提取');
+      return;
+    }
+    const embeddingService = new EmbeddingService();
+    if (!embeddingService.isReady()) {
+      console.warn('[VideoAnalyzer] 未配置 DASHSCOPE_API_KEY，跳过帧向量提取');
+      if (onVectorProgress) onVectorProgress(100, 'error', '未配置环境变量 DASHSCOPE_API_KEY，跳过语义搜索功能');
+      return;
+    }
+
+    try {
+      if (onVectorProgress) onVectorProgress(5, 'running', '正在读取视频帧...');
+      const files = fs.readdirSync(framesDir).filter(f => f.endsWith('.jpg')).sort();
+      if (files.length === 0) {
+        if (onVectorProgress) onVectorProgress(100, 'completed', '没有可以入库的帧');
+        return;
+      }
+
+      console.log(`[VideoAnalyzer] 开始提取并存储 ${files.length} 个帧向量...`);
+      const points = [];
+      const total = files.length;
+
+      for (let i = 0; i < total; i++) {
+        const file = files[i];
+        // 文件名格式 frame_001_12345.jpg，其中12345是毫秒
+        const match = file.match(/_(\d+)\.jpg$/);
+        if (!match) continue;
+        const timestampMs = parseInt(match[1], 10);
+        const timestampSec = timestampMs / 1000.0;
+        const filePath = path.join(framesDir, file);
+
+        try {
+          const vector = await embeddingService.embedLocalImage(bvid, timestampMs, filePath);
+          if (vector) {
+            points.push({
+              timestamp: timestampSec,
+              vector: vector
+            });
+          }
+        } catch (err) {
+          console.error(`[VideoAnalyzer] embedLocalImage 失败: ${file}`, err.message);
+        }
+
+        const percent = 5 + Math.round(((i + 1) / total) * 90);
+        if (onVectorProgress) onVectorProgress(percent, 'running', `正在调用百炼多模态模型向量化画面: ${i + 1}/${total} 帧...`);
+      }
+
+      if (points.length > 0) {
+        if (onVectorProgress) onVectorProgress(96, 'running', '正在存入本地LanceDB向量数据库...');
+        await vectorDb.upsertFramePoints(bvid, points);
+      }
+      
+      if (onVectorProgress) onVectorProgress(100, 'completed', '多模态帧向量提取完毕！现在可以正常使用语义搜索了。');
+    } catch (error) {
+      console.error('[VideoAnalyzer] storeFrameVectors 失败:', error.message);
+      if (onVectorProgress) onVectorProgress(100, 'error', `后台提取失败: ${error.message}`);
+    }
+    */
+  }
+
+  /**
    * 完整的视频分析流程（支持音视频结合分析）
    */
   async analyzeVideo(url, useAudio = true, userConfig = null, options = {}) {
     const onProgress = typeof options === 'function' ? options : options?.onProgress;
+    const bilibiliCookies = options?.bilibiliCookies; // 接收前端传来的 cookies
+    let bvid = null;
+    let tempCookiesPath = null;
+    
     try {
       // 1. 提取视频信息
-      const { bvid } = this.extractBilibiliInfo(url);
+      ({ bvid } = this.extractBilibiliInfo(url));
       console.log(`[VideoAnalyzer] 开始分析视频: ${bvid}`);
       this.reportProgress(onProgress, 'prepare', 2, '准备分析视频');
 
-      // 2. 下载视频
-      const videoPath = await this.downloadVideo(bvid, url, onProgress);
+      // 2. 如果有 cookies，保存为临时文件
+      if (bilibiliCookies) {
+        try {
+          const tempDir = path.join(this.downloadDir, 'temp');
+          if (!fs.existsSync(tempDir)) {
+            fs.mkdirSync(tempDir, { recursive: true });
+          }
+          tempCookiesPath = path.join(tempDir, `${bvid}_cookies.txt`);
+          fs.writeFileSync(tempCookiesPath, bilibiliCookies, 'utf8');
+          console.log(`[VideoAnalyzer] 已保存临时 cookies 文件: ${tempCookiesPath}`);
+        } catch (error) {
+          console.warn('[VideoAnalyzer] 保存 cookies 文件失败:', error.message);
+          tempCookiesPath = null;
+        }
+      }
 
-      // 3. 提取关键帧（用于视觉理解）
+      // 3. 下载视频（传递 cookies 路径）- 使用混合策略
+      const videoPath = await this.downloadVideoHybrid(bvid, url, onProgress, tempCookiesPath);
+
+      // 4. 提取关键帧（用于视觉理解）
       const { framesDir, duration } = await this.extractFrames(videoPath, bvid, onProgress);
 
-      // 4. 提取音频并进行语音识别（可选）
+      // 后台异步执行向量提取
+      this.storeFrameVectors(bvid, framesDir, options?.onVectorProgress).catch(err => {
+        console.error('[VideoAnalyzer] 后台提取向量失败:', err);
+      });
+
+      // 5. 提取音频并进行语音识别（可选）
       let transcript = null;
       const shouldAnalyzeAudio = Boolean(useAudio && hasOssConfig);
 
@@ -948,12 +1143,12 @@ ${transcript || '无语音内容'}
         this.reportProgress(onProgress, 'model', 42, '跳过音频，准备大模型分析');
       }
 
-      // 5. AI分析（基于关键帧、时长和音频转录），知识点和热词从分析结果中获取
+      // 6. AI分析（基于关键帧、时长和音频转录），知识点和热词从分析结果中获取
       const analysisResult = await this.analyzeWithQwen(videoPath, framesDir, duration, transcript, userConfig, onProgress, {
         modelStartPercent: shouldAnalyzeAudio ? 60 : 42
       });
 
-      // 6. 整合所有分析结果
+      // 7. 整合所有分析结果
       this.reportProgress(onProgress, 'finalize', 98, '正在整理分析结果');
       const finalResult = {
         ...analysisResult,
@@ -961,7 +1156,7 @@ ${transcript || '无语音内容'}
         transcript: transcript
       };
 
-      // 7. 返回结果
+      // 8. 返回结果
       return {
         bvid,
         video_path: videoPath,
@@ -971,6 +1166,16 @@ ${transcript || '无语音内容'}
     } catch (error) {
       console.error('[VideoAnalyzer] 视频分析失败:', error);
       throw error;
+    } finally {
+      // 清理临时 cookies 文件（成功或失败都执行）
+      if (tempCookiesPath && fs.existsSync(tempCookiesPath)) {
+        try {
+          fs.unlinkSync(tempCookiesPath);
+          console.log(`[VideoAnalyzer] 已清理临时 cookies 文件: ${tempCookiesPath}`);
+        } catch (error) {
+          console.warn('[VideoAnalyzer] 清理临时 cookies 文件失败:', error.message);
+        }
+      }
     }
   }
 

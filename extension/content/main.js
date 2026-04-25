@@ -1,5 +1,6 @@
 import { createChapterTimelineInjector, watchBilibiliSpaRoute } from './chapterRail/inject.js';
 import { ANALYSIS_UPDATED_EVENT } from './events.js';
+import './utils.js';
 
 (function () {
   'use strict';
@@ -53,6 +54,9 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       // 手动跳过功能
       this.skipMode = 'auto';
       this.skipButton = null;
+      // WebSocket 连接
+      this.websocket = null;
+      this.currentAnalysisBvid = null;
       // 日志控制变量
       this.noSegmentLogPrinted = false;
       this.coolDownLogPrinted = false;
@@ -482,6 +486,77 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           resolve(storage.adskipper_token);
         });
       });
+    }
+
+    async connectWebSocket(token) {
+      // 断开现有连接
+      this.disconnectWebSocket();
+      
+      if (!token) {
+        console.log('[AdSkipper] WebSocket: 无 token，跳过连接');
+        return;
+      }
+      
+      try {
+        // 构建 WebSocket URL（使用与 API 相同的 base URL）
+        const wsUrl = VIDEO_ANALYSIS_BASE.replace(/^http/, 'ws') + '/?token=' + encodeURIComponent(token);
+        console.log('[AdSkipper] WebSocket: 连接中...', wsUrl);
+        
+        this.websocket = new WebSocket(wsUrl);
+        
+        this.websocket.onopen = () => {
+          console.log('[AdSkipper] WebSocket: 连接成功');
+        };
+        
+        this.websocket.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'progress') {
+              this.handleWebSocketProgress(data.data);
+            }
+          } catch (error) {
+            console.warn('[AdSkipper] WebSocket: 消息解析失败', error);
+          }
+        };
+        
+        this.websocket.onerror = (error) => {
+          console.error('[AdSkipper] WebSocket: 连接错误', error);
+        };
+        
+        this.websocket.onclose = (event) => {
+          console.log('[AdSkipper] WebSocket: 连接关闭', event.code, event.reason);
+          this.websocket = null;
+        };
+      } catch (error) {
+        console.error('[AdSkipper] WebSocket: 连接失败', error);
+      }
+    }
+    
+    disconnectWebSocket() {
+      if (this.websocket) {
+        this.websocket.close();
+        this.websocket = null;
+      }
+    }
+    
+    handleWebSocketProgress(progressData) {
+      // 更新进度显示
+      if (sidebarState && this.currentAnalysisBvid) {
+        sidebarState.analysisProgress = this.normalizeAnalysisProgress({
+          status: progressData.percent >= 100 ? 'completed' : 'running',
+          stage: progressData.stage,
+          percent: progressData.percent,
+          message: progressData.message
+        });
+      }
+      
+      // 如果分析完成或失败，断开 WebSocket 连接
+      if (progressData.percent >= 100 || progressData.message?.includes('失败')) {
+        setTimeout(() => {
+          this.disconnectWebSocket();
+          this.currentAnalysisBvid = null;
+        }, 5000);
+      }
     }
 
     createNetworkUnavailableError() {
@@ -1772,67 +1847,59 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         : null;
     }
 
-    stopAnalysisProgressPolling() {
-      if (this.analysisProgressPollTimer) {
-        clearInterval(this.analysisProgressPollTimer);
-        this.analysisProgressPollTimer = null;
-      }
-      this.analysisProgressBvid = null;
-    }
-
     async requestAnalysisProgress(bvid, token) {
-      const encodedBvid = encodeURIComponent(bvid);
-      const url = `${VIDEO_ANALYSIS_BASE}/video-analysis/status/${encodedBvid}`;
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000);
-
+      const url = `${VIDEO_ANALYSIS_BASE}/video-analysis/status/${encodeURIComponent(bvid)}`;
+      
       try {
-        const res = await fetch(url, {
+        const response = await fetch(url, {
+          method: 'GET',
           headers: {
             'Authorization': 'Bearer ' + token
-          },
-          signal: controller.signal
+          }
         });
-
-        if (!res.ok) return null;
-        const payload = await res.json();
-        return payload?.data || null;
-      } finally {
-        clearTimeout(timeoutId);
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        
+        return await response.json();
+      } catch (error) {
+        console.warn('[AdSkipper] 获取分析进度失败:', error);
+        throw error;
       }
     }
 
-    startAnalysisProgressPolling(bvid, token) {
-      this.stopAnalysisProgressPolling();
-      if (!bvid || !token) return;
+    // WebSocket now handles real-time progress updates
 
-      this.analysisProgressBvid = bvid;
-      const poll = async () => {
-        if (this.analysisProgressBvid !== bvid) return;
-
-        try {
-          const progress = await this.requestAnalysisProgress(bvid, token);
-          if (this.analysisProgressBvid !== bvid) return;
-          if (!progress || progress.status === 'idle') return;
-          this.setAnalysisProgress(progress);
-
-          if (progress.status === 'completed' || progress.status === 'failed') {
-            this.stopAnalysisProgressPolling();
-          }
-        } catch (error) {
-          console.warn('[AdSkipper] 获取分析进度失败:', error);
-        }
-      };
-
-      poll();
-      this.analysisProgressPollTimer = setInterval(poll, 1000);
+    async requestAnalysis(bvid, token) {
     }
 
 
     async requestAnalysis(bvid, token) {
       const url = VIDEO_ANALYSIS_BASE + "/video-analysis/analyze";
       console.log('[AdSkipper] 请求URL:', url);
-      console.log('[AdSkipper] 请求体:', JSON.stringify({ bvid }));
+      
+      // 自动获取 Bilibili cookies（如果可用）
+      let bilibiliCookies = null;
+      try {
+        if (window.VisionMarkCookieUtils?.getBilibiliCookiesForYtDlp) {
+          bilibiliCookies = await window.VisionMarkCookieUtils.getBilibiliCookiesForYtDlp();
+          if (bilibiliCookies) {
+            console.log('[AdSkipper] 成功获取 Bilibili cookies，将用于视频下载');
+          } else {
+            console.log('[AdSkipper] 未获取到 Bilibili cookies，将使用无 cookies 模式');
+          }
+        }
+      } catch (error) {
+        console.warn('[AdSkipper] 获取 cookies 时出错:', error.message);
+      }
+
+      const requestBody = { bvid };
+      if (bilibiliCookies) {
+        requestBody.bilibili_cookies = bilibiliCookies;
+      }
+
+      console.log('[AdSkipper] 请求体:', JSON.stringify({ bvid })); // 注意：不记录 cookies 内容
       console.log('[AdSkipper] 注意：视频分析无超时限制');
 
       // 直接使用原生 fetch，不设置超时
@@ -1843,7 +1910,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           'Content-Type': 'application/json',
           'Authorization': 'Bearer ' + token
         },
-        body: JSON.stringify({ bvid })
+        body: JSON.stringify(requestBody)
       });
 
       console.log('[AdSkipper] 响应状态:', res.status, res.statusText);
@@ -2037,6 +2104,10 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           return;
         }
 
+        // 连接 WebSocket 获取实时进度
+        await this.connectWebSocket(token);
+        this.currentAnalysisBvid = bvid;
+
         if (sidebarState) {
           sidebarState.isLoading = true;
           sidebarState.loadError = null;
@@ -2049,7 +2120,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         }
 
         console.log('[AdSkipper] 开始请求分析API...');
-        this.startAnalysisProgressPolling(bvid, token);
+        // 不再需要轮询，直接发送分析请求
         const result = await this.requestAnalysis(bvid, token);
         console.log('[AdSkipper] API返回:', result);
 

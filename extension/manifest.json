@@ -6,7 +6,8 @@
   "permissions": [
     "storage",
     "activeTab",
-    "tabs"
+    "tabs",
+    "cookies"
   ],
   "options_page": "options/options.html",
   "host_permissions": [

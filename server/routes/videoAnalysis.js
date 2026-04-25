@@ -4,15 +4,14 @@
  */
 
 const express = require('express');
-const router = express.Router();
 const VideoAnalyzer = require('../services/videoAnalyzer');
 const { authenticateToken } = require('../middlewares/auth.js');
 const db = require('../database/db');
 const { getLatestEnabledUserModelConfig } = require('../services/modelConfigService');
 
-// 创建视频分析器实例
-const videoAnalyzer = new VideoAnalyzer();
+// 进度存储（保持全局）
 const analysisProgressStore = new Map();
+const vectorProgressStore = new Map();
 const PROGRESS_TTL_MS = 15 * 60 * 1000;
 
 function clampPercent(percent) {
@@ -35,56 +34,78 @@ function pruneProgressStore() {
   });
 }
 
-function setAnalysisProgress(userId, bvid, update = {}) {
-  pruneProgressStore();
+/**
+ * 创建视频分析路由
+ * @param {Object} wss - WebSocket Server 实例 (可选)
+ * @returns {express.Router}
+ */
+function createVideoAnalysisRouter(wss = null) {
+  const router = express.Router();
 
-  const key = getProgressKey(userId, bvid);
-  const previous = analysisProgressStore.get(key) || {};
-  const nowIso = new Date().toISOString();
-  const next = {
-    bvid,
-    status: update.status || previous.status || 'running',
-    stage: update.stage || previous.stage || 'prepare',
-    percent: clampPercent(update.percent ?? previous.percent ?? 0),
-    message: update.message || previous.message || '准备分析视频',
-    detail: update.detail !== undefined ? update.detail : previous.detail || null,
-    startedAt: update.startedAt || previous.startedAt || nowIso,
-    updatedAt: update.updatedAt || nowIso,
-    finishedAt: update.finishedAt !== undefined ? update.finishedAt : previous.finishedAt || null,
-    updatedMs: Date.now()
-  };
+  // 创建视频分析器实例（传入 WebSocket 服务器）
+  const videoAnalyzer = new VideoAnalyzer(null, wss);
 
-  analysisProgressStore.set(key, next);
-  return next;
-}
-
-function getAnalysisProgress(userId, bvid) {
-  pruneProgressStore();
-
-  const progress = analysisProgressStore.get(getProgressKey(userId, bvid));
-  if (progress) {
-    const { updatedMs, ...publicProgress } = progress;
-    return publicProgress;
+  function setVectorProgress(bvid, update) {
+    const p = vectorProgressStore.get(bvid) || { status: 'idle', percent: 0, message: '' };
+    vectorProgressStore.set(bvid, { ...p, ...update, updatedMs: Date.now() });
   }
 
-  return {
-    bvid,
-    status: 'idle',
-    stage: 'idle',
-    percent: 0,
-    message: '等待分析',
-    detail: null,
-    startedAt: null,
-    updatedAt: null,
-    finishedAt: null
-  };
-}
+  router.get('/vector-progress', (req, res) => {
+    const { bvid } = req.query;
+    const p = vectorProgressStore.get(bvid) || { status: 'idle', percent: 0, message: '' };
+    res.json(p);
+  });
 
-/**
- * POST /api/v1/video-analysis/analyze
- * 分析单个视频
- */
-router.post('/analyze', authenticateToken, async (req, res) => {
+  function setAnalysisProgress(userId, bvid, update = {}) {
+    pruneProgressStore();
+
+    const key = getProgressKey(userId, bvid);
+    const previous = analysisProgressStore.get(key) || {};
+    const nowIso = new Date().toISOString();
+    const next = {
+      bvid,
+      status: update.status || previous.status || 'running',
+      stage: update.stage || previous.stage || 'prepare',
+      percent: clampPercent(update.percent ?? previous.percent ?? 0),
+      message: update.message || previous.message || '准备分析视频',
+      detail: update.detail !== undefined ? update.detail : previous.detail || null,
+      startedAt: update.startedAt || previous.startedAt || nowIso,
+      updatedAt: update.updatedAt || nowIso,
+      finishedAt: update.finishedAt !== undefined ? update.finishedAt : previous.finishedAt || null,
+      updatedMs: Date.now()
+    };
+
+    analysisProgressStore.set(key, next);
+    return next;
+  }
+
+  function getAnalysisProgress(userId, bvid) {
+    pruneProgressStore();
+
+    const progress = analysisProgressStore.get(getProgressKey(userId, bvid));
+    if (progress) {
+      const { updatedMs, ...publicProgress } = progress;
+      return publicProgress;
+    }
+
+    return {
+      bvid,
+      status: 'idle',
+      stage: 'idle',
+      percent: 0,
+      message: '等待分析',
+      detail: null,
+      startedAt: null,
+      updatedAt: null,
+      finishedAt: null
+    };
+  }
+
+  /**
+   * POST /api/v1/video-analysis/analyze
+   * 分析单个视频
+   */
+  router.post('/analyze', authenticateToken, async (req, res) => {
   try {
     const { bvid } = req.body;
 
@@ -114,9 +135,16 @@ router.post('/analyze', authenticateToken, async (req, res) => {
     // 构建B站视频URL
     const videoUrl = `https://www.bilibili.com/video/${bvid}`;
 
+    // 获取前端发送的 cookies（如果有）
+    const bilibiliCookies = req.body.bilibili_cookies;
+
     // 调用新的 VideoAnalyzer
     const result = await videoAnalyzer.analyzeVideo(videoUrl, true, userConfig, {
-      onProgress: reportProgress
+      onProgress: reportProgress,
+      onVectorProgress: (percent, status, message) => {
+        setVectorProgress(bvid, { percent, status, message });
+      },
+      bilibiliCookies: bilibiliCookies
     });
 
     // 转换数据格式以适配前端
@@ -226,12 +254,12 @@ router.post('/analyze', authenticateToken, async (req, res) => {
       message: error.message
     });
   }
-});
+  });
 
-/**
- * 将时间格式 MM:SS 或 HH:MM:SS 转换为秒数
- */
-function parseTimeToSeconds(timeStr) {
+  /**
+   * 将时间格式 MM:SS 或 HH:MM:SS 转换为秒数
+   */
+  function parseTimeToSeconds(timeStr) {
   if (!timeStr) return 0;
   if (typeof timeStr === 'number') return timeStr;
 
@@ -251,14 +279,14 @@ function parseTimeToSeconds(timeStr) {
   if (parts.length === 1) {
     return parts[0];
   }
-  return 0;
-}
+    return 0;
+  }
 
-/**
- * POST /api/v1/video-analysis/batch
- * 批量分析视频
- */
-router.post('/batch', authenticateToken, async (req, res) => {
+  /**
+   * POST /api/v1/video-analysis/batch
+   * 批量分析视频
+   */
+  router.post('/batch', authenticateToken, async (req, res) => {
   try {
     const { videos } = req.body;
 
@@ -312,24 +340,24 @@ router.post('/batch', authenticateToken, async (req, res) => {
       message: error.message
     });
   }
-});
+  });
 
-/**
- * GET /api/v1/video-analysis/status/:bvid
- * 获取视频分析状态（如果实现了任务队列）
- */
-router.get('/status/:bvid', authenticateToken, (req, res) => {
+  /**
+   * GET /api/v1/video-analysis/status/:bvid
+   * 获取视频分析状态（如果实现了任务队列）
+   */
+  router.get('/status/:bvid', authenticateToken, (req, res) => {
   res.json({
     success: true,
     data: getAnalysisProgress(req.user.userId, req.params.bvid)
   });
-});
+  });
 
-/**
- * POST /api/v1/video-analysis/extract-keyframes
- * 提取视频关键帧
- */
-router.post('/extract-keyframes', authenticateToken, async (req, res) => {
+  /**
+   * POST /api/v1/video-analysis/extract-keyframes
+   * 提取视频关键帧
+   */
+  router.post('/extract-keyframes', authenticateToken, async (req, res) => {
   try {
     const { bvid, cid, interval = 10 } = req.body;
 
@@ -354,6 +382,9 @@ router.post('/extract-keyframes', authenticateToken, async (req, res) => {
       message: error.message
     });
   }
-});
+  });
 
-module.exports = router;
+  return router;
+}
+
+module.exports = createVideoAnalysisRouter;
