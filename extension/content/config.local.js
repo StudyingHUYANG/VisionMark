@@ -1,5 +1,5 @@
 window.LOCAL_CONFIG = {
-  API_BASE: 'http://localhost:8080',
+  API_BASE: 'https://apitest.visionmark.com.cn:8443',
   API_VERSION: 'api/v1'
 };
 

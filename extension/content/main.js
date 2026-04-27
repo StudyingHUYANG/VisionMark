@@ -552,10 +552,22 @@ import './utils.js';
       
       // 如果分析完成或失败，断开 WebSocket 连接
       if (progressData.percent >= 100 || progressData.message?.includes('失败')) {
-        setTimeout(() => {
+        setTimeout(async () => {
           this.disconnectWebSocket();
+          
+          // 分析完成后，重新加载视频数据以获取最新结果
+          if (this.currentAnalysisBvid && progressData.percent >= 100) {
+            try {
+              console.log('[AdSkipper] 分析完成，重新加载视频数据...');
+              await this.loadSegments(this.currentAnalysisBvid);
+              console.log('[AdSkipper] 视频数据重新加载完成');
+            } catch (error) {
+              console.error('[AdSkipper] 重新加载视频数据失败:', error);
+            }
+          }
+          
           this.currentAnalysisBvid = null;
-        }, 5000);
+        }, 1000); // 减少延迟时间，更快地重新加载数据
       }
     }
 
@@ -635,22 +647,35 @@ import './utils.js';
       }
     }
 
-    async loadSegments(bvid) {
-      if (!bvid || this.isLoadingSegments) return;
+    async loadSegments(bvid, options = {}) {
+      if (!bvid) return false;
+      const force = Boolean(options.force);
+      const bustCache = options.bustCache !== false;
+
+      if (this.isLoadingSegments) {
+        if (!force) return false;
+        // 等待当前请求结束，避免并发导致状态覆盖。
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        if (this.isLoadingSegments) return false;
+      }
+
       const previousAnalysisBvid = this.analysisBvid;
+      const previousSegments = Array.isArray(this.segments) ? [...this.segments] : [];
+      const previousAllSegments = Array.isArray(this.allSegments) ? [...this.allSegments] : [];
+      const previousSegmentIds = Array.isArray(this.currentSegmentIds) ? [...this.currentSegmentIds] : [];
       this.isLoadingSegments = true;
       if (sidebarState) {
         sidebarState.isLoading = true;
         sidebarState.loadError = null;
-        sidebarState.analysisProgress = null;
       }
 
       try {
         const storage = await new Promise(r => chrome.storage.local.get(['skip_types'], r));
         const skipTypes = storage.skip_types || ['hard_ad', 'soft_ad', 'product_placement'];
 
-        const url = API_BASE + "/segments?bvid=" + bvid + "&page=" + this.getPage();
-        const res = await this.safeFetch(url, {}, 'load segments');
+        const cacheBuster = bustCache ? `&_t=${Date.now()}` : '';
+        const url = API_BASE + "/segments?bvid=" + bvid + "&page=" + this.getPage() + cacheBuster;
+        const res = await this.safeFetch(url, { cache: 'no-store' }, 'load segments');
         if (!res.ok) {
           throw new Error('加载片段失败：' + res.status);
         }
@@ -707,26 +732,50 @@ import './utils.js';
         }
 
         this.addSegmentMarkers();
+        return true;
       } catch (error) {
         if (error.code !== 'NETWORK_UNAVAILABLE') {
           console.error('[AdSkipper] 加载片段失败:', error);
         }
-        this.segments = [];
-        this.allSegments = [];
-        this.currentSegmentIds = [];
+        // 保留旧内容，避免瞬时网络抖动导致侧边栏内容被清空。
+        this.segments = previousSegments;
+        this.allSegments = previousAllSegments;
+        this.currentSegmentIds = previousSegmentIds;
         if (sidebarState) {
           sidebarState.bvid = bvid;
           sidebarState.cid = this.player.currentCid || null;
-          sidebarState.segments = [];
-          sidebarState.aiSummary = '总结加载失败';
+          sidebarState.segments = previousSegments;
           sidebarState.loadError = error.message || '加载失败';
         }
+        return false;
       } finally {
         this.isLoadingSegments = false;
         if (sidebarState) {
           sidebarState.isLoading = false;
         }
       }
+    }
+
+    hasUsableAnalysisContent() {
+      if (Array.isArray(this.segments) && this.segments.length > 0) return true;
+      if (typeof this.aiSummary === 'string' && this.aiSummary.trim() && this.aiSummary !== '暂无总结') {
+        return true;
+      }
+      return false;
+    }
+
+    async refreshSegmentsAfterCompletion(bvid) {
+      const delays = [0, 1200, 2500];
+      for (let i = 0; i < delays.length; i += 1) {
+        if (delays[i] > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delays[i]));
+        }
+        await this.loadSegments(bvid, { force: true, bustCache: true });
+        if (this.hasUsableAnalysisContent()) {
+          return true;
+        }
+      }
+      return false;
     }
 
     normalizeSegment(segment, index) {
@@ -1869,11 +1918,84 @@ import './utils.js';
       }
     }
 
-    // WebSocket now handles real-time progress updates
-
-    async requestAnalysis(bvid, token) {
+    stopAnalysisProgressPolling() {
+      if (this.analysisProgressPollTimer) {
+        clearTimeout(this.analysisProgressPollTimer);
+        this.analysisProgressPollTimer = null;
+      }
+      this.analysisProgressBvid = null;
     }
 
+    startAnalysisProgressPolling(bvid, token) {
+      this.stopAnalysisProgressPolling();
+      this.analysisProgressBvid = bvid;
+
+      const pollIntervalMs = 2500;
+      const maxConsecutiveErrors = 5;
+      let consecutiveErrors = 0;
+      let pollInFlight = false;
+
+      return new Promise((resolve, reject) => {
+        const scheduleNext = () => {
+          if (this.analysisProgressBvid !== bvid) {
+            resolve(null);
+            return;
+          }
+          this.analysisProgressPollTimer = setTimeout(runPoll, pollIntervalMs);
+        };
+
+        const runPoll = async () => {
+          if (this.analysisProgressBvid !== bvid) {
+            resolve(null);
+            return;
+          }
+          if (pollInFlight) {
+            scheduleNext();
+            return;
+          }
+
+          pollInFlight = true;
+          try {
+            const payload = await this.requestAnalysisProgress(bvid, token);
+            const progress = payload?.data || payload;
+            this.setAnalysisProgress(progress);
+            consecutiveErrors = 0;
+
+            if (progress?.status === 'completed') {
+              this.stopAnalysisProgressPolling();
+              await this.refreshSegmentsAfterCompletion(bvid);
+              if (sidebarState) {
+                sidebarState.isLoading = false;
+                sidebarState.loadError = null;
+              }
+              resolve(progress);
+              return;
+            }
+
+            if (progress?.status === 'failed') {
+              this.stopAnalysisProgressPolling();
+              reject(new Error(progress?.message || '分析失败'));
+              return;
+            }
+          } catch (error) {
+            consecutiveErrors += 1;
+            if (consecutiveErrors >= maxConsecutiveErrors) {
+              this.stopAnalysisProgressPolling();
+              reject(new Error(`进度查询失败：${error.message || '未知错误'}`));
+              return;
+            }
+          } finally {
+            pollInFlight = false;
+          }
+
+          scheduleNext();
+        };
+
+        runPoll();
+      });
+    }
+
+    // WebSocket now handles real-time progress updates
 
     async requestAnalysis(bvid, token) {
       const url = VIDEO_ANALYSIS_BASE + "/video-analysis/analyze";
@@ -1900,10 +2022,8 @@ import './utils.js';
       }
 
       console.log('[AdSkipper] 请求体:', JSON.stringify({ bvid })); // 注意：不记录 cookies 内容
-      console.log('[AdSkipper] 注意：视频分析无超时限制');
+      console.log('[AdSkipper] 派发异步分析任务...');
 
-      // 直接使用原生 fetch，不设置超时
-      // 视频分析需要很长时间（下载、提取、AI分析），不能有超时限制
       const res = await fetch(url, {
         method: 'POST',
         headers: {
@@ -1928,6 +2048,11 @@ import './utils.js';
         const message = payload?.message || payload?.error || `分析失败（${res.status}）`;
         console.error('[AdSkipper] API错误:', message);
         throw new Error(message);
+      }
+
+      const accepted = res.status === 202 || payload?.status === 'accepted';
+      if (!accepted && !payload?.success) {
+        throw new Error('分析任务派发失败');
       }
       return payload;
     }
@@ -2104,14 +2229,14 @@ import './utils.js';
           return;
         }
 
-        // 连接 WebSocket 获取实时进度
-        await this.connectWebSocket(token);
-        this.currentAnalysisBvid = bvid;
+        // 改为纯轮询进度，避免 WebSocket 抖动导致状态错乱。
+        this.disconnectWebSocket();
+        this.currentAnalysisBvid = null;
 
         if (sidebarState) {
           sidebarState.isLoading = true;
           sidebarState.loadError = null;
-          sidebarState.analysisProgress = this.normalizeAnalysisProgress({
+          this.setAnalysisProgress({
             status: 'running',
             stage: 'prepare',
             percent: 1,
@@ -2119,23 +2244,20 @@ import './utils.js';
           });
         }
 
-        console.log('[AdSkipper] 开始请求分析API...');
-        // 不再需要轮询，直接发送分析请求
-        const result = await this.requestAnalysis(bvid, token);
-        console.log('[AdSkipper] API返回:', result);
+        console.log('[AdSkipper] 开始派发分析任务...');
+        const dispatchResult = await this.requestAnalysis(bvid, token);
+        console.log('[AdSkipper] 任务派发成功:', dispatchResult?.status || 'ok');
 
-        if (!result?.success || !result?.data) {
-          throw new Error('分析结果无效');
-        }
+        this.setAnalysisProgress({
+          status: 'running',
+          stage: 'prepare',
+          percent: 2,
+          message: dispatchResult?.alreadyRunning ? '任务已在进行中，等待结果' : '任务已创建，开始分析'
+        });
 
-        this.applyAnalysisData(bvid, result.data);
+        await this.startAnalysisProgressPolling(bvid, token);
+
         if (sidebarState) {
-          sidebarState.analysisProgress = this.normalizeAnalysisProgress({
-            status: 'completed',
-            stage: 'completed',
-            percent: 100,
-            message: '分析完成'
-          }, sidebarState.analysisProgress || {});
           sidebarState.isLoading = false;
         }
         console.log('[AdSkipper] ========== 视频分析完成 ==========');
@@ -2147,17 +2269,18 @@ import './utils.js';
           stack: error.stack
         });
         if (sidebarState) {
-          sidebarState.analysisProgress = this.normalizeAnalysisProgress({
+          this.setAnalysisProgress({
             status: 'failed',
             stage: 'failed',
             percent: 100,
             message: error.message || '分析失败'
-          }, sidebarState.analysisProgress || {});
+          });
           sidebarState.isLoading = false;
           sidebarState.loadError = '分析失败: ' + error.message;
         }
       } finally {
         this.stopAnalysisProgressPolling();
+        this.disconnectWebSocket();
       }
     }
 

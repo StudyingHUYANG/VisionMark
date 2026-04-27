@@ -12,6 +12,7 @@ const { getLatestEnabledUserModelConfig } = require('../services/modelConfigServ
 // 进度存储（保持全局）
 const analysisProgressStore = new Map();
 const vectorProgressStore = new Map();
+const analysisTaskStore = new Map();
 const PROGRESS_TTL_MS = 15 * 60 * 1000;
 
 function clampPercent(percent) {
@@ -22,6 +23,10 @@ function clampPercent(percent) {
 
 function getProgressKey(userId, bvid) {
   return `${userId || 'anonymous'}:${String(bvid || '').trim()}`;
+}
+
+function getTaskKey(userId, bvid) {
+  return getProgressKey(userId, bvid);
 }
 
 function pruneProgressStore() {
@@ -103,157 +108,177 @@ function createVideoAnalysisRouter(wss = null) {
 
   /**
    * POST /api/v1/video-analysis/analyze
-   * 分析单个视频
+   * 派发单个视频分析任务（异步）
    */
   router.post('/analyze', authenticateToken, async (req, res) => {
-  try {
-    const { bvid } = req.body;
+    try {
+      const { bvid } = req.body;
+      if (!bvid) {
+        return res.status(400).json({ error: '缺少bvid参数' });
+      }
 
-    if (!bvid) {
-      return res.status(400).json({ error: '缺少bvid参数' });
-    }
+      const userId = req.user.userId;
+      const taskKey = getTaskKey(userId, bvid);
+      const existingTask = analysisTaskStore.get(taskKey);
 
-    console.log(`[API] 开始分析视频: ${bvid}`);
-    const userId = req.user.userId;
-    const userConfig = getLatestEnabledUserModelConfig(userId);
-    const runtimeModelConfig = videoAnalyzer.getEffectiveModelConfig(userConfig);
-    setAnalysisProgress(userId, bvid, {
-      status: 'running',
-      stage: 'prepare',
-      percent: 1,
-      message: '准备分析视频',
-      startedAt: new Date().toISOString(),
-      finishedAt: null
-    });
-    const reportProgress = (progress) => {
+      if (existingTask) {
+        return res.status(202).json({
+          success: true,
+          status: 'accepted',
+          alreadyRunning: true,
+          data: getAnalysisProgress(userId, bvid)
+        });
+      }
+
+      console.log(`[API] 派发分析任务: ${bvid}`);
       setAnalysisProgress(userId, bvid, {
-        ...progress,
-        status: 'running'
+        status: 'running',
+        stage: 'prepare',
+        percent: 1,
+        message: '任务已派发，准备分析视频',
+        startedAt: new Date().toISOString(),
+        finishedAt: null
       });
-    };
 
-    // 构建B站视频URL
-    const videoUrl = `https://www.bilibili.com/video/${bvid}`;
+      const taskPromise = (async () => {
+        try {
+          const userConfig = getLatestEnabledUserModelConfig(userId);
+          const runtimeModelConfig = videoAnalyzer.getEffectiveModelConfig(userConfig);
+          const reportProgress = (progress) => {
+            setAnalysisProgress(userId, bvid, {
+              ...progress,
+              status: 'running'
+            });
+          };
 
-    // 获取前端发送的 cookies（如果有）
-    const bilibiliCookies = req.body.bilibili_cookies;
+          const videoUrl = `https://www.bilibili.com/video/${bvid}`;
+          const bilibiliCookies = req.body.bilibili_cookies;
+          const result = await videoAnalyzer.analyzeVideo(videoUrl, true, userConfig, {
+            onProgress: reportProgress,
+            onVectorProgress: (percent, status, message) => {
+              setVectorProgress(bvid, { percent, status, message });
+            },
+            bilibiliCookies
+          });
 
-    // 调用新的 VideoAnalyzer
-    const result = await videoAnalyzer.analyzeVideo(videoUrl, true, userConfig, {
-      onProgress: reportProgress,
-      onVectorProgress: (percent, status, message) => {
-        setVectorProgress(bvid, { percent, status, message });
-      },
-      bilibiliCookies: bilibiliCookies
-    });
-
-    // 转换数据格式以适配前端
-    const adaptedData = {
-      bvid: result.bvid,
-      title: result.analysis.title,
-      tags: result.analysis.tags,
-      summary: result.analysis.summary,
-      transcript: result.analysis.transcript,
-      // 将 segments 映射为 ad_segments
-      ad_segments: result.analysis.segments ? result.analysis.segments.map(seg => ({
-        start_time: parseTimeToSeconds(seg.start_time),
-        end_time: parseTimeToSeconds(seg.end_time),
-        description: seg.description,
-        highlight: seg.highlight,
-        ad_type: seg.highlight ? 'hard_ad' : 'soft_ad' // 根据 highlight 判断内容类型
-      })) : [],
-      knowledge_points: result.analysis.knowledge_points || [],
-      hot_words: result.analysis.hot_words || [],
-      analyzed_at: result.analyzed_at
-    };
-
-    let video = db.prepare("SELECT id FROM videos WHERE bvid = ?").get(result.bvid);
-    if (!video) {
-      const r = db.prepare("INSERT INTO videos (bvid, cid) VALUES (?, ?)").run(result.bvid, null);
-      video = { id: r.lastInsertRowid };
-    }
-
-    const normalizedContent = {
-      meta: {
-        bvid: result.bvid,
-        title: result.analysis.title || null
-    },
-      content_analysis: {
-        summary: result.analysis.summary || null,
-        transcript: result.analysis.transcript || null,
-        knowledge_points: result.analysis.knowledge_points || [],
-        hot_words: result.analysis.hot_words || [],
-        tags: result.analysis.tags || [],
-        analyzed_at: result.analyzed_at || null,
-        ad_segments: result.analysis.segments
-          ? result.analysis.segments.map(seg => ({
+          const adaptedData = {
+            bvid: result.bvid,
+            title: result.analysis.title,
+            tags: result.analysis.tags,
+            summary: result.analysis.summary,
+            transcript: result.analysis.transcript,
+            ad_segments: result.analysis.segments ? result.analysis.segments.map(seg => ({
               start_time: parseTimeToSeconds(seg.start_time),
               end_time: parseTimeToSeconds(seg.end_time),
-              ad_type: seg.highlight ? 'hard_ad' : 'soft_ad',
-              description: seg.description || null,
-              highlight: !!seg.highlight
-            }))
-          : []
-      }
-    };
+              description: seg.description,
+              highlight: seg.highlight,
+              ad_type: seg.highlight ? 'hard_ad' : 'soft_ad'
+            })) : [],
+            knowledge_points: result.analysis.knowledge_points || [],
+            hot_words: result.analysis.hot_words || [],
+            analyzed_at: result.analyzed_at
+          };
 
-    db.prepare(`
-      INSERT INTO annotations (
-        video_id,
-        source_type,
-        submitter_id,
-        submitter_name,
-        parent_id,
-        annotation_type,
-        title,
-        summary,
-        transcript,
-        score,
-        content_json,
-        model_name
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      video.id,
-      'AI',
-      null,
-      'AI',
-      null,
-      'full_analysis',
-      adaptedData.title || null,
-      adaptedData.summary || null,
-      adaptedData.transcript || null,
-      null,
-      JSON.stringify(normalizedContent),
-      runtimeModelConfig.visionModel
-    );
-    setAnalysisProgress(userId, bvid, {
-      status: 'completed',
-      stage: 'completed',
-      percent: 100,
-      message: '分析完成',
-      finishedAt: new Date().toISOString()
-    });
+          let video = db.prepare("SELECT id FROM videos WHERE bvid = ?").get(result.bvid);
+          if (!video) {
+            const r = db.prepare("INSERT INTO videos (bvid, cid) VALUES (?, ?)").run(result.bvid, null);
+            video = { id: r.lastInsertRowid };
+          }
 
-    res.json({
-      success: true,
-      data: adaptedData
-    });
-  } catch (error) {
-    console.error('[API] 视频分析失败:', error);
-    if (req.body?.bvid && req.user?.userId) {
-      setAnalysisProgress(req.user.userId, req.body.bvid, {
-        status: 'failed',
-        stage: 'failed',
-        percent: 100,
-        message: error.message || '视频分析失败',
-        finishedAt: new Date().toISOString()
+          const normalizedContent = {
+            meta: {
+              bvid: result.bvid,
+              title: result.analysis.title || null
+            },
+            content_analysis: {
+              summary: result.analysis.summary || null,
+              transcript: result.analysis.transcript || null,
+              knowledge_points: result.analysis.knowledge_points || [],
+              hot_words: result.analysis.hot_words || [],
+              tags: result.analysis.tags || [],
+              analyzed_at: result.analyzed_at || null,
+              ad_segments: result.analysis.segments
+                ? result.analysis.segments.map(seg => ({
+                    start_time: parseTimeToSeconds(seg.start_time),
+                    end_time: parseTimeToSeconds(seg.end_time),
+                    ad_type: seg.highlight ? 'hard_ad' : 'soft_ad',
+                    description: seg.description || null,
+                    highlight: !!seg.highlight
+                  }))
+                : []
+            }
+          };
+
+          db.prepare(`
+            INSERT INTO annotations (
+              video_id,
+              source_type,
+              submitter_id,
+              submitter_name,
+              parent_id,
+              annotation_type,
+              title,
+              summary,
+              transcript,
+              score,
+              content_json,
+              model_name
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            video.id,
+            'AI',
+            null,
+            'AI',
+            null,
+            'full_analysis',
+            adaptedData.title || null,
+            adaptedData.summary || null,
+            adaptedData.transcript || null,
+            null,
+            JSON.stringify(normalizedContent),
+            runtimeModelConfig.visionModel
+          );
+
+          setAnalysisProgress(userId, bvid, {
+            status: 'completed',
+            stage: 'completed',
+            percent: 100,
+            message: '分析完成',
+            detail: {
+              analyzedAt: adaptedData.analyzed_at,
+              segmentCount: adaptedData.ad_segments.length
+            },
+            finishedAt: new Date().toISOString()
+          });
+        } catch (error) {
+          console.error('[API] 视频分析失败:', error);
+          setAnalysisProgress(userId, bvid, {
+            status: 'failed',
+            stage: 'failed',
+            percent: 100,
+            message: error.message || '视频分析失败',
+            finishedAt: new Date().toISOString()
+          });
+        } finally {
+          analysisTaskStore.delete(taskKey);
+        }
+      })();
+
+      analysisTaskStore.set(taskKey, taskPromise);
+
+      res.status(202).json({
+        success: true,
+        status: 'accepted',
+        alreadyRunning: false,
+        data: getAnalysisProgress(userId, bvid)
+      });
+    } catch (error) {
+      console.error('[API] 派发分析任务失败:', error);
+      res.status(500).json({
+        error: '派发分析任务失败',
+        message: error.message
       });
     }
-    res.status(500).json({
-      error: '视频分析失败',
-      message: error.message
-    });
-  }
   });
 
   /**

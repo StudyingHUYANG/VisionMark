@@ -16,7 +16,8 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 const JWT_SECRET = config.JWT_SECRET;
 
-app.use(cors({ origin: '*', credentials: true }));
+// 因为 Nginx 层已经配置了严格的 CORS，所以这里停用自带 cors 模块，避免头部重复附加
+// app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
 app.use('/api/v1/model-config', modelConfigRouter);
 

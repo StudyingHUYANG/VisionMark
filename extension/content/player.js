@@ -147,3 +147,45 @@ class BilibiliPlayerController {
 }
 
 window.BilibiliPlayerController = BilibiliPlayerController;
+
+async function fetchAnalysisResults(videoId) {
+  const url = `${window.API_BASE}/video-analysis/${videoId}`;
+  const maxRetries = 3;
+  let retries = 0;
+
+  // 设置超时时间
+  const timeout = 10000; // 10秒超时
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+
+  while (retries < maxRetries) {
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': localStorage.getItem('user_token') // 如果需要认证
+        },
+        signal: controller.signal // 添加超时控制
+      });
+
+      clearTimeout(id); // 清除超时定时器
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      console.error(`Fetch failed, retrying... (${retries + 1}/${maxRetries})`, error);
+      retries++;
+      if (retries < maxRetries) {
+        await new Promise(resolve => setTimeout(resolve, 1000)); // 等待1秒后重试
+      }
+    }
+  }
+
+  clearTimeout(id); // 清除超时定时器
+  throw new Error('Failed to fetch analysis results after multiple attempts');
+}
