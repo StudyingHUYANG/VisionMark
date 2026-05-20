@@ -41,7 +41,12 @@ async requestAnalysis(bvid, token) {
       let payload = null;
       try {
         payload = await res.json();
-        console.log('[AdSkipper] 响应数据:', payload);
+        console.log('[AdSkipper] 响应摘要:', {
+          ok: res.ok,
+          status: res.status,
+          success: payload?.success === true,
+          hasData: Boolean(payload?.data)
+        });
       } catch (error) {
         console.error('[AdSkipper] 解析JSON失败:', error);
         payload = null;
