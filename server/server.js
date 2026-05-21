@@ -193,6 +193,10 @@ app.get('/api/v1/segments', (req, res) => {
   let hot_words = [];
   let visual_cuts = [];
   let visual_cut_stats = null;
+  let keyword_cuts = [];
+  let candidateCuts = [];
+  let segmentPipeline = null;
+  let final_segments = [];
 
   const aiAnnotation = allAnnotations.find(row => row.source_type === 'AI' && row.annotation_type === 'full_analysis');
   if (aiAnnotation) {
@@ -206,6 +210,10 @@ app.get('/api/v1/segments', (req, res) => {
       hot_words = content.content_analysis.hot_words || [];
       visual_cuts = content.content_analysis.visual_cuts || [];
       visual_cut_stats = content.content_analysis.visual_cut_stats || null;
+      keyword_cuts = content.content_analysis.keyword_cuts || [];
+      candidateCuts = content.content_analysis.candidateCuts || [];
+      segmentPipeline = content.content_analysis.segmentPipeline || null;
+      final_segments = content.content_analysis.segments || [];
     }
   }
 
@@ -235,7 +243,19 @@ app.get('/api/v1/segments', (req, res) => {
     })
     .sort((a, b) => a.start_time - b.start_time);
 
-    res.json({ segments, ai_title, ai_summary, knowledge_points, hot_words, visual_cuts, visual_cut_stats });
+    res.json({
+      segments,
+      ai_title,
+      ai_summary,
+      knowledge_points,
+      hot_words,
+      visual_cuts,
+      visual_cut_stats,
+      keyword_cuts,
+      candidateCuts,
+      segmentPipeline,
+      final_segments
+    });
   });
 
 app.post('/api/v1/segments', authenticateToken, (req, res) => {

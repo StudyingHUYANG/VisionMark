@@ -11,6 +11,8 @@ const EmbeddingService = require('./embeddingService');
 const vectorDb = require('./vectorDb');
 const BilibiliDownloader = require('./bilibiliDownloader');
 const { analyzeVisualCuts } = require('./visualCutDetector');
+const keywordCutService = require('./segment/keywordCuts');
+const { runSegmentPipeline } = require('./segmentPipeline');
 
 const execPromise = util.promisify(exec);
 
@@ -1286,6 +1288,19 @@ ${visualCutsText}
         this.reportProgress(onProgress, 'model', 42, '跳过音频，准备大模型分析');
       }
 
+      let keywordCuts = [];
+      if (transcript) {
+        try {
+          keywordCuts = keywordCutService.mergeNearbyDetections(
+            keywordCutService.detectKeywordCuts(transcript),
+            5
+          );
+          console.log(`[VideoAnalyzer] 关键词候选切点检测完成: ${keywordCuts.length} 个`);
+        } catch (error) {
+          console.warn('[VideoAnalyzer] 关键词切点检测失败，继续分析:', error.message);
+        }
+      }
+
       // 7. AI分析（基于关键帧、时长、视觉切点和音频转录），知识点和热词从分析结果中获取
       const analysisResult = await this.analyzeWithQwen(videoPath, framesDir, duration, transcript, userConfig, onProgress, {
         modelStartPercent: shouldAnalyzeAudio ? 60 : 42,
@@ -1295,12 +1310,44 @@ ${visualCutsText}
 
       // 8. 整合所有分析结果
       this.reportProgress(onProgress, 'finalize', 98, '正在整理分析结果');
+      let segmentPipeline = null;
+      try {
+        const frameTimes = fs.readdirSync(framesDir)
+          .filter(file => file.endsWith('.jpg'))
+          .map(file => {
+            const match = file.match(/frame_\d+_(\d+)\.jpg$/);
+            return match ? Number(match[1]) / 1000 : null;
+          })
+          .filter(time => Number.isFinite(time));
+        const modelConfig = this.getEffectiveModelConfig(userConfig);
+        segmentPipeline = await runSegmentPipeline({
+          videoId: bvid,
+          bvid,
+          duration,
+          frames: frameTimes,
+          transcript,
+          visualCuts,
+          audioCuts: [],
+          keywordCuts,
+          existingAnalysis: analysisResult,
+          modelConfig,
+          modelClient: this.createOpenAIClient(modelConfig)
+        });
+        console.log(`[VideoAnalyzer] 分段主流程完成: ${segmentPipeline.segments.length} 个最终片段`);
+      } catch (error) {
+        console.warn('[VideoAnalyzer] 分段主流程运行失败，保留原分析结果:', error.message);
+      }
+
       const finalResult = {
         ...analysisResult,
         // 添加音频转录文本（如果有）
         transcript: transcript,
+        keyword_cuts: keywordCuts,
         visual_cuts: visualCuts,
-        visual_cut_stats: visualCutStats
+        visual_cut_stats: visualCutStats,
+        candidateCuts: segmentPipeline?.candidateCuts || [],
+        segmentPipeline,
+        final_segments: segmentPipeline?.segments || []
       };
 
       // 9. 返回结果

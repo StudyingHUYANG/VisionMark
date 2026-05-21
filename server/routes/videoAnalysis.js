@@ -8,6 +8,7 @@ const VideoAnalyzer = require('../services/videoAnalyzer');
 const { authenticateToken } = require('../middlewares/auth.js');
 const db = require('../database/db');
 const { getLatestEnabledUserModelConfig } = require('../services/modelConfigService');
+const { getLatestDebugArtifact } = require('../services/segmentPipeline/debugArtifactWriter');
 
 // 进度存储（保持全局）
 const analysisProgressStore = new Map();
@@ -156,6 +157,10 @@ function createVideoAnalysisRouter(wss = null) {
       transcript: result.analysis.transcript,
       visual_cuts: result.analysis.visual_cuts || [],
       visual_cut_stats: result.analysis.visual_cut_stats || null,
+      keyword_cuts: result.analysis.keyword_cuts || [],
+      candidateCuts: result.analysis.candidateCuts || [],
+      segmentPipeline: result.analysis.segmentPipeline || null,
+      segments: result.analysis.final_segments || [],
       // 将 segments 映射为 ad_segments
       ad_segments: result.analysis.segments ? result.analysis.segments.map(seg => ({
         start_time: parseTimeToSeconds(seg.start_time),
@@ -188,6 +193,10 @@ function createVideoAnalysisRouter(wss = null) {
         tags: result.analysis.tags || [],
         visual_cuts: result.analysis.visual_cuts || [],
         visual_cut_stats: result.analysis.visual_cut_stats || null,
+        keyword_cuts: result.analysis.keyword_cuts || [],
+        candidateCuts: result.analysis.candidateCuts || [],
+        segmentPipeline: result.analysis.segmentPipeline || null,
+        segments: result.analysis.final_segments || [],
         analyzed_at: result.analyzed_at || null,
         ad_segments: result.analysis.segments
           ? result.analysis.segments.map(seg => ({
@@ -318,6 +327,10 @@ function createVideoAnalysisRouter(wss = null) {
           summary: result.analysis.summary,
           visual_cuts: result.analysis.visual_cuts || [],
           visual_cut_stats: result.analysis.visual_cut_stats || null,
+          keyword_cuts: result.analysis.keyword_cuts || [],
+          candidateCuts: result.analysis.candidateCuts || [],
+          segmentPipeline: result.analysis.segmentPipeline || null,
+          segments: result.analysis.final_segments || [],
           ad_segments: result.analysis.segments ? result.analysis.segments.map(seg => ({
             start_time: parseTimeToSeconds(seg.start_time),
             end_time: parseTimeToSeconds(seg.end_time),
@@ -357,6 +370,32 @@ function createVideoAnalysisRouter(wss = null) {
     success: true,
     data: getAnalysisProgress(req.user.userId, req.params.bvid)
   });
+  });
+
+  router.get('/segments/:videoId/debug', authenticateToken, (req, res) => {
+  try {
+    const artifact = getLatestDebugArtifact(req.params.videoId);
+    if (!artifact) {
+      return res.status(404).json({
+        success: false,
+        error: '未找到分段调试产物'
+      });
+    }
+    return res.json({
+      success: true,
+      data: {
+        path: artifact.path,
+        ...artifact.content
+      }
+    });
+  } catch (error) {
+    console.error('[API] 读取分段调试产物失败:', error);
+    return res.status(500).json({
+      success: false,
+      error: '读取分段调试产物失败',
+      message: error.message
+    });
+  }
   });
 
   /**
