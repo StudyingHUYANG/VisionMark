@@ -416,7 +416,9 @@ class VideoAnalyzer {
         const cacheMatchesOptions =
           Math.abs(Number(manifest.sample_fps) - sampleFps) < 0.0001 &&
           Number(manifest.scale_width) === scaleWidth &&
-          Number(manifest.max_frames || maxFrames) === maxFrames;
+          Number(manifest.max_frames || maxFrames) === maxFrames &&
+          path.resolve(String(manifest.source_video || '')) === path.resolve(videoPath) &&
+          Math.abs(Number(manifest.duration || 0) - safeDuration) < 0.5;
         const cachedFrames = Array.isArray(manifest.frames)
           ? manifest.frames
             .map(frame => ({
