@@ -1222,7 +1222,7 @@ ${visualCutsText}
       console.log(`[VideoAnalyzer] 开始分析视频: ${bvid}`);
       this.reportProgress(onProgress, 'prepare', 2, '准备分析视频');
 
-      // 2. 如果有 cookies，保存为临时文件
+      // 2. 如果有 cookies，保存为临时文件，仅在下载阶段使用
       if (bilibiliCookies) {
         try {
           const tempDir = path.join(this.downloadDir, 'temp');
@@ -1231,7 +1231,7 @@ ${visualCutsText}
           }
           tempCookiesPath = path.join(tempDir, `${bvid}_cookies.txt`);
           fs.writeFileSync(tempCookiesPath, bilibiliCookies, 'utf8');
-          console.log(`[VideoAnalyzer] 已保存临时 cookies 文件: ${tempCookiesPath}`);
+          console.log('[VideoAnalyzer] 已启用临时 cookies 进行下载');
         } catch (error) {
           console.warn('[VideoAnalyzer] 保存 cookies 文件失败:', error.message);
           tempCookiesPath = null;
@@ -1318,7 +1318,7 @@ ${visualCutsText}
       if (tempCookiesPath && fs.existsSync(tempCookiesPath)) {
         try {
           fs.unlinkSync(tempCookiesPath);
-          console.log(`[VideoAnalyzer] 已清理临时 cookies 文件: ${tempCookiesPath}`);
+          console.log('[VideoAnalyzer] 临时 cookies 已清理');
         } catch (error) {
           console.warn('[VideoAnalyzer] 清理临时 cookies 文件失败:', error.message);
         }

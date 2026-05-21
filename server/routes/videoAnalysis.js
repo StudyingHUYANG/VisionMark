@@ -249,13 +249,13 @@ function createVideoAnalysisRouter(wss = null) {
         status: 'failed',
         stage: 'failed',
         percent: 100,
-        message: error.message || '视频分析失败',
+        message: '视频分析失败，请稍后重试',
         finishedAt: new Date().toISOString()
       });
     }
     res.status(500).json({
       error: '视频分析失败',
-      message: error.message
+      message: '视频分析失败，请稍后重试'
     });
   }
   });
