@@ -187,29 +187,73 @@ const KEYWORD_RULES = [
 ];
 
 /**
- * 从转录文本中提取时间戳信息
- * 转录格式：[m:ss] 文本内容
- * @param {string} transcript - 转录文本
- * @returns {Array} [{text, time}, ...]
+ * 将常见时间格式统一成秒。
+ * 支持 number、"SS"、"MM:SS"、"HH:MM:SS"。
+ */
+function parseTimeToSeconds(value) {
+  if (Number.isFinite(Number(value))) return Number(value);
+  if (typeof value !== 'string') return null;
+
+  const parts = value.replace(/：/g, ':').split(':').map(part => Number(part.trim()));
+  if (parts.some(part => !Number.isFinite(part))) return null;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 1) return parts[0];
+  return null;
+}
+
+/**
+ * 从转录文本中提取时间戳信息。
+ * 支持：
+ * - 字符串: [m:ss] 文本内容
+ * - 数组: [{ start, end, text }] / [{ time, text }]
+ * @param {string|Array} transcript - 转录文本或结构化转录
+ * @returns {Array} [{text, time, start, end}, ...]
  */
 function parseTranscriptWithTimestamps(transcript) {
-  if (!transcript || typeof transcript !== 'string') {
-    return [];
+  if (Array.isArray(transcript)) {
+    return transcript
+      .map((item, index) => {
+        if (typeof item === 'string') {
+          const match = item.trim().match(/^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*(.+)$/);
+          const time = match ? parseTimeToSeconds(match[1]) : index;
+          return {
+            text: match ? match[2].trim() : item.trim(),
+            time,
+            start: time,
+            end: time
+          };
+        }
+
+        const start = parseTimeToSeconds(item?.start ?? item?.time ?? item?.timestamp ?? item?.begin_time);
+        const end = parseTimeToSeconds(item?.end ?? item?.end_time);
+        const time = Number.isFinite(start) ? start : 0;
+        return {
+          text: String(item?.text ?? item?.content ?? '').trim(),
+          time,
+          start: time,
+          end: Number.isFinite(end) ? end : time
+        };
+      })
+      .filter(segment => segment.text && Number.isFinite(segment.time))
+      .sort((a, b) => a.time - b.time);
   }
+
+  if (!transcript || typeof transcript !== 'string') return [];
 
   const segments = [];
   const lines = transcript.split('\n');
 
   for (const line of lines) {
-    // 匹配 [m:ss] 或 [mm:ss] 格式
-    const timeMatch = line.match(/^\[(\d{1,2}):(\d{2})\]\s+(.+)$/);
+    // 匹配 [m:ss]、[mm:ss] 或 [h:mm:ss] 格式
+    const timeMatch = line.match(/^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s+(.+)$/);
     if (timeMatch) {
-      const minutes = parseInt(timeMatch[1], 10);
-      const seconds = parseInt(timeMatch[2], 10);
-      const time = minutes * 60 + seconds;
-      const text = timeMatch[3];
+      const time = parseTimeToSeconds(timeMatch[1]);
+      const text = timeMatch[2];
 
-      segments.push({ text, time });
+      if (Number.isFinite(time) && text.trim()) {
+        segments.push({ text: text.trim(), time, start: time, end: time });
+      }
     }
   }
 
@@ -282,7 +326,10 @@ function detectKeywordCuts(transcript, customRules = null) {
 
         detections.push({
           time,
+          start: segment.start,
+          end: segment.end,
           score: Number(finalScore.toFixed(3)),
+          keyword: rule.keyword,
           reasons: [`keyword:${rule.keyword}`, `match:${(matchScore * 100).toFixed(0)}%`],
           type: rule.type,
           category: rule.category || "未分类",
@@ -359,5 +406,6 @@ module.exports = {
   mergeNearbyDetections,
   filterDetections,
   parseTranscriptWithTimestamps,
+  parseTimeToSeconds,
   calculateMatchScore
 };

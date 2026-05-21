@@ -381,12 +381,16 @@ function createVideoAnalysisRouter(wss = null) {
         error: '未找到分段调试产物'
       });
     }
+    const content = artifact.content || {};
     return res.json({
-      success: true,
-      data: {
-        path: artifact.path,
-        ...artifact.content
-      }
+      videoId: req.params.videoId,
+      latestArtifact: artifact.path,
+      evidence: content.evidence || null,
+      candidateCuts: content.candidateCuts || [],
+      finalSegments: content.finalSegments || [],
+      warnings: content.warnings || [],
+      mode: content.mode || 'fallback',
+      confidence: content.confidence || 'low'
     });
   } catch (error) {
     console.error('[API] 读取分段调试产物失败:', error);

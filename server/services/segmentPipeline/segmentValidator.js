@@ -3,6 +3,9 @@ function toNumber(value, fallback = 0) {
   return Number.isFinite(number) ? number : fallback;
 }
 
+const VALID_TYPES = new Set(['intro', 'content', 'ad', 'summary', 'transition', 'unknown']);
+const VALID_CONFIDENCE = new Set(['high', 'medium', 'low']);
+
 function markAdopted(candidateCuts, segments) {
   return candidateCuts.map(cut => {
     const cutTime = toNumber(cut.time, -1);
@@ -22,8 +25,9 @@ function validateSegments({ duration = 0, candidateCuts = [], segments = [], fal
       start: Math.max(0, Math.min(validDuration, toNumber(segment.start))),
       end: Math.max(0, Math.min(validDuration, toNumber(segment.end))),
       title: String(segment.title || `Segment ${index + 1}`).trim() || `Segment ${index + 1}`,
-      type: segment.type || 'unknown',
-      confidence: segment.confidence || 'low',
+      type: VALID_TYPES.has(segment.type) ? segment.type : 'unknown',
+      confidence: VALID_CONFIDENCE.has(segment.confidence) ? segment.confidence : 'low',
+      summary: String(segment.summary || '').trim(),
       evidence: segment.evidence || { candidateCutTimes: [], reasons: [] }
     }))
     .filter(segment => {

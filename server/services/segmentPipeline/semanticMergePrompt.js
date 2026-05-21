@@ -4,9 +4,16 @@ function safeSliceText(text, maxLength = 6000) {
 }
 
 function buildSemanticMergePrompt(input = {}) {
+  const transcriptContext = Array.isArray(input.transcript)
+    ? input.transcript
+      .slice(0, 160)
+      .map(row => `[${row.start}] ${row.text}`)
+      .join('\n')
+    : input.transcript || input.transcriptText || '';
   const payload = {
     duration: input.duration || 0,
     mode: input.mode || 'fallback',
+    confidence: input.confidence || 'low',
     candidateCuts: (input.candidateCuts || []).map(cut => ({
       time: cut.time,
       score: cut.score,
@@ -15,7 +22,7 @@ function buildSemanticMergePrompt(input = {}) {
       nearbyEvidence: cut.nearbyEvidence || {}
     })),
     frameTimes: (input.frameTimes || []).slice(0, 120),
-    transcriptContext: safeSliceText(input.transcript || '')
+    transcriptContext: safeSliceText(transcriptContext)
   };
 
   return `你是视频语义分段助手。请基于候选切点把视频合并为最终 segments。
@@ -51,22 +58,26 @@ ${JSON.stringify(payload, null, 2)}
 }`;
 }
 
-function extractJsonObject(text) {
+function extractJsonFromModelOutput(text) {
   if (!text || typeof text !== 'string') {
-    throw new Error('empty_ai_output');
+    return null;
   }
 
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  const source = fenced ? fenced[1] : text;
-  const first = source.indexOf('{');
-  const last = source.lastIndexOf('}');
-  if (first < 0 || last <= first) {
-    throw new Error('json_object_not_found');
+  try {
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    const source = fenced ? fenced[1] : text;
+    const first = source.indexOf('{');
+    const last = source.lastIndexOf('}');
+    if (first < 0 || last <= first) {
+      return null;
+    }
+    return JSON.parse(source.slice(first, last + 1));
+  } catch (error) {
+    return null;
   }
-  return JSON.parse(source.slice(first, last + 1));
 }
 
 module.exports = {
   buildSemanticMergePrompt,
-  extractJsonObject
+  extractJsonFromModelOutput
 };

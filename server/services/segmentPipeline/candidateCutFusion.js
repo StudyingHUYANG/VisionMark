@@ -1,5 +1,3 @@
-const { parseTranscriptWithTimestamps } = require('../segment/keywordCuts');
-
 const SOURCE_WEIGHTS = {
   keyword: 0.9,
   visual: 0.75,
@@ -18,11 +16,35 @@ function unique(values) {
   return [...new Set(values.filter(Boolean))];
 }
 
+function transcriptRows(transcript) {
+  if (Array.isArray(transcript)) {
+    return transcript
+      .map(row => ({
+        time: Number(row.start ?? row.time ?? row.timestamp),
+        text: String(row.text || '').trim()
+      }))
+      .filter(row => Number.isFinite(row.time) && row.text)
+      .sort((a, b) => a.time - b.time);
+  }
+
+  if (typeof transcript !== 'string') return [];
+  return transcript
+    .split(/\r?\n/)
+    .map(line => {
+      const match = line.trim().match(/^\[(\d{1,2}):(\d{2})\]\s+(.+)$/);
+      if (!match) return null;
+      return {
+        time: Number(match[1]) * 60 + Number(match[2]),
+        text: match[3].trim()
+      };
+    })
+    .filter(Boolean);
+}
+
 function normalizeCut(cut, source) {
   const time = Number(cut?.time ?? cut?.timestamp ?? cut?.start_time ?? cut?.start);
   if (!Number.isFinite(time)) return null;
-  const baseScore = clamp01(cut?.score ?? cut?.confidence ?? SOURCE_WEIGHTS[source]);
-  const score = clamp01(baseScore * (SOURCE_WEIGHTS[source] || 0.5));
+  const score = clamp01(cut?.score ?? cut?.confidence ?? SOURCE_WEIGHTS[source]);
   const reasons = Array.isArray(cut?.reasons) ? cut.reasons : [];
   const reasonFallback = source === 'keyword' && cut?.keyword ? `keyword:${cut.keyword}` : `${source}_change`;
 
@@ -36,7 +58,7 @@ function normalizeCut(cut, source) {
 }
 
 function transcriptSemanticCuts(transcript) {
-  const rows = parseTranscriptWithTimestamps(transcript);
+  const rows = transcriptRows(transcript);
   if (rows.length < 3) return [];
 
   const transitionHints = ['接下来', '然后', '但是', '所以', '总结', '最后', '回到', '换句话说', '另一方面'];
@@ -51,7 +73,7 @@ function transcriptSemanticCuts(transcript) {
       cuts.push({
         time: current.time,
         score: hasHint ? 0.72 : 0.5,
-        reasons: [hasHint ? 'text_transition_hint' : 'text_window_change'],
+        reasons: [hasHint ? 'text_topic_shift' : 'text_topic_shift'],
         sources: ['text'],
         raw: current
       });
@@ -61,7 +83,7 @@ function transcriptSemanticCuts(transcript) {
 }
 
 function addNearbyEvidence(cut, transcript, frameTimes) {
-  const rows = parseTranscriptWithTimestamps(transcript);
+  const rows = transcriptRows(transcript);
   const before = [...rows].reverse().find(row => row.time < cut.time);
   const after = rows.find(row => row.time >= cut.time);
   return {
@@ -120,12 +142,17 @@ function enforceMinSpacing(cuts, minSpacing = 10) {
 function insertTimePaddingCuts(cuts, duration) {
   if (!Number.isFinite(duration) || duration <= 0) return cuts;
   const result = cuts.slice().sort((a, b) => a.time - b.time);
-  const boundaries = [0, ...result.map(c => c.time), duration];
-  for (let i = 0; i < boundaries.length - 1; i += 1) {
-    const start = boundaries[i];
-    const end = boundaries[i + 1];
-    if (end - start > 90) {
-      const time = Number((start + Math.min(90, (end - start) / 2)).toFixed(2));
+  let changed = true;
+
+  while (changed) {
+    changed = false;
+    const boundaries = [0, ...result.map(c => c.time).sort((a, b) => a - b), duration];
+    for (let i = 0; i < boundaries.length - 1; i += 1) {
+      const start = boundaries[i];
+      const end = boundaries[i + 1];
+      if (end - start <= 90) continue;
+
+      const time = Number(((start + end) / 2).toFixed(2));
       result.push({
         time,
         score: SOURCE_WEIGHTS.time_padding,
@@ -133,6 +160,8 @@ function insertTimePaddingCuts(cuts, duration) {
         sources: ['time_padding'],
         raw: null
       });
+      changed = true;
+      break;
     }
   }
   return result.sort((a, b) => a.time - b.time);
@@ -145,7 +174,7 @@ function generateCandidateCuts(input = {}) {
     ...(Array.isArray(input.visualCuts) ? input.visualCuts.map(cut => normalizeCut(cut, 'visual')) : []),
     ...(Array.isArray(input.audioCuts) ? input.audioCuts.map(cut => normalizeCut(cut, 'audio')) : []),
     ...(Array.isArray(input.keywordCuts) ? input.keywordCuts.map(cut => normalizeCut(cut, 'keyword')) : []),
-    ...transcriptSemanticCuts(input.transcript || '')
+    ...transcriptSemanticCuts(input.transcript || input.transcriptText || '')
   ].filter(Boolean);
 
   let cuts = enforceBoundaries(rawCuts, duration);
@@ -160,7 +189,7 @@ function generateCandidateCuts(input = {}) {
       time: Number(cut.time.toFixed(2)),
       score: Number(clamp01(cut.score).toFixed(3)),
       adopted: false
-    }, input.transcript || '', frameTimes))
+    }, input.transcript || input.transcriptText || '', frameTimes))
     .sort((a, b) => a.time - b.time);
 }
 

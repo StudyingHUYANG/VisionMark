@@ -1,4 +1,4 @@
-const { buildSemanticMergePrompt, extractJsonObject } = require('./semanticMergePrompt');
+const { buildSemanticMergePrompt, extractJsonFromModelOutput } = require('./semanticMergePrompt');
 
 const VALID_TYPES = new Set(['intro', 'content', 'ad', 'summary', 'transition', 'unknown']);
 const VALID_CONFIDENCE = new Set(['high', 'medium', 'low']);
@@ -32,6 +32,17 @@ function normalizeSegment(segment, index, duration) {
   };
 }
 
+function transcriptSnippet(transcript, start, end) {
+  const rows = Array.isArray(transcript)
+    ? transcript
+    : [];
+  const text = rows
+    .filter(row => Number(row.start) >= start && Number(row.start) < end)
+    .map(row => row.text)
+    .join(' ');
+  return text.length > 120 ? `${text.slice(0, 120)}...` : text;
+}
+
 function fallbackSegmentMerge(candidateCuts = [], duration = 0, transcript = '') {
   const validDuration = Math.max(0, Number(duration) || 0);
   const cutTimes = candidateCuts
@@ -60,8 +71,8 @@ function fallbackSegmentMerge(candidateCuts = [], duration = 0, transcript = '')
       start: Number(start.toFixed(2)),
       end: Number(end.toFixed(2)),
       title: `Segment ${segments.length + 1}`,
-      type: 'unknown',
-      summary: '',
+      type: 'content',
+      summary: transcriptSnippet(transcript, start, end),
       confidence: fallbackConfidence,
       evidence: {
         candidateCutTimes: boundaryCut ? [boundaryCut.time] : [],
@@ -100,7 +111,10 @@ async function mergeSegmentsWithAI(input = {}, modelClient = null) {
     });
     const content = response?.choices?.[0]?.message?.content || '';
     debug.aiRawOutput = content;
-    const parsed = extractJsonObject(content);
+    const parsed = extractJsonFromModelOutput(content);
+    if (!parsed) {
+      throw new Error('invalid_ai_json');
+    }
     const segments = (Array.isArray(parsed?.segments) ? parsed.segments : [])
       .map((segment, index) => normalizeSegment(segment, index, duration))
       .filter(Boolean);

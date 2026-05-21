@@ -4,14 +4,14 @@ const { mergeSegmentsWithAI } = require('./semanticSegmentMerger');
 const { validateSegments } = require('./segmentValidator');
 const { writeDebugArtifacts } = require('./debugArtifactWriter');
 
-async function runSegmentPipeline(input = {}) {
+async function runSegmentPipeline(input = {}, options = {}) {
   const evidence = buildEvidence(input);
-  const candidateCuts = generateCandidateCuts(evidence);
+  const candidateCuts = generateCandidateCuts(evidence, options);
   const mergeResult = await mergeSegmentsWithAI({
     ...evidence,
     candidateCuts,
     modelConfig: input.modelConfig
-  }, input.modelClient);
+  }, options.modelClient || input.modelClient);
 
   const validated = validateSegments({
     duration: evidence.duration,
@@ -32,7 +32,7 @@ async function runSegmentPipeline(input = {}) {
     confidence
   });
 
-  const warnings = [...validated.warnings, ...debugWrite.warnings];
+  const warnings = [...(evidence.warnings || []), ...validated.warnings, ...debugWrite.warnings];
 
   return {
     mode: evidence.mode,
