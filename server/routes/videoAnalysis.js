@@ -154,6 +154,8 @@ function createVideoAnalysisRouter(wss = null) {
       tags: result.analysis.tags,
       summary: result.analysis.summary,
       transcript: result.analysis.transcript,
+      visual_cuts: result.analysis.visual_cuts || [],
+      visual_cut_stats: result.analysis.visual_cut_stats || null,
       // 将 segments 映射为 ad_segments
       ad_segments: result.analysis.segments ? result.analysis.segments.map(seg => ({
         start_time: parseTimeToSeconds(seg.start_time),
@@ -184,6 +186,8 @@ function createVideoAnalysisRouter(wss = null) {
         knowledge_points: result.analysis.knowledge_points || [],
         hot_words: result.analysis.hot_words || [],
         tags: result.analysis.tags || [],
+        visual_cuts: result.analysis.visual_cuts || [],
+        visual_cut_stats: result.analysis.visual_cut_stats || null,
         analyzed_at: result.analyzed_at || null,
         ad_segments: result.analysis.segments
           ? result.analysis.segments.map(seg => ({
@@ -312,6 +316,8 @@ function createVideoAnalysisRouter(wss = null) {
           title: result.analysis.title,
           tags: result.analysis.tags,
           summary: result.analysis.summary,
+          visual_cuts: result.analysis.visual_cuts || [],
+          visual_cut_stats: result.analysis.visual_cut_stats || null,
           ad_segments: result.analysis.segments ? result.analysis.segments.map(seg => ({
             start_time: parseTimeToSeconds(seg.start_time),
             end_time: parseTimeToSeconds(seg.end_time),

@@ -191,6 +191,8 @@ app.get('/api/v1/segments', (req, res) => {
   let ai_summary = '';
   let knowledge_points = [];
   let hot_words = [];
+  let visual_cuts = [];
+  let visual_cut_stats = null;
 
   const aiAnnotation = allAnnotations.find(row => row.source_type === 'AI' && row.annotation_type === 'full_analysis');
   if (aiAnnotation) {
@@ -202,6 +204,8 @@ app.get('/api/v1/segments', (req, res) => {
       ai_summary = content.content_analysis.summary || aiAnnotation.summary || '';
       knowledge_points = content.content_analysis.knowledge_points || [];
       hot_words = content.content_analysis.hot_words || [];
+      visual_cuts = content.content_analysis.visual_cuts || [];
+      visual_cut_stats = content.content_analysis.visual_cut_stats || null;
     }
   }
 
@@ -231,7 +235,7 @@ app.get('/api/v1/segments', (req, res) => {
     })
     .sort((a, b) => a.start_time - b.start_time);
 
-    res.json({ segments, ai_title, ai_summary, knowledge_points, hot_words });
+    res.json({ segments, ai_title, ai_summary, knowledge_points, hot_words, visual_cuts, visual_cut_stats });
   });
 
 app.post('/api/v1/segments', authenticateToken, (req, res) => {
@@ -469,6 +473,8 @@ app.get('/api/v1/video-view', authenticateToken, (req, res) => {
           summary: null,
           transcript: null,
           ad_segments: [],
+          visual_cuts: [],
+          visual_cut_stats: null,
           knowledge_points: [],
           hot_words: [],
           analyzed_at: null
@@ -519,6 +525,8 @@ app.get('/api/v1/video-view', authenticateToken, (req, res) => {
       summary: aiAnalysis.summary || latestAI?.summary || null,
       transcript: aiAnalysis.transcript || latestAI?.transcript || null,
       ad_segments: allAdSegments,
+      visual_cuts: aiAnalysis.visual_cuts || [],
+      visual_cut_stats: aiAnalysis.visual_cut_stats || null,
       knowledge_points: aiAnalysis.knowledge_points || [],
       hot_words: aiAnalysis.hot_words || [],
       analyzed_at: aiAnalysis.analyzed_at || null
