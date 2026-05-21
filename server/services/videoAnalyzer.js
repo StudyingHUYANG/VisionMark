@@ -10,6 +10,7 @@ const { ossClient, hasOssConfig } = require('../utils/oss');
 const EmbeddingService = require('./embeddingService');
 const vectorDb = require('./vectorDb');
 const BilibiliDownloader = require('./bilibiliDownloader');
+const { analyzeVisualCuts } = require('./visualCutDetector');
 
 const execPromise = util.promisify(exec);
 
@@ -385,6 +386,104 @@ class VideoAnalyzer {
       console.error('[VideoAnalyzer] 关键帧提取失败:', error);
       throw new Error(`关键帧提取失败: ${error.message}`);
     }
+  }
+
+  /**
+   * 抽取用于视觉切点检测的低分辨率连续采样帧。
+   * 这组帧和发给大模型的关键帧分开，避免 30 帧上限影响切点召回。
+   */
+  async extractVisualProbeFrames(videoPath, bvid, duration, onProgress = null, options = {}) {
+    const framesDir = path.join(this.downloadDir, `${bvid}_visual_frames`);
+    const manifestPath = path.join(framesDir, 'manifest.json');
+    const sampleFps = Number.isFinite(Number(options.sampleFps)) && Number(options.sampleFps) > 0
+      ? Number(options.sampleFps)
+      : 1;
+    const maxFrames = Number.isFinite(Number(options.maxFrames)) && Number(options.maxFrames) > 1
+      ? Math.floor(Number(options.maxFrames))
+      : 900;
+    const scaleWidth = Number.isFinite(Number(options.scaleWidth)) && Number(options.scaleWidth) > 0
+      ? Math.floor(Number(options.scaleWidth))
+      : 320;
+    const safeDuration = Number.isFinite(Number(duration)) && Number(duration) > 0
+      ? Number(duration)
+      : 300;
+    const targetFrames = Math.max(2, Math.min(maxFrames, Math.ceil(safeDuration * sampleFps)));
+    const effectiveFps = targetFrames / safeDuration;
+
+    if (fs.existsSync(manifestPath)) {
+      try {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        const cacheMatchesOptions =
+          Math.abs(Number(manifest.sample_fps) - sampleFps) < 0.0001 &&
+          Number(manifest.scale_width) === scaleWidth &&
+          Number(manifest.max_frames || maxFrames) === maxFrames &&
+          path.resolve(String(manifest.source_video || '')) === path.resolve(videoPath) &&
+          Math.abs(Number(manifest.duration || 0) - safeDuration) < 0.5;
+        const cachedFrames = Array.isArray(manifest.frames)
+          ? manifest.frames
+            .map(frame => ({
+              framePath: path.join(framesDir, frame.file),
+              time: Number(frame.time)
+            }))
+            .filter(frame => fs.existsSync(frame.framePath) && Number.isFinite(frame.time))
+          : [];
+
+        if (cacheMatchesOptions && cachedFrames.length >= 2) {
+          console.log(`[VideoAnalyzer] 视觉检测帧已缓存: ${cachedFrames.length} 张`);
+          this.reportProgress(onProgress, 'visual', 41, '视觉检测帧已缓存');
+          return cachedFrames;
+        }
+      } catch (error) {
+        console.warn('[VideoAnalyzer] 读取视觉帧缓存失败，将重新抽帧:', error.message);
+      }
+    }
+
+    if (!fs.existsSync(framesDir)) {
+      fs.mkdirSync(framesDir, { recursive: true });
+    }
+
+    for (const file of fs.readdirSync(framesDir)) {
+      if (/\.(jpe?g|png)$/i.test(file)) {
+        fs.unlinkSync(path.join(framesDir, file));
+      }
+    }
+
+    console.log(`[VideoAnalyzer] 抽取视觉检测帧: target=${targetFrames}, fps=${effectiveFps.toFixed(4)}`);
+    this.reportProgress(onProgress, 'visual', 41, '正在抽取视觉检测帧');
+
+    const outputPattern = path.join(framesDir, 'visual_%06d.jpg');
+    const command = `"${ffmpegPath}" -i "${videoPath}" -vf "fps=${effectiveFps.toFixed(4)},scale=${scaleWidth}:-1" -q:v 5 "${outputPattern}" -y`;
+    await execPromise(command, { shell: true });
+
+    const files = fs.readdirSync(framesDir)
+      .filter(file => /^visual_\d+\.jpg$/i.test(file))
+      .sort();
+
+    const frames = files.map((file, index) => ({
+      framePath: path.join(framesDir, file),
+      time: Number((index / effectiveFps).toFixed(3))
+    }));
+
+    fs.writeFileSync(
+      manifestPath,
+      JSON.stringify({
+        generated_at: new Date().toISOString(),
+        source_video: videoPath,
+        duration: safeDuration,
+        sample_fps: sampleFps,
+        max_frames: maxFrames,
+        effective_fps: effectiveFps,
+        scale_width: scaleWidth,
+        frames: frames.map(frame => ({
+          file: path.basename(frame.framePath),
+          time: frame.time
+        }))
+      }, null, 2),
+      'utf8'
+    );
+
+    console.log(`[VideoAnalyzer] 视觉检测帧抽取完成: ${frames.length} 张`);
+    return frames;
   }
 
   /**
@@ -822,6 +921,19 @@ ${transcript}
       .slice(0, 10)
       .map(t => formatTime(t))
       .join(', ');
+    const visualCuts = Array.isArray(progressOptions.visualCuts)
+      ? progressOptions.visualCuts
+      : [];
+    const visualCutsText = visualCuts.length > 0
+      ? visualCuts
+        .slice(0, 20)
+        .map(cut => {
+          const reasons = Array.isArray(cut.reasons) ? cut.reasons.join('/') : 'visual_change';
+          const score = Number.isFinite(Number(cut.score)) ? Number(cut.score).toFixed(2) : '0.00';
+          return `- ${formatTime(Number(cut.time) || 0)} score=${score} method=${cut.method || 'visual'} reasons=${reasons}`;
+        })
+        .join('\n')
+      : '无高置信视觉候选切点';
 
     // 构建提示词 - 结合音视频进行综合分析
     const promptText = `请作为一个资深B站用户和百科全书，对这段视频内容进行深度分析。
@@ -833,6 +945,9 @@ ${transcript || '无语音内容'}
 
 关键帧分析（仅用于分段和视觉理解）：
 我已上传 ${frames.length} 张关键帧截图，按时间顺序排列。它们对应的视频时间点会根据场景/画面内容变化（不固定长度）。示例时间点（仅供参考）：${frameTimesText}。
+
+视觉候选切点（由 SSIM / histogram diff / pHash / 峰值检测生成，仅作为候选边界，不是最终结论）：
+${visualCutsText}
 
 请输出JSON格式报告：
 {
@@ -870,7 +985,8 @@ ${transcript || '无语音内容'}
 4. 只提取那些在转录文本中能明确找到时间戳的知识点和热词
 5. 分段的start_time和end_time由关键帧画面分析决定
 6. 知识点要硬核且有趣，适合B站用户口味
-7. 只有真正有价值的内容才提取，不要凑数`;
+7. 只有真正有价值的内容才提取，不要凑数
+8. 视觉候选切点可作为片段边界参考，但必须结合语义和转录内容判断，不要机械照搬`;
 
     // 构建多模态消息
     const content = [
@@ -933,6 +1049,8 @@ ${transcript || '无语音内容'}
               segments: parsed.segments || [],
               knowledge_points: parsed.knowledge_points || [],
               hot_words: parsed.hot_words || [],
+              visual_cuts: visualCuts,
+              visual_cut_stats: progressOptions.visualCutStats || null,
               raw_response: aiResponse // 包含原始响应以便前端调试
             };
 
@@ -985,6 +1103,8 @@ ${transcript || '无语音内容'}
             segments: [],
             knowledge_points: [],
             hot_words: [],
+            visual_cuts: visualCuts,
+            visual_cut_stats: progressOptions.visualCutStats || null,
             raw_response: aiResponse,
             parse_error: '无法提取JSON格式的分析结果'
           };
@@ -997,6 +1117,8 @@ ${transcript || '无语音内容'}
             segments: [],
             knowledge_points: [],
             hot_words: [],
+            visual_cuts: visualCuts,
+            visual_cut_stats: progressOptions.visualCutStats || null,
             raw_response: aiResponse,
             parse_error: parseError.message
           };
@@ -1127,7 +1249,28 @@ ${transcript || '无语音内容'}
         console.error('[VideoAnalyzer] 后台提取向量失败:', err);
       });
 
-      // 5. 提取音频并进行语音识别（可选）
+      // 5. 视觉候选切点检测（确定性信号，供分段参考）
+      let visualCuts = [];
+      let visualCutStats = null;
+      try {
+        const visualFrames = await this.extractVisualProbeFrames(
+          videoPath,
+          bvid,
+          duration,
+          onProgress,
+          options?.visualProbe
+        );
+        const visualResult = await analyzeVisualCuts(visualFrames, options?.visualCuts);
+        visualCuts = visualResult.visualCuts || [];
+        visualCutStats = visualResult.stats || null;
+        console.log(`[VideoAnalyzer] 视觉候选切点检测完成: ${visualCuts.length} 个`);
+        this.reportProgress(onProgress, 'visual', 42, `检测到 ${visualCuts.length} 个视觉候选切点`);
+      } catch (error) {
+        console.warn('[VideoAnalyzer] 视觉候选切点检测失败，继续后续分析:', error.message);
+        this.reportProgress(onProgress, 'visual', 42, '视觉切点检测失败，继续分析');
+      }
+
+      // 6. 提取音频并进行语音识别（可选）
       let transcript = null;
       const shouldAnalyzeAudio = Boolean(useAudio && hasOssConfig);
 
@@ -1143,20 +1286,24 @@ ${transcript || '无语音内容'}
         this.reportProgress(onProgress, 'model', 42, '跳过音频，准备大模型分析');
       }
 
-      // 6. AI分析（基于关键帧、时长和音频转录），知识点和热词从分析结果中获取
+      // 7. AI分析（基于关键帧、时长、视觉切点和音频转录），知识点和热词从分析结果中获取
       const analysisResult = await this.analyzeWithQwen(videoPath, framesDir, duration, transcript, userConfig, onProgress, {
-        modelStartPercent: shouldAnalyzeAudio ? 60 : 42
+        modelStartPercent: shouldAnalyzeAudio ? 60 : 42,
+        visualCuts,
+        visualCutStats
       });
 
-      // 7. 整合所有分析结果
+      // 8. 整合所有分析结果
       this.reportProgress(onProgress, 'finalize', 98, '正在整理分析结果');
       const finalResult = {
         ...analysisResult,
         // 添加音频转录文本（如果有）
-        transcript: transcript
+        transcript: transcript,
+        visual_cuts: visualCuts,
+        visual_cut_stats: visualCutStats
       };
 
-      // 8. 返回结果
+      // 9. 返回结果
       return {
         bvid,
         video_path: videoPath,
