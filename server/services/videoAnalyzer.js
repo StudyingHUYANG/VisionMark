@@ -1,7 +1,7 @@
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
-const { exec, spawn } = require('child_process');
+const { exec, spawn, spawnSync } = require('child_process');
 const util = require('util');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const OpenAI = require('openai');
@@ -10,7 +10,9 @@ const { ossClient, hasOssConfig } = require('../utils/oss');
 const EmbeddingService = require('./embeddingService');
 const vectorDb = require('./vectorDb');
 const BilibiliDownloader = require('./bilibiliDownloader');
-const { analyzeVisualCuts } = require('./visualCutDetector');
+const { analyzeVisualCuts, analyzeSceneCutsWithFfmpeg } = require('./visualCutDetector');
+const keywordCutService = require('./segment/keywordCuts');
+const { runSegmentPipeline } = require('./segmentPipeline');
 
 const execPromise = util.promisify(exec);
 
@@ -25,6 +27,47 @@ function clampPercent(percent) {
   const numericPercent = Number(percent);
   if (!Number.isFinite(numericPercent)) return null;
   return Math.max(0, Math.min(100, Math.round(numericPercent)));
+}
+
+function resolveFfprobePath() {
+  const siblingFfprobePath = ffmpegPath.replace(/ffmpeg$/, 'ffprobe');
+  if (fs.existsSync(siblingFfprobePath)) return siblingFfprobePath;
+
+  const probe = spawnSync('ffprobe', ['-version'], { encoding: 'utf8' });
+  if (!probe.error && probe.status === 0) return 'ffprobe';
+
+  return null;
+}
+
+function parsePtsTimes(text) {
+  return [...String(text || '').matchAll(/pts_time:([0-9]+(?:\.[0-9]+)?)/g)]
+    .map(match => Number(match[1]))
+    .filter(time => Number.isFinite(time) && time >= 0)
+    .filter((time, index, list) => index === 0 || Math.abs(time - list[index - 1]) > 0.001);
+}
+
+function buildFallbackAnalysisResult(reason, transcript = null, visualCuts = [], visualCutStats = null) {
+  const transcriptPreview = typeof transcript === 'string'
+    ? transcript
+      .split(/\r?\n/)
+      .map(line => line.replace(/^\[[^\]]+\]\s*/, '').trim())
+      .filter(Boolean)
+      .slice(0, 8)
+      .join(' ')
+    : '';
+
+  return {
+    title: 'AI分析暂不可用',
+    tags: [],
+    summary: transcriptPreview || '大模型分析暂不可用，已保留基础视频证据并进入降级分段流程。',
+    segments: [],
+    knowledge_points: [],
+    hot_words: [],
+    visual_cuts: visualCuts,
+    visual_cut_stats: visualCutStats,
+    raw_response: null,
+    fallback_reason: reason
+  };
 }
 
 class VideoAnalyzer {
@@ -312,14 +355,25 @@ class VideoAnalyzer {
    */
   async extractKeyframeTimestamps(videoPath) {
     try {
-      const command = `"${ffmpegPath.replace(/ffmpeg$/, 'ffprobe')}" -v error -select_streams v -skip_frame nokey -show_entries frame=pkt_pts_time -of csv=p=0 "${videoPath}"`;
-      const { stdout } = await execPromise(command, { shell: true });
-      const timestamps = stdout
-        .split(/\r?\n/)
-        .map(line => line.trim())
-        .filter(line => line)
-        .map(line => parseFloat(line))
-        .filter(t => !Number.isNaN(t));
+      const ffprobePath = resolveFfprobePath();
+      if (ffprobePath) {
+        const command = `"${ffprobePath}" -v error -select_streams v -skip_frame nokey -show_entries frame=pkt_pts_time -of csv=p=0 "${videoPath}"`;
+        const { stdout } = await execPromise(command, { shell: true, maxBuffer: 8 * 1024 * 1024 });
+        const timestamps = stdout
+          .split(/\r?\n/)
+          .map(line => line.trim())
+          .filter(line => line)
+          .map(line => parseFloat(line))
+          .filter(t => !Number.isNaN(t));
+        if (timestamps.length > 0) return timestamps;
+      }
+
+      const command = `"${ffmpegPath}" -skip_frame nokey -i "${videoPath}" -map 0:v:0 -an -vf showinfo -f null -`;
+      const { stderr } = await execPromise(command, { shell: true, maxBuffer: 16 * 1024 * 1024 });
+      const timestamps = parsePtsTimes(stderr);
+      if (timestamps.length > 0) {
+        console.log(`[VideoAnalyzer] 使用 ffmpeg showinfo 提取关键帧时间戳: ${timestamps.length} 个`);
+      }
       return timestamps;
     } catch (error) {
       console.warn('[VideoAnalyzer] 提取关键帧时间戳失败，回退到均匀采样', error.message);
@@ -1128,7 +1182,13 @@ ${visualCutsText}
       }
     } catch (error) {
       console.error('[VideoAnalyzer] API调用失败:', error.response?.data || error.message);
-      throw new Error(`AI分析失败: ${error.message}`);
+      this.reportProgress(onProgress, 'model', 96, '大模型分析失败，使用降级结果继续');
+      return buildFallbackAnalysisResult(
+        `AI分析失败: ${error.message}`,
+        transcript,
+        visualCuts,
+        progressOptions.visualCutStats || null
+      );
     }
   }
 
@@ -1266,8 +1326,24 @@ ${visualCutsText}
         console.log(`[VideoAnalyzer] 视觉候选切点检测完成: ${visualCuts.length} 个`);
         this.reportProgress(onProgress, 'visual', 42, `检测到 ${visualCuts.length} 个视觉候选切点`);
       } catch (error) {
-        console.warn('[VideoAnalyzer] 视觉候选切点检测失败，继续后续分析:', error.message);
-        this.reportProgress(onProgress, 'visual', 42, '视觉切点检测失败，继续分析');
+        console.warn('[VideoAnalyzer] Python视觉候选切点检测失败，尝试 ffmpeg scene fallback:', error.message);
+        try {
+          const fallbackVisualResult = await analyzeSceneCutsWithFfmpeg(videoPath, {
+            ...(options?.visualCuts || {}),
+            timeoutMs: 120000
+          });
+          visualCuts = fallbackVisualResult.visualCuts || [];
+          visualCutStats = {
+            ...(fallbackVisualResult.stats || {}),
+            fallbackFrom: 'python_visual_metrics',
+            fallbackReason: error.message
+          };
+          console.log(`[VideoAnalyzer] ffmpeg视觉候选切点检测完成: ${visualCuts.length} 个`);
+          this.reportProgress(onProgress, 'visual', 42, `检测到 ${visualCuts.length} 个视觉候选切点`);
+        } catch (fallbackError) {
+          console.warn('[VideoAnalyzer] 视觉候选切点检测失败，继续后续分析:', fallbackError.message);
+          this.reportProgress(onProgress, 'visual', 42, '视觉切点检测失败，继续分析');
+        }
       }
 
       // 6. 提取音频并进行语音识别（可选）
@@ -1286,6 +1362,19 @@ ${visualCutsText}
         this.reportProgress(onProgress, 'model', 42, '跳过音频，准备大模型分析');
       }
 
+      let keywordCuts = [];
+      if (transcript) {
+        try {
+          keywordCuts = keywordCutService.mergeNearbyDetections(
+            keywordCutService.detectKeywordCuts(transcript),
+            5
+          );
+          console.log(`[VideoAnalyzer] 关键词候选切点检测完成: ${keywordCuts.length} 个`);
+        } catch (error) {
+          console.warn('[VideoAnalyzer] 关键词切点检测失败，继续分析:', error.message);
+        }
+      }
+
       // 7. AI分析（基于关键帧、时长、视觉切点和音频转录），知识点和热词从分析结果中获取
       const analysisResult = await this.analyzeWithQwen(videoPath, framesDir, duration, transcript, userConfig, onProgress, {
         modelStartPercent: shouldAnalyzeAudio ? 60 : 42,
@@ -1295,12 +1384,45 @@ ${visualCutsText}
 
       // 8. 整合所有分析结果
       this.reportProgress(onProgress, 'finalize', 98, '正在整理分析结果');
+      let segmentPipeline = null;
+      try {
+        const frameTimes = fs.readdirSync(framesDir)
+          .filter(file => file.endsWith('.jpg'))
+          .map(file => {
+            const match = file.match(/frame_\d+_(\d+)\.jpg$/);
+            return match ? Number(match[1]) / 1000 : null;
+          })
+          .filter(time => Number.isFinite(time));
+        const modelConfig = this.getEffectiveModelConfig(userConfig);
+        segmentPipeline = await runSegmentPipeline({
+          videoId: bvid,
+          bvid,
+          duration,
+          frameTimes,
+          transcript,
+          visualCuts,
+          audioCuts: [],
+          keywordCuts,
+          existingAnalysis: analysisResult,
+          modelConfig
+        }, {
+          modelClient: this.createOpenAIClient(modelConfig)
+        });
+        console.log(`[VideoAnalyzer] 分段主流程完成: ${segmentPipeline.segments.length} 个最终片段`);
+      } catch (error) {
+        console.warn('[VideoAnalyzer] 分段主流程运行失败，保留原分析结果:', error.message);
+      }
+
       const finalResult = {
         ...analysisResult,
         // 添加音频转录文本（如果有）
         transcript: transcript,
+        keyword_cuts: keywordCuts,
         visual_cuts: visualCuts,
-        visual_cut_stats: visualCutStats
+        visual_cut_stats: visualCutStats,
+        candidateCuts: segmentPipeline?.candidateCuts || [],
+        segmentPipeline,
+        final_segments: segmentPipeline?.segments || []
       };
 
       // 9. 返回结果
