@@ -14,3 +14,7 @@ numpy>=1.24.0
 
 # 图像处理（用于关键帧提取）
 Pillow>=9.5.0
+
+# ASR Whisper fallback（可选，用于本地语音识别）
+openai-whisper>=20230314
+torch>=2.0.0

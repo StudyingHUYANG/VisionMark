@@ -12,6 +12,7 @@ const vectorDb = require('./vectorDb');
 const BilibiliDownloader = require('./bilibiliDownloader');
 const { analyzeVisualCuts, analyzeSceneCutsWithFfmpeg } = require('./visualCutDetector');
 const keywordCutService = require('./segment/keywordCuts');
+const { detectAudioCuts } = require('./segment/audioCuts');
 const { runSegmentPipeline } = require('./segmentPipeline');
 
 const execPromise = util.promisify(exec);
@@ -1124,8 +1125,7 @@ ${visualCutsText}
               console.log('[VideoAnalyzer] 验证知识点时间戳...');
               const transcriptLines = (transcript || '').split('\n');
               result.knowledge_points.forEach((kp, i) => {
-                const timestampPattern = new RegExp(`\\[${kp.timestamp}\\]`);
-                const foundInTranscript = transcriptLines.some(line => timestampPattern.test(line));
+                const foundInTranscript = transcriptLines.some(line => line.includes(kp.timestamp));
                 console.log(`  [${i+1}] "${kp.term}" (${kp.timestamp}) ${foundInTranscript ? '✓ 在转录文本中找到' : '✗ 未在转录文本中找到'}`);
               });
             }
@@ -1137,10 +1137,9 @@ ${visualCutsText}
 
               // 验证时间戳是否在转录文本中
               console.log('[VideoAnalyzer] 验证热词时间戳...');
-              const transcriptLines = (transcript || '').split('\n');
+              const transcriptLinesHw = (transcript || '').split('\n');
               result.hot_words.forEach((hw, i) => {
-                const timestampPattern = new RegExp(`\\[${hw.timestamp}\\]`);
-                const foundInTranscript = transcriptLines.some(line => timestampPattern.test(line));
+                const foundInTranscript = transcriptLinesHw.some(line => line.includes(hw.timestamp));
                 console.log(`  [${i+1}] "${hw.word}" (${hw.timestamp}) ${foundInTranscript ? '✓ 在转录文本中找到' : '✗ 未在转录文本中找到'}`);
               });
             }
@@ -1363,6 +1362,7 @@ ${visualCutsText}
       }
 
       let keywordCuts = [];
+      let audioCuts = [];
       if (transcript) {
         try {
           keywordCuts = keywordCutService.mergeNearbyDetections(
@@ -1372,6 +1372,19 @@ ${visualCutsText}
           console.log(`[VideoAnalyzer] 关键词候选切点检测完成: ${keywordCuts.length} 个`);
         } catch (error) {
           console.warn('[VideoAnalyzer] 关键词切点检测失败，继续分析:', error.message);
+        }
+      }
+
+      // 6.5 音频切点检测（静音 + 音量变化）
+      if (shouldAnalyzeAudio) {
+        try {
+          const audioPathForCuts = path.join(this.downloadDir, `${bvid}.wav`);
+          if (fs.existsSync(audioPathForCuts)) {
+            audioCuts = await detectAudioCuts(audioPathForCuts);
+            console.log(`[VideoAnalyzer] 音频切点检测完成: ${audioCuts.length} 个`);
+          }
+        } catch (error) {
+          console.warn('[VideoAnalyzer] 音频切点检测失败，继续分析:', error.message);
         }
       }
 
@@ -1401,7 +1414,7 @@ ${visualCutsText}
           frameTimes,
           transcript,
           visualCuts,
-          audioCuts: [],
+          audioCuts,
           keywordCuts,
           existingAnalysis: analysisResult,
           modelConfig
