@@ -53,10 +53,10 @@ async function searchTable(tableName, bvid, runId, vector, limit) {
   const safeLimit = Math.max(1, Math.min(Number(limit) || 30, 200));
   return table
     .search(vector)
-    .metricType('cosine')
+    .distanceType('cosine')
     .filter(`bvid = '${bvid}' AND runId = '${runId}'`)
     .limit(safeLimit)
-    .execute();
+    .toArray();
 }
 
 function withScore(row) {
@@ -99,7 +99,7 @@ async function getIndexedWindows(bvid, runId) {
     .query()
     .filter(`bvid = '${bvid}' AND runId = '${runId}'`)
     .select(['windowId', 'bvid', 'startTime', 'endTime', 'frameTime', 'thumbnailPath'])
-    .execute();
+    .toArray();
   const windows = new Map();
   for (const row of rows) {
     if (!windows.has(row.windowId)) windows.set(row.windowId, row);
@@ -119,7 +119,7 @@ async function getWindowMetadata(bvid, runId, windowId) {
       .filter(`bvid = '${bvid}' AND runId = '${runId}' AND windowId = '${windowId}'`)
       .select(['windowId', 'bvid', 'startTime', 'endTime', 'thumbnailPath'])
       .limit(1)
-      .execute();
+      .toArray();
     if (rows.length) return rows[0];
   }
   return null;
