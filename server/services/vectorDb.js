@@ -1,124 +1,155 @@
 const lancedb = require('@lancedb/lancedb');
 const path = require('path');
-const fs = require('fs');
-const crypto = require('crypto');
 
 const dbPath = path.join(__dirname, '../database/lancedb_data');
-const TABLE_NAME = 'visionmark_frames';
+const VISUAL_TABLE = 'visionmark_visual_windows_v2';
+const TEXT_TABLE = 'visionmark_text_windows_v2';
 
 let dbPromise = null;
 
-/**
- * 确保返回数据库连接
- */
-async function getDb() {
-  if (!dbPromise) {
-    dbPromise = lancedb.connect(dbPath);
+function assertBvid(bvid) {
+  if (!/^BV[0-9A-Za-z]{10}$/.test(String(bvid || ''))) {
+    throw new Error('非法 BVID');
   }
+  return bvid;
+}
+
+function assertRunId(runId) {
+  if (!/^[0-9a-f-]{36}$/i.test(String(runId || ''))) {
+    throw new Error('非法索引 runId');
+  }
+  return runId;
+}
+
+async function getDb() {
+  if (!dbPromise) dbPromise = lancedb.connect(dbPath);
   return dbPromise;
 }
 
-/**
- * 获取表对象，如果存在的话
- */
-async function getTable() {
+async function getTable(name) {
   const db = await getDb();
-  const tables = await db.tableNames();
-  if (tables.includes(TABLE_NAME)) {
-    return await db.openTable(TABLE_NAME);
+  const names = await db.tableNames();
+  return names.includes(name) ? db.openTable(name) : null;
+}
+
+async function appendRows(tableName, rows) {
+  if (!rows.length) return;
+  const db = await getDb();
+  const table = await getTable(tableName);
+  if (table) await table.add(rows);
+  else await db.createTable(tableName, rows);
+}
+
+async function appendRun(visualRows, textRows) {
+  await appendRows(VISUAL_TABLE, visualRows);
+  await appendRows(TEXT_TABLE, textRows);
+}
+
+async function searchTable(tableName, bvid, runId, vector, limit) {
+  assertBvid(bvid);
+  assertRunId(runId);
+  const table = await getTable(tableName);
+  if (!table) return [];
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 30, 200));
+  return table
+    .search(vector)
+    .metricType('cosine')
+    .filter(`bvid = '${bvid}' AND runId = '${runId}'`)
+    .limit(safeLimit)
+    .execute();
+}
+
+function withScore(row) {
+  const distance = Number(row._distance ?? 1);
+  const { vector, _distance, ...metadata } = row;
+  return { ...metadata, score: Math.max(-1, Math.min(1, 1 - distance)) };
+}
+
+async function searchVisual(bvid, runId, vector, limit = 90) {
+  return (await searchTable(VISUAL_TABLE, bvid, runId, vector, limit)).map(withScore);
+}
+
+async function searchText(bvid, runId, vector, limit = 30) {
+  const table = await getTable(TEXT_TABLE);
+  if (!table) return [];
+  return (await searchTable(TEXT_TABLE, bvid, runId, vector, limit)).map(withScore);
+}
+
+async function deleteRunsExcept(tableName, bvid, activeRunId) {
+  assertBvid(bvid);
+  assertRunId(activeRunId);
+  const table = await getTable(tableName);
+  if (!table) return;
+  await table.delete(`bvid = '${bvid}' AND runId != '${activeRunId}'`);
+}
+
+async function cleanupOldRuns(bvid, activeRunId) {
+  await Promise.all([
+    deleteRunsExcept(VISUAL_TABLE, bvid, activeRunId),
+    deleteRunsExcept(TEXT_TABLE, bvid, activeRunId)
+  ]);
+}
+
+async function getIndexedWindows(bvid, runId) {
+  assertBvid(bvid);
+  assertRunId(runId);
+  const table = await getTable(VISUAL_TABLE);
+  if (!table) return [];
+  const rows = await table
+    .query()
+    .filter(`bvid = '${bvid}' AND runId = '${runId}'`)
+    .select(['windowId', 'bvid', 'startTime', 'endTime', 'frameTime', 'thumbnailPath'])
+    .execute();
+  const windows = new Map();
+  for (const row of rows) {
+    if (!windows.has(row.windowId)) windows.set(row.windowId, row);
+  }
+  return [...windows.values()].sort((a, b) => a.startTime - b.startTime);
+}
+
+async function getWindowMetadata(bvid, runId, windowId) {
+  assertBvid(bvid);
+  assertRunId(runId);
+  if (!/^w_\d{4}_\d+$/.test(String(windowId || ''))) throw new Error('非法窗口 ID');
+  for (const tableName of [VISUAL_TABLE, TEXT_TABLE]) {
+    const table = await getTable(tableName);
+    if (!table) continue;
+    const rows = await table
+      .query()
+      .filter(`bvid = '${bvid}' AND runId = '${runId}' AND windowId = '${windowId}'`)
+      .select(['windowId', 'bvid', 'startTime', 'endTime', 'thumbnailPath'])
+      .limit(1)
+      .execute();
+    if (rows.length) return rows[0];
   }
   return null;
 }
 
-/**
- * 将帧特征存入 LanceDB (本地文件存储)
- * @param {string} bvid 
- * @param {Array<{ timestamp: number, vector: number[] }>} points 
- */
-async function upsertFramePoints(bvid, points) {
-  if (!points || points.length === 0) return;
-  
-  const db = await getDb();
-  const data = points.map((p) => ({
-    id: crypto.randomUUID(),
-    vector: p.vector,
-    bvid: bvid,
-    timestamp: p.timestamp
-  }));
-
-  let table = await getTable();
-  if (table) {
-    try {
-      // 删除该视频在向量库中的旧数据（避免重复插入）
-      await table.delete(`bvid = '${bvid}'`);
-    } catch (err) {
-      console.warn(`[VectorDB] 清除旧记录失败或无旧记录可清: ${err.message}`);
-    }
-    // 添加新数据
-    await table.add(data);
-  } else {
-    // 创建新表并存入初始数据
-    table = await db.createTable(TABLE_NAME, data);
-  }
-  
-  console.log(`[VectorDB] 成功插入 ${points.length} 个视频帧向量到 ${bvid} (LanceDB)`);
+// Legacy helpers intentionally read only the v2 active index through callers.
+async function upsertFramePoints() {
+  throw new Error('旧版帧索引已停用，请使用 appendRun');
 }
 
-/**
- * 根据文本向量搜索最匹配的帧
- * @param {string} bvid (可选，若不传则全库搜)
- * @param {number[]} queryVector 
- * @param {number} topK 
- */
-async function searchSimilarFrames(bvid, queryVector, topK = 5) {
-  const table = await getTable();
-  if (!table) return [];
-
-  // LanceDB 默认按 L2，可以通过 .metricType('cosine') 指定使用余弦相似度进行搜索
-  let query = table.search(queryVector).metricType('cosine').limit(topK);
-  
-  if (bvid) {
-    query = query.filter(`bvid = '${bvid}'`);
-  }
-
-  const results = await query.execute();
-
-  return results.map(r => {
-    // 转换为前端可读的相似度百分比
-    const distance = r._distance !== undefined ? r._distance : 0;
-    // 余弦距离的转化 (Cosine Distance) 的特点是 越小越相似，范围[0,2]
-    // 分数计算: 1 - 距离 或者直接使用其余弦值 (由于LanceDB的Cosine distance = 1 - cosine_similarity)
-    // 所以 similarity = 1 - _distance
-    const score = Math.max(0, 1 - distance);
-    return {
-      score: score,
-      bvid: r.bvid,
-      timestamp: r.timestamp
-    };
-  });
+async function searchSimilarFrames() {
+  return [];
 }
 
-/**
- * 获取指定视频的所有帧时间戳 (用于调试展示)
- */
-async function getAllFrames(bvid) {
-  const table = await getTable();
-  if (!table) return [];
-
-  // 获取表中的所有该 bvid 的记录
-  // 不取 vector 字段以减少返回数据量
-  const query = table.query().filter(`bvid = '${bvid}'`).select(['bvid', 'timestamp']);
-  const results = await query.execute();
-  return results.map(r => ({
-    bvid: r.bvid,
-    timestamp: r.timestamp
-  })).sort((a,b) => a.timestamp - b.timestamp);
+async function getAllFrames() {
+  return [];
 }
 
 module.exports = {
-  getDb,
-  upsertFramePoints,
-  searchSimilarFrames,
+  VISUAL_TABLE,
+  TEXT_TABLE,
+  appendRun,
+  cleanupOldRuns,
   getAllFrames,
-  isReady: () => true // LanceDB 本地运行不依赖环境变量，始终Ready
+  getDb,
+  getIndexedWindows,
+  getWindowMetadata,
+  isReady: () => true,
+  searchSimilarFrames,
+  searchText,
+  searchVisual,
+  upsertFramePoints
 };
