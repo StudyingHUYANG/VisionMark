@@ -8,8 +8,9 @@ const fs = require('fs');
  * 封装 DashScope 的 Text Embedding 接口 (text-embedding-v2)
  */
 class EmbeddingService {
-  constructor(apiKey) {
+  constructor(apiKey, options = {}) {
     this.apiKey = apiKey || process.env.DASHSCOPE_API_KEY;
+    this.textModel = options.textModel || process.env.TEXT_EMBEDDING_MODEL || 'text-embedding-v2';
     this.textApiUrl = 'https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding';
     this.multimodalApiUrl = 'https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding';
   }
@@ -25,14 +26,16 @@ class EmbeddingService {
    */
   async embedText(text) {
     if (!this.isReady()) throw new Error('DASHSCOPE_API_KEY 未配置');
+    const normalizedText = String(text || '').trim();
+    if (!normalizedText) throw new Error('文本不能为空');
     
     try {
       const response = await axios.post(
         this.textApiUrl,
         {
-          model: 'text-embedding-v2',
+          model: this.textModel,
           input: {
-            texts: [text]
+            texts: [normalizedText]
           },
           parameters: {}
         },
@@ -50,6 +53,44 @@ class EmbeddingService {
       
     } catch (error) {
       console.error('[Embedding] embedText 失败:', error.response?.data || error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * 批量文本向量化。索引和查询必须使用同一个 EmbeddingService/模型，
+   * 从而保证向量处于同一语义空间。
+   */
+  async embedTexts(texts) {
+    if (!this.isReady()) throw new Error('DASHSCOPE_API_KEY 未配置');
+    if (!Array.isArray(texts) || texts.length === 0) return [];
+    const normalizedTexts = texts.map(text => String(text || '').trim());
+    if (normalizedTexts.some(text => !text)) throw new Error('文本不能为空');
+
+    try {
+      const response = await axios.post(
+        this.textApiUrl,
+        {
+          model: this.textModel,
+          input: { texts: normalizedTexts },
+          parameters: {}
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      const embeddings = response.data?.output?.embeddings || [];
+      if (embeddings.length !== normalizedTexts.length) {
+        throw new Error(`文本向量数量不匹配: expected=${normalizedTexts.length}, actual=${embeddings.length}`);
+      }
+      return embeddings
+        .sort((a, b) => (a.text_index ?? 0) - (b.text_index ?? 0))
+        .map(item => item.embedding);
+    } catch (error) {
+      console.error('[Embedding] embedTexts 失败:', error.response?.data || error.message);
       throw error;
     }
   }

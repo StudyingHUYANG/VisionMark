@@ -1,67 +1,59 @@
 const express = require('express');
-const router = express.Router();
 const { authenticateToken } = require('../middlewares/auth');
 const vectorDb = require('../services/vectorDb');
-const EmbeddingService = require('../services/embeddingService');
+const SearchIndexService = require('../services/searchIndexService');
+const { SearchError } = require('../services/searchErrors');
+
+const router = express.Router();
+
+function sendError(res, error) {
+  if (error instanceof SearchError) {
+    return res.status(error.status).json({ success: false, error: { code: error.code, message: error.message } });
+  }
+  if (error instanceof TypeError || error instanceof RangeError) {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_REQUEST', message: error.message } });
+  }
+  console.error('[SemanticSearch] 请求失败:', error);
+  return res.status(500).json({ success: false, error: { code: 'INTERNAL_ERROR', message: '语义搜索失败' } });
+}
 
 /**
- * 根据文本语义搜索视频帧
- * GET /api/v1/search/semantic
- * Query Params:
- *  - bvid: 选填。指定搜索特定的视频，不传则在所有已处理视频中搜索。
- *  - q: 必填。用户的搜索词。
- *  - topk: 选填。返回的结果数，默认 5。
+ * 文本 segment 语义搜索。bvid 作为 videoId 的兼容别名保留。
+ * 无匹配不是错误，返回 results: []。
  */
 router.get('/semantic', authenticateToken, async (req, res) => {
   try {
-    const { bvid, q, topk } = req.query;
-
-    if (!vectorDb.isReady()) {
-      return res.status(503).json({ error: '系统未配置 Qdrant 向量引擎' });
-    }
-
-    if (!q) {
-      return res.status(400).json({ error: '必须提供搜索词 q' });
-    }
-
-    const embeddingService = new EmbeddingService();
-    if (!embeddingService.isReady()) {
-      return res.status(503).json({ error: '服务端未配置 Embedding 接口' });
-    }
-
-    const k = topk ? parseInt(topk, 10) : 5;
-
-    console.log(`[SemanticSearch] 收到请求: q="${q}", bvid="${bvid || '全部'}", topk=${k}`);
-
-    // 1. 将关键词转化为向量
-    const queryVector = await embeddingService.embedText(q);
-
-    // 2. 从 Qdrant 查询最相似的帧并提取元数据
-    const results = await vectorDb.searchSimilarFrames(bvid || null, queryVector, k);
-
-    res.json({
-      success: true,
-      query: q,
-      results
-    });
+    const { q, bvid, videoId } = req.query;
+    const topK = req.query.topK ?? req.query.topk ?? 5;
+    const service = new SearchIndexService();
+    const results = await service.search(q, { videoId: videoId || bvid || null, topK: Number(topK) });
+    return res.json({ success: true, query: String(q).trim(), results });
   } catch (error) {
-    console.error('[SemanticSearch] 语义搜索失败:', error);
-    res.status(500).json({ error: '语义搜索失败', message: error.message });
+    return sendError(res, error);
   }
 });
 
+/**
+ * 供分析管道或离线脚本写入标准 segment。真实分析输出接入时只需调用相同服务。
+ */
+router.post('/segments', authenticateToken, async (req, res) => {
+  try {
+    const service = new SearchIndexService();
+    const result = await service.indexSegments(req.body?.segments);
+    return res.status(200).json({ success: true, ...result });
+  } catch (error) {
+    return sendError(res, error);
+  }
+});
+
+// 保留旧帧调试接口，不改变其他成员现有调用。
 router.get('/frames', authenticateToken, async (req, res) => {
   try {
     const { bvid } = req.query;
-    if (!bvid) return res.status(400).json({ error: '缺少bvid参数' });
-    if (!vectorDb.isReady()) {
-      return res.status(503).json({ error: '系统未配置 Qdrant 向量引擎' });
-    }
-    const frames = await vectorDb.getAllFrames(bvid);
-    res.json({ success: true, frames });
+    if (!bvid) throw new TypeError('缺少 bvid 参数');
+    return res.json({ success: true, frames: await vectorDb.getAllFrames(bvid) });
   } catch (error) {
-    console.error('[SemanticSearch] 获取视频帧失败:', error);
-    res.status(500).json({ error: '获取视频帧失败', message: error.message });
+    return sendError(res, error);
   }
 });
 
