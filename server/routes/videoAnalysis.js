@@ -9,6 +9,7 @@ const { authenticateToken } = require('../middlewares/auth.js');
 const db = require('../database/db');
 const { getLatestEnabledUserModelConfig } = require('../services/modelConfigService');
 const { getLatestDebugArtifact } = require('../services/segmentPipeline/debugArtifactWriter');
+const searchIndexStore = require('../services/search/searchIndexStore');
 
 // 进度存储（保持全局）
 const analysisProgressStore = new Map();
@@ -51,10 +52,25 @@ function createVideoAnalysisRouter(wss = null) {
     vectorProgressStore.set(bvid, { ...p, ...update, updatedMs: Date.now() });
   }
 
-  router.get('/vector-progress', (req, res) => {
+  router.get('/vector-progress', authenticateToken, (req, res) => {
     const { bvid } = req.query;
-    const p = vectorProgressStore.get(bvid) || { status: 'idle', percent: 0, message: '' };
-    res.json(p);
+    const live = vectorProgressStore.get(bvid);
+    if (live) return res.json(live);
+    const persisted = searchIndexStore.getStatus(bvid);
+    const percentByStatus = {
+      not_found: 0,
+      pending: 1,
+      extracting: 20,
+      embedding: 70,
+      committing: 95,
+      ready: 100,
+      failed: 100
+    };
+    res.json({
+      status: persisted.status,
+      percent: percentByStatus[persisted.status] || 0,
+      message: persisted.error || (persisted.ready ? '跨模态检索索引已就绪' : '等待检索索引')
+    });
   });
 
   function setAnalysisProgress(userId, bvid, update = {}) {
@@ -155,6 +171,7 @@ function createVideoAnalysisRouter(wss = null) {
       tags: result.analysis.tags,
       summary: result.analysis.summary,
       transcript: result.analysis.transcript,
+      transcript_segments: result.analysis.transcript_segments || [],
       visual_cuts: result.analysis.visual_cuts || [],
       visual_cut_stats: result.analysis.visual_cut_stats || null,
       keyword_cuts: result.analysis.keyword_cuts || [],
@@ -188,6 +205,7 @@ function createVideoAnalysisRouter(wss = null) {
       content_analysis: {
         summary: result.analysis.summary || null,
         transcript: result.analysis.transcript || null,
+        transcript_segments: result.analysis.transcript_segments || [],
         knowledge_points: result.analysis.knowledge_points || [],
         hot_words: result.analysis.hot_words || [],
         tags: result.analysis.tags || [],

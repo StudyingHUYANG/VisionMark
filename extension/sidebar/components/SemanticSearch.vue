@@ -1,9 +1,9 @@
 <template>
   <div class="vm-semantic-search-wrapper">
     <!-- 向量预处理进度提示 -->
-    <div v-if="vectorProgressState.status === 'running' || vectorProgressState.status === 'error'" class="vm-vector-progress-container" :class="{ 'is-error': vectorProgressState.status === 'error' }">
+    <div v-if="isIndexing || vectorProgressState.status === 'failed'" class="vm-vector-progress-container" :class="{ 'is-error': vectorProgressState.status === 'failed' }">
       <div class="vm-vector-progress-header">
-        <span>{{ vectorProgressState.status === 'error' ? '画面索引失败' : '正在为语义搜索索引画面' }}</span>
+        <span>{{ vectorProgressState.status === 'failed' ? '跨模态索引失败' : '正在索引画面与字幕' }}</span>
         <span>{{ vectorProgressState.percent }}%</span>
       </div>
       <div class="vm-vector-progress-bar">
@@ -15,7 +15,7 @@
     </div>
 
     <!-- 查看已解析画面按钮 -->
-    <div v-if="framesList.length > 0 && vectorProgressState.status !== 'running'" class="vm-frames-dropdown">
+    <div v-if="framesList.length > 0 && !isIndexing" class="vm-frames-dropdown">
       <button class="vm-frames-btn" @click="showFrames = !showFrames">
         <span>可用检索画面 ({{ framesList.length }}帧)</span>
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" :class="{ 'is-open': showFrames }">
@@ -36,7 +36,7 @@
     </div>
 
     <!-- 搜索框本体 -->
-    <div class="vm-semantic-search" :class="{ 'disabled': vectorProgressState.status === 'running' }">
+    <div class="vm-semantic-search" :class="{ 'disabled': isIndexing }">
       <div class="vm-search-box" :class="{ 'is-active': isFocused || query }">
         <svg class="vm-search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <circle cx="11" cy="11" r="8"/>
@@ -45,13 +45,13 @@
         <input
           type="text"
           v-model="query"
-          :placeholder="vectorProgressState.status === 'running' ? '等待画面索引完成...' : '搜索视频画面 (例如：拿出手机测试)'"
+          :placeholder="isIndexing ? '等待跨模态索引完成...' : '搜索画面、动作或口播内容'"
           @keyup.enter="handleSearch"
           @focus="isFocused = true"
           @blur="isFocused = false"
-          :disabled="loading || vectorProgressState.status === 'running'"
+          :disabled="loading || isIndexing"
         />
-        <button v-if="query" class="vm-search-clear" @click="clearSearch" :disabled="loading || vectorProgressState.status === 'running'">
+        <button v-if="query" class="vm-search-clear" @click="clearSearch" :disabled="loading || isIndexing">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <line x1="18" y1="6" x2="6" y2="18"/>
             <line x1="6" y1="6" x2="18" y2="18"/>
@@ -60,27 +60,40 @@
       </div>
 
       <!-- 搜索结果下拉面板 -->
-      <div v-if="results.length > 0 || (hasSearched && query && vectorProgressState.status !== 'running')" class="vm-search-results">
+      <div v-if="results.length > 0 || (hasSearched && query && !isIndexing)" class="vm-search-results">
         <div v-if="loading" class="vm-search-loading">
           <div class="loader-spinner"></div>
           <span>正在匹配画面...</span>
         </div>
         <template v-else>
           <div v-if="results.length === 0" class="vm-search-empty">
-            未能找到匹配画面的时间点
+            {{ searchError || '未找到匹配的视频片段' }}
           </div>
           <div
             v-for="(item, index) in results"
-            :key="index"
+            :key="item.id || index"
             class="vm-search-item"
             @click="selectResult(item)"
           >
-            <div class="vm-search-time">{{ formatTime(item.timestamp) }}</div>
-            <div class="vm-search-score">
-              <div class="score-bar-bg">
-                <div class="score-bar-fill" :style="{ width: `${item.score * 100}%` }"></div>
+            <img v-if="item.thumbnailObjectUrl" class="vm-search-thumbnail" :src="item.thumbnailObjectUrl" alt="检索片段缩略图" />
+            <div class="vm-search-content">
+              <div class="vm-search-meta">
+                <div class="vm-search-time">{{ formatTime(item.startTime) }}–{{ formatTime(item.endTime) }}</div>
+                <div class="vm-search-score">
+                  <div class="score-bar-bg">
+                    <div class="score-bar-fill" :style="{ width: `${item.score * 100}%` }"></div>
+                  </div>
+                  <span>{{ (item.score * 100).toFixed(0) }}%</span>
+                </div>
               </div>
-              <span>{{ (item.score * 100).toFixed(0) }}% 相似</span>
+              <div class="vm-search-modalities">
+                <span v-for="modality in item.matchedModalities" :key="modality">
+                  {{ modality === 'visual' ? '画面' : '字幕' }}
+                </span>
+              </div>
+              <div v-if="item.evidence?.transcript" class="vm-search-evidence">
+                {{ item.evidence.transcript }}
+              </div>
             </div>
           </div>
         </template>
@@ -90,7 +103,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, watch } from 'vue';
+import { computed, ref, onMounted, onUnmounted, watch } from 'vue';
 
 const props = defineProps({
   bvid: {
@@ -106,10 +119,13 @@ const isFocused = ref(false);
 const loading = ref(false);
 const results = ref([]);
 const hasSearched = ref(false);
-const vectorProgressState = ref({ status: 'idle', percent: 0, message: '' });
+const searchError = ref('');
+const vectorProgressState = ref({ status: 'not_found', percent: 0, message: '' });
 const framesList = ref([]);
 const showFrames = ref(false);
 let progressInterval = null;
+const indexingStatuses = new Set(['pending', 'extracting', 'embedding', 'committing']);
+const isIndexing = computed(() => indexingStatuses.has(vectorProgressState.value.status));
 
 const formatTime = (seconds) => {
   const mins = Math.floor(seconds / 60);
@@ -118,9 +134,17 @@ const formatTime = (seconds) => {
 };
 
 const clearSearch = () => {
+  clearResultObjectUrls();
   query.value = '';
   results.value = [];
   hasSearched.value = false;
+  searchError.value = '';
+};
+
+const clearResultObjectUrls = () => {
+  results.value.forEach(item => {
+    if (item.thumbnailObjectUrl) URL.revokeObjectURL(item.thumbnailObjectUrl);
+  });
 };
 
 const fetchFramesList = async () => {
@@ -146,7 +170,7 @@ const fetchFramesList = async () => {
 };
 
 const selectResult = (item) => {
-  emit('seek', item.timestamp);
+  emit('seek', item.seekTime ?? item.timestamp ?? item.startTime);
 };
 
 const pollVectorProgress = async () => {
@@ -156,20 +180,22 @@ const pollVectorProgress = async () => {
     const storage = await new Promise(resolve => chrome.storage.local.get(['adskipper_token'], resolve));
     const token = storage.adskipper_token;
     
-    // Check vector status to display progress
-    // videoAnalysisRouter is mounted at /video-analysis, not /api/v1/video-analysis
-    const hostBase = window.LOCAL_CONFIG?.API_BASE || 'http://localhost:8080';
-    const response = await fetch(`${hostBase}/video-analysis/vector-progress?bvid=${props.bvid}`, {
+    const response = await fetch(`${apiBase}/search/status?bvid=${props.bvid}`, {
       headers: { 'Authorization': token ? `Bearer ${token}` : '' }
     });
     
     if (response.ok) {
       const data = await response.json();
-      vectorProgressState.value = data;
+      const percentByStatus = { not_found: 0, pending: 1, extracting: 20, embedding: 70, committing: 95, ready: 100, failed: 100 };
+      vectorProgressState.value = {
+        ...data,
+        percent: percentByStatus[data.status] ?? 0,
+        message: data.error || (data.status === 'ready' ? '跨模态检索索引已就绪' : '正在准备检索索引')
+      };
       
-      if (data.status === 'completed' || data.status === 'error') {
+      if (data.status === 'ready' || data.status === 'failed') {
         stopPolling();
-        if (data.status === 'completed') {
+        if (data.status === 'ready') {
           fetchFramesList(); // 获取最新帧列表
         }
       }
@@ -199,11 +225,14 @@ onMounted(() => {
 
 onUnmounted(() => {
   stopPolling();
+  clearResultObjectUrls();
 });
 
 watch(() => props.bvid, (newVal) => {
   if (newVal) {
-    vectorProgressState.value = { status: 'idle', percent: 0, message: '' };
+    clearResultObjectUrls();
+    results.value = [];
+    vectorProgressState.value = { status: 'not_found', percent: 0, message: '' };
     framesList.value = [];
     showFrames.value = false;
     fetchFramesList();
@@ -212,32 +241,51 @@ watch(() => props.bvid, (newVal) => {
 });
 
 const handleSearch = async () => {
-  if (!query.value.trim() || !props.bvid || vectorProgressState.value.status === 'running') return;
+  if (!query.value.trim() || !props.bvid || isIndexing.value) return;
 
   loading.value = true;
   hasSearched.value = true;
+  clearResultObjectUrls();
   results.value = [];
+  searchError.value = '';
 
   try {
     const apiBase = window.API_BASE || 'http://localhost:8080/api/v1';
-    const searchUrl = `${apiBase}/search/semantic?bvid=${props.bvid}&q=${encodeURIComponent(query.value)}&topk=3`;
+    const searchUrl = `${apiBase}/search/multimodal`;
     const storage = await new Promise(resolve => chrome.storage.local.get(['adskipper_token'], resolve));
     const token = storage.adskipper_token;
     
     // In extension context, we can fetch directly
     const response = await fetch(searchUrl, {
+      method: 'POST',
       headers: {
-        'Authorization': token ? `Bearer ${token}` : ''
-      }
+        'Authorization': token ? `Bearer ${token}` : '',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ bvid: props.bvid, query: query.value.trim(), topK: 5 })
     });
     
-    if (!response.ok) throw new Error('Search failed');
     const data = await response.json();
+    if (!response.ok) throw new Error(data.message || '搜索失败');
     if (data.success) {
-      results.value = data.results || [];
+      const hostBase = new URL(apiBase).origin;
+      results.value = await Promise.all((data.results || []).map(async item => {
+        if (!item.thumbnailUrl) return item;
+        try {
+          const thumbnailResponse = await fetch(`${hostBase}${item.thumbnailUrl}`, {
+            headers: { 'Authorization': token ? `Bearer ${token}` : '' }
+          });
+          if (!thumbnailResponse.ok) return item;
+          const blob = await thumbnailResponse.blob();
+          return { ...item, thumbnailObjectUrl: URL.createObjectURL(blob) };
+        } catch (_) {
+          return item;
+        }
+      }));
     }
   } catch (error) {
     console.error('Semantic search error:', error);
+    searchError.value = error.message || '搜索失败';
   } finally {
     loading.value = false;
   }
@@ -478,12 +526,58 @@ input::placeholder {
 
 .vm-search-item {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
   padding: 10px 12px;
   cursor: pointer;
   transition: background 0.2s;
   border-bottom: 1px solid #f5f5f5;
+}
+
+.vm-search-thumbnail {
+  width: 96px;
+  height: 54px;
+  flex: 0 0 auto;
+  object-fit: cover;
+  border-radius: 5px;
+  background: #f3f3f3;
+}
+
+.vm-search-content {
+  min-width: 0;
+  flex: 1;
+}
+
+.vm-search-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.vm-search-modalities {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.vm-search-modalities span {
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: rgba(0, 161, 214, 0.1);
+  color: #0087b3;
+  font-size: 10px;
+}
+
+.vm-search-evidence {
+  margin-top: 5px;
+  color: #666;
+  font-size: 11px;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .vm-search-item:last-child {

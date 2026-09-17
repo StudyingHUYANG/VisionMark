@@ -7,13 +7,13 @@ const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const OpenAI = require('openai');
 const { buildEffectiveModelConfig } = require('./modelConfigService');
 const { ossClient, hasOssConfig } = require('../utils/oss');
-const EmbeddingService = require('./embeddingService');
-const vectorDb = require('./vectorDb');
 const BilibiliDownloader = require('./bilibiliDownloader');
 const { analyzeVisualCuts, analyzeSceneCutsWithFfmpeg } = require('./visualCutDetector');
 const keywordCutService = require('./segment/keywordCuts');
 const { detectAudioCuts } = require('./segment/audioCuts');
 const { runSegmentPipeline } = require('./segmentPipeline');
+const VideoSearchIndexer = require('./search/videoSearchIndexer');
+const { normalizeTranscript } = require('./search/windowBuilder');
 
 const execPromise = util.promisify(exec);
 
@@ -75,6 +75,7 @@ class VideoAnalyzer {
   constructor(downloadDir, wss = null) {
     this.downloadDir = downloadDir || path.join(__dirname, '../../downloads');
     this.wss = wss; // WebSocket 服务器实例
+    this.searchIndexer = new VideoSearchIndexer();
     this.ensureDownloadDir();
   }
 
@@ -1303,16 +1304,12 @@ ${visualCutsText}
       // 4. 提取关键帧（用于视觉理解）
       const { framesDir, duration } = await this.extractFrames(videoPath, bvid, onProgress);
 
-      // 后台异步执行向量提取
-      this.storeFrameVectors(bvid, framesDir, options?.onVectorProgress).catch(err => {
-        console.error('[VideoAnalyzer] 后台提取向量失败:', err);
-      });
-
       // 5. 视觉候选切点检测（确定性信号，供分段参考）
       let visualCuts = [];
       let visualCutStats = null;
+      let visualFrames = [];
       try {
-        const visualFrames = await this.extractVisualProbeFrames(
+        visualFrames = await this.extractVisualProbeFrames(
           videoPath,
           bvid,
           duration,
@@ -1430,6 +1427,7 @@ ${visualCutsText}
         ...analysisResult,
         // 添加音频转录文本（如果有）
         transcript: transcript,
+        transcript_segments: normalizeTranscript(transcript),
         keyword_cuts: keywordCuts,
         visual_cuts: visualCuts,
         visual_cut_stats: visualCutStats,
@@ -1437,6 +1435,28 @@ ${visualCutsText}
         segmentPipeline,
         final_segments: segmentPipeline?.segments || []
       };
+
+      const fallbackFrames = fs.readdirSync(framesDir)
+        .filter(file => file.endsWith('.jpg'))
+        .map(file => {
+          const match = file.match(/frame_\d+_(\d+)\.jpg$/);
+          return match ? {
+            framePath: path.join(framesDir, file),
+            time: Number(match[1]) / 1000
+          } : null;
+        })
+        .filter(Boolean);
+
+      this.searchIndexer.indexVideo({
+        bvid,
+        duration,
+        frames: visualFrames.length ? visualFrames : fallbackFrames,
+        transcriptSegments: finalResult.transcript_segments,
+        visualCuts,
+        segments: finalResult.final_segments
+      }, options?.onVectorProgress).catch(error => {
+        console.error('[VideoAnalyzer] 跨模态检索索引失败:', error.message);
+      });
 
       // 9. 返回结果
       return {
