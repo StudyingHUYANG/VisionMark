@@ -7,13 +7,15 @@ const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const OpenAI = require('openai');
 const { buildEffectiveModelConfig } = require('./modelConfigService');
 const { ossClient, hasOssConfig } = require('../utils/oss');
-const EmbeddingService = require('./embeddingService');
-const vectorDb = require('./vectorDb');
 const BilibiliDownloader = require('./bilibiliDownloader');
 const { analyzeVisualCuts, analyzeSceneCutsWithFfmpeg } = require('./visualCutDetector');
 const keywordCutService = require('./segment/keywordCuts');
 const { detectAudioCuts } = require('./segment/audioCuts');
 const { runSegmentPipeline } = require('./segmentPipeline');
+const VideoSearchIndexer = require('./search/videoSearchIndexer');
+const { normalizeTranscript } = require('./search/windowBuilder');
+const { buildMaterialExtraction } = require('./materialExtractionService');
+const { enrichMaterialInsights } = require('./materialInsightService');
 
 const execPromise = util.promisify(exec);
 
@@ -75,6 +77,7 @@ class VideoAnalyzer {
   constructor(downloadDir, wss = null) {
     this.downloadDir = downloadDir || path.join(__dirname, '../../downloads');
     this.wss = wss; // WebSocket 服务器实例
+    this.searchIndexer = new VideoSearchIndexer();
     this.ensureDownloadDir();
   }
 
@@ -1303,16 +1306,12 @@ ${visualCutsText}
       // 4. 提取关键帧（用于视觉理解）
       const { framesDir, duration } = await this.extractFrames(videoPath, bvid, onProgress);
 
-      // 后台异步执行向量提取
-      this.storeFrameVectors(bvid, framesDir, options?.onVectorProgress).catch(err => {
-        console.error('[VideoAnalyzer] 后台提取向量失败:', err);
-      });
-
       // 5. 视觉候选切点检测（确定性信号，供分段参考）
       let visualCuts = [];
       let visualCutStats = null;
+      let visualFrames = [];
       try {
-        const visualFrames = await this.extractVisualProbeFrames(
+        visualFrames = await this.extractVisualProbeFrames(
           videoPath,
           bvid,
           duration,
@@ -1426,17 +1425,64 @@ ${visualCutsText}
         console.warn('[VideoAnalyzer] 分段主流程运行失败，保留原分析结果:', error.message);
       }
 
+      const transcriptSegments = normalizeTranscript(transcript);
+      const fallbackFrames = fs.readdirSync(framesDir)
+        .filter(file => file.endsWith('.jpg'))
+        .map(file => {
+          const match = file.match(/frame_\d+_(\d+)\.jpg$/);
+          return match ? {
+            framePath: path.join(framesDir, file),
+            time: Number(match[1]) / 1000
+          } : null;
+        })
+        .filter(Boolean);
+      const materialSourceFrames = visualFrames.length ? visualFrames : fallbackFrames;
+      let materialExtraction = { runId: null, generatedAt: null, clips: [] };
+      try {
+        materialExtraction = buildMaterialExtraction({
+          bvid,
+          duration,
+          frames: materialSourceFrames,
+          segments: segmentPipeline?.segments || [],
+          transcriptSegments
+        }, options?.materialExtraction);
+        this.reportProgress(onProgress, 'finalize', 98, '正在结合画面与字幕生成片段解读');
+        const insightModelConfig = this.getEffectiveModelConfig(userConfig);
+        await enrichMaterialInsights(materialExtraction, { bvid, transcriptSegments }, {
+          modelClient: this.createOpenAIClient(insightModelConfig),
+          modelConfig: insightModelConfig,
+          assetsDir: options?.materialExtraction?.assetsDir
+        });
+        console.log(`[VideoAnalyzer] 素材提取分析完成: ${materialExtraction.clips.length} 个候选`);
+      } catch (error) {
+        console.warn('[VideoAnalyzer] 素材提取分析失败，继续返回其他分析结果:', error.message);
+      }
+
       const finalResult = {
         ...analysisResult,
         // 添加音频转录文本（如果有）
         transcript: transcript,
+        transcript_segments: transcriptSegments,
         keyword_cuts: keywordCuts,
         visual_cuts: visualCuts,
         visual_cut_stats: visualCutStats,
         candidateCuts: segmentPipeline?.candidateCuts || [],
         segmentPipeline,
-        final_segments: segmentPipeline?.segments || []
+        final_segments: segmentPipeline?.segments || [],
+        material_extraction: materialExtraction,
+        material_clips: materialExtraction.clips
       };
+
+      this.searchIndexer.indexVideo({
+        bvid,
+        duration,
+        frames: materialSourceFrames,
+        transcriptSegments: finalResult.transcript_segments,
+        visualCuts,
+        segments: finalResult.final_segments
+      }, options?.onVectorProgress).catch(error => {
+        console.error('[VideoAnalyzer] 跨模态检索索引失败:', error.message);
+      });
 
       // 9. 返回结果
       return {

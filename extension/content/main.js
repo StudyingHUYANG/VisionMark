@@ -301,6 +301,7 @@ import './utils.js';
         sidebarState.aiTitle = '';
         sidebarState.knowledgePoints = [];
         sidebarState.hotWords = [];
+        sidebarState.materialClips = [];
         sidebarState.loadError = null;
         sidebarState.analysisProgress = null;
         sidebarState.segments = [];
@@ -694,6 +695,7 @@ import './utils.js';
           if (data.hot_words !== undefined) {
             sidebarState.hotWords = data.hot_words || [];
           }
+          sidebarState.materialClips = Array.isArray(data.material_clips) ? data.material_clips : [];
           sidebarState.segments = this.segments;
           sidebarState.activeSegmentKey = null;
 
@@ -1982,6 +1984,7 @@ import './utils.js';
         sidebarState.aiTitle = analysisData.title || '';
         sidebarState.knowledgePoints = knowledgePoints;
         sidebarState.hotWords = hotWords;
+        sidebarState.materialClips = Array.isArray(analysisData.material_clips) ? analysisData.material_clips : [];
         sidebarState.bvid = bvid;
         sidebarState.cid = this.player.currentCid || null;
         sidebarState.segments = aiSegments;
@@ -2044,6 +2047,7 @@ import './utils.js';
             sidebarState.aiTitle = result.data.title || '';
             sidebarState.knowledgePoints = result.data.knowledge_points || [];
             sidebarState.hotWords = result.data.hot_words || [];
+            sidebarState.materialClips = Array.isArray(result.data.material_clips) ? result.data.material_clips : [];
             sidebarState.bvid = bvid;
             sidebarState.cid = this.player.currentCid || null;
             sidebarState.isLoading = false; // 结束加载状态

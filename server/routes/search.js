@@ -1,67 +1,97 @@
 const express = require('express');
-const router = express.Router();
+const path = require('path');
 const { authenticateToken } = require('../middlewares/auth');
 const vectorDb = require('../services/vectorDb');
-const EmbeddingService = require('../services/embeddingService');
+const indexStore = require('../services/search/searchIndexStore');
+const searchConfig = require('../config/search');
+const {
+  MultimodalSearchService,
+  SearchError,
+  validateBvid
+} = require('../services/search/multimodalSearchService');
 
-/**
- * 根据文本语义搜索视频帧
- * GET /api/v1/search/semantic
- * Query Params:
- *  - bvid: 选填。指定搜索特定的视频，不传则在所有已处理视频中搜索。
- *  - q: 必填。用户的搜索词。
- *  - topk: 选填。返回的结果数，默认 5。
- */
+const router = express.Router();
+const searchService = new MultimodalSearchService();
+
+function sendSearchError(res, error) {
+  const statusCode = error instanceof SearchError ? error.statusCode : 500;
+  return res.status(statusCode).json({
+    success: false,
+    error: error.code || 'SEARCH_FAILED',
+    message: error.message
+  });
+}
+
+router.post('/multimodal', authenticateToken, async (req, res) => {
+  try {
+    res.json(await searchService.search(req.body || {}));
+  } catch (error) {
+    console.error('[MultimodalSearch] 搜索失败:', error.message);
+    sendSearchError(res, error);
+  }
+});
+
 router.get('/semantic', authenticateToken, async (req, res) => {
   try {
-    const { bvid, q, topk } = req.query;
-
-    if (!vectorDb.isReady()) {
-      return res.status(503).json({ error: '系统未配置 Qdrant 向量引擎' });
-    }
-
-    if (!q) {
-      return res.status(400).json({ error: '必须提供搜索词 q' });
-    }
-
-    const embeddingService = new EmbeddingService();
-    if (!embeddingService.isReady()) {
-      return res.status(503).json({ error: '服务端未配置 Embedding 接口' });
-    }
-
-    const k = topk ? parseInt(topk, 10) : 5;
-
-    console.log(`[SemanticSearch] 收到请求: q="${q}", bvid="${bvid || '全部'}", topk=${k}`);
-
-    // 1. 将关键词转化为向量
-    const queryVector = await embeddingService.embedText(q);
-
-    // 2. 从 Qdrant 查询最相似的帧并提取元数据
-    const results = await vectorDb.searchSimilarFrames(bvid || null, queryVector, k);
-
+    const data = await searchService.search({
+      bvid: req.query.bvid,
+      query: req.query.q,
+      topK: req.query.topk
+    });
     res.json({
-      success: true,
-      query: q,
-      results
+      ...data,
+      results: data.results.map(result => ({
+        ...result,
+        timestamp: result.seekTime
+      }))
     });
   } catch (error) {
-    console.error('[SemanticSearch] 语义搜索失败:', error);
-    res.status(500).json({ error: '语义搜索失败', message: error.message });
+    sendSearchError(res, error);
+  }
+});
+
+router.get('/status', authenticateToken, (req, res) => {
+  try {
+    const bvid = validateBvid(req.query.bvid);
+    res.json({ success: true, bvid, ...indexStore.getStatus(bvid) });
+  } catch (error) {
+    sendSearchError(res, error);
   }
 });
 
 router.get('/frames', authenticateToken, async (req, res) => {
   try {
-    const { bvid } = req.query;
-    if (!bvid) return res.status(400).json({ error: '缺少bvid参数' });
-    if (!vectorDb.isReady()) {
-      return res.status(503).json({ error: '系统未配置 Qdrant 向量引擎' });
-    }
-    const frames = await vectorDb.getAllFrames(bvid);
-    res.json({ success: true, frames });
+    const bvid = validateBvid(req.query.bvid);
+    const row = indexStore.getIndexRow(bvid);
+    if (!row?.active_run_id) return res.json({ success: true, frames: [] });
+    const windows = await vectorDb.getIndexedWindows(bvid, row.active_run_id);
+    res.json({
+      success: true,
+      frames: windows.map(window => ({
+        bvid,
+        timestamp: Number(window.startTime),
+        startTime: Number(window.startTime),
+        endTime: Number(window.endTime)
+      }))
+    });
   } catch (error) {
-    console.error('[SemanticSearch] 获取视频帧失败:', error);
-    res.status(500).json({ error: '获取视频帧失败', message: error.message });
+    sendSearchError(res, error);
+  }
+});
+
+router.get('/thumbnails/:bvid/:windowId', authenticateToken, async (req, res) => {
+  try {
+    const bvid = validateBvid(req.params.bvid);
+    const row = indexStore.getIndexRow(bvid);
+    if (!row?.active_run_id) return res.status(404).json({ error: 'SEARCH_INDEX_NOT_READY' });
+    const metadata = await vectorDb.getWindowMetadata(bvid, row.active_run_id, req.params.windowId);
+    if (!metadata?.thumbnailPath) return res.status(404).json({ error: 'THUMBNAIL_NOT_FOUND' });
+    const resolved = path.resolve(metadata.thumbnailPath);
+    const assetsRoot = `${path.resolve(searchConfig.assetsDir)}${path.sep}`;
+    if (!resolved.startsWith(assetsRoot)) return res.status(403).json({ error: 'INVALID_THUMBNAIL_PATH' });
+    res.sendFile(resolved);
+  } catch (error) {
+    sendSearchError(res, error);
   }
 });
 

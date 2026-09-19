@@ -72,7 +72,8 @@ function fallbackSegmentMerge(candidateCuts = [], duration = 0, transcript = '')
       end: Number(end.toFixed(2)),
       title: `Segment ${segments.length + 1}`,
       type: 'content',
-      summary: transcriptSnippet(transcript, start, end),
+      summary: '',
+      transcriptExcerpt: transcriptSnippet(transcript, start, end),
       confidence: fallbackConfidence,
       evidence: {
         candidateCutTimes: boundaryCut ? [boundaryCut.time] : [],

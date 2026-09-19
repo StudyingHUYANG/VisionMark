@@ -2,7 +2,7 @@ const db = require('../database/db');
 
 const DEFAULT_MODEL_CONFIG = Object.freeze({
   provider: 'qwen',
-  apiKey: process.env.QWEN_API_KEY || 'sk-df7f07a45dee431fb8cc9b6453df5f34',
+  apiKey: process.env.QWEN_API_KEY || '',
   baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
   textModel: 'qwen-turbo',
   visionModel: 'qwen-vl-max',

@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --config build/vite.config.js",
     "build": "vite build --config build/vite.config.js",
+    "test:plugin": "node --test extension/sidebar/materialCollection.test.mjs",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
