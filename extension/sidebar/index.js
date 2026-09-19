@@ -14,6 +14,7 @@ const sidebarState = reactive({
   aiTitle: '',
   knowledgePoints: [],
   hotWords: [],
+  materialClips: [],
   segments: [],
   activeSegmentKey: null,
   analysisProgress: null,
@@ -37,6 +38,7 @@ export function createSidebar(container) {
         aiTitle: sidebarState.aiTitle,
         knowledgePoints: sidebarState.knowledgePoints,
         hotWords: sidebarState.hotWords,
+        materialClips: sidebarState.materialClips,
         segments: sidebarState.segments,
         activeKey: sidebarState.activeSegmentKey,
         analysisProgress: sidebarState.analysisProgress,
@@ -86,6 +88,7 @@ export function createSidebar(container) {
       if (data.aiTitle !== undefined) sidebarState.aiTitle = data.aiTitle;
       if (data.knowledgePoints !== undefined) sidebarState.knowledgePoints = data.knowledgePoints;
       if (data.hotWords !== undefined) sidebarState.hotWords = data.hotWords;
+      if (data.materialClips !== undefined) sidebarState.materialClips = data.materialClips;
       if (data.segments !== undefined) sidebarState.segments = data.segments;
       if (data.isLoading !== undefined) sidebarState.isLoading = data.isLoading;
       if (data.loadError !== undefined) sidebarState.loadError = data.loadError;

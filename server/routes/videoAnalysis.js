@@ -4,12 +4,14 @@
  */
 
 const express = require('express');
+const fs = require('fs');
 const VideoAnalyzer = require('../services/videoAnalyzer');
 const { authenticateToken } = require('../middlewares/auth.js');
 const db = require('../database/db');
 const { getLatestEnabledUserModelConfig } = require('../services/modelConfigService');
 const { getLatestDebugArtifact } = require('../services/segmentPipeline/debugArtifactWriter');
 const searchIndexStore = require('../services/search/searchIndexStore');
+const { resolveMaterialFramePath } = require('../services/materialExtractionService');
 
 // 进度存储（保持全局）
 const analysisProgressStore = new Map();
@@ -178,6 +180,8 @@ function createVideoAnalysisRouter(wss = null) {
       candidateCuts: result.analysis.candidateCuts || [],
       segmentPipeline: result.analysis.segmentPipeline || null,
       segments: result.analysis.final_segments || [],
+      material_extraction: result.analysis.material_extraction || null,
+      material_clips: result.analysis.material_clips || [],
       // 将 segments 映射为 ad_segments
       ad_segments: result.analysis.segments ? result.analysis.segments.map(seg => ({
         start_time: parseTimeToSeconds(seg.start_time),
@@ -215,6 +219,8 @@ function createVideoAnalysisRouter(wss = null) {
         candidateCuts: result.analysis.candidateCuts || [],
         segmentPipeline: result.analysis.segmentPipeline || null,
         segments: result.analysis.final_segments || [],
+        material_extraction: result.analysis.material_extraction || null,
+        material_clips: result.analysis.material_clips || [],
         analyzed_at: result.analyzed_at || null,
         ad_segments: result.analysis.segments
           ? result.analysis.segments.map(seg => ({
@@ -349,6 +355,8 @@ function createVideoAnalysisRouter(wss = null) {
           candidateCuts: result.analysis.candidateCuts || [],
           segmentPipeline: result.analysis.segmentPipeline || null,
           segments: result.analysis.final_segments || [],
+          material_extraction: result.analysis.material_extraction || null,
+          material_clips: result.analysis.material_clips || [],
           ad_segments: result.analysis.segments ? result.analysis.segments.map(seg => ({
             start_time: parseTimeToSeconds(seg.start_time),
             end_time: parseTimeToSeconds(seg.end_time),
@@ -417,6 +425,23 @@ function createVideoAnalysisRouter(wss = null) {
       error: '读取分段调试产物失败',
       message: error.message
     });
+  }
+  });
+
+  /**
+   * GET /video-analysis/material-frames/:bvid/:runId/:fileName
+   * 返回素材分析生成的代表帧。
+   */
+  router.get('/material-frames/:bvid/:runId/:fileName', authenticateToken, (req, res) => {
+  try {
+    const framePath = resolveMaterialFramePath(req.params);
+    if (!fs.existsSync(framePath)) {
+      return res.status(404).json({ success: false, error: '代表帧不存在或已清理' });
+    }
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+    return res.sendFile(framePath);
+  } catch (error) {
+    return res.status(400).json({ success: false, error: error.message });
   }
   });
 

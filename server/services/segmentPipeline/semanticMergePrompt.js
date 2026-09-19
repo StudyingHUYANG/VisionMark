@@ -35,6 +35,8 @@ function buildSemanticMergePrompt(input = {}) {
 5. 只输出严格 JSON，不要输出 markdown、解释或代码块。
 6. segment type 只能是 intro/content/ad/summary/transition/unknown。
 7. 每个 segment 必须包含 start/end/title/type/summary/confidence/evidence。
+8. 无论字幕原始语言是什么，title 和 summary 都必须使用简体中文；summary 应具体描述画面或内容，不要直接复制外语字幕。
+9. summary 必须归纳该段的主题、观点或内容关系，不得复制中文转录或逐句翻译外语字幕；没有画面证据时不能虚构视觉细节，证据不足则 summary 留空。
 
 输入：
 ${JSON.stringify(payload, null, 2)}

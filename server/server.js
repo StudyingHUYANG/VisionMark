@@ -197,6 +197,8 @@ app.get('/api/v1/segments', (req, res) => {
   let candidateCuts = [];
   let segmentPipeline = null;
   let final_segments = [];
+  let material_extraction = null;
+  let material_clips = [];
 
   const aiAnnotation = allAnnotations.find(row => row.source_type === 'AI' && row.annotation_type === 'full_analysis');
   if (aiAnnotation) {
@@ -214,6 +216,8 @@ app.get('/api/v1/segments', (req, res) => {
       candidateCuts = content.content_analysis.candidateCuts || [];
       segmentPipeline = content.content_analysis.segmentPipeline || null;
       final_segments = content.content_analysis.segments || [];
+      material_extraction = content.content_analysis.material_extraction || null;
+      material_clips = content.content_analysis.material_clips || material_extraction?.clips || [];
     }
   }
 
@@ -254,7 +258,9 @@ app.get('/api/v1/segments', (req, res) => {
       keyword_cuts,
       candidateCuts,
       segmentPipeline,
-      final_segments
+      final_segments,
+      material_extraction,
+      material_clips
     });
   });
 

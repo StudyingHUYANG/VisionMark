@@ -14,6 +14,8 @@ const { detectAudioCuts } = require('./segment/audioCuts');
 const { runSegmentPipeline } = require('./segmentPipeline');
 const VideoSearchIndexer = require('./search/videoSearchIndexer');
 const { normalizeTranscript } = require('./search/windowBuilder');
+const { buildMaterialExtraction } = require('./materialExtractionService');
+const { enrichMaterialInsights } = require('./materialInsightService');
 
 const execPromise = util.promisify(exec);
 
@@ -1423,19 +1425,7 @@ ${visualCutsText}
         console.warn('[VideoAnalyzer] 分段主流程运行失败，保留原分析结果:', error.message);
       }
 
-      const finalResult = {
-        ...analysisResult,
-        // 添加音频转录文本（如果有）
-        transcript: transcript,
-        transcript_segments: normalizeTranscript(transcript),
-        keyword_cuts: keywordCuts,
-        visual_cuts: visualCuts,
-        visual_cut_stats: visualCutStats,
-        candidateCuts: segmentPipeline?.candidateCuts || [],
-        segmentPipeline,
-        final_segments: segmentPipeline?.segments || []
-      };
-
+      const transcriptSegments = normalizeTranscript(transcript);
       const fallbackFrames = fs.readdirSync(framesDir)
         .filter(file => file.endsWith('.jpg'))
         .map(file => {
@@ -1446,11 +1436,47 @@ ${visualCutsText}
           } : null;
         })
         .filter(Boolean);
+      const materialSourceFrames = visualFrames.length ? visualFrames : fallbackFrames;
+      let materialExtraction = { runId: null, generatedAt: null, clips: [] };
+      try {
+        materialExtraction = buildMaterialExtraction({
+          bvid,
+          duration,
+          frames: materialSourceFrames,
+          segments: segmentPipeline?.segments || [],
+          transcriptSegments
+        }, options?.materialExtraction);
+        this.reportProgress(onProgress, 'finalize', 98, '正在结合画面与字幕生成片段解读');
+        const insightModelConfig = this.getEffectiveModelConfig(userConfig);
+        await enrichMaterialInsights(materialExtraction, { bvid, transcriptSegments }, {
+          modelClient: this.createOpenAIClient(insightModelConfig),
+          modelConfig: insightModelConfig,
+          assetsDir: options?.materialExtraction?.assetsDir
+        });
+        console.log(`[VideoAnalyzer] 素材提取分析完成: ${materialExtraction.clips.length} 个候选`);
+      } catch (error) {
+        console.warn('[VideoAnalyzer] 素材提取分析失败，继续返回其他分析结果:', error.message);
+      }
+
+      const finalResult = {
+        ...analysisResult,
+        // 添加音频转录文本（如果有）
+        transcript: transcript,
+        transcript_segments: transcriptSegments,
+        keyword_cuts: keywordCuts,
+        visual_cuts: visualCuts,
+        visual_cut_stats: visualCutStats,
+        candidateCuts: segmentPipeline?.candidateCuts || [],
+        segmentPipeline,
+        final_segments: segmentPipeline?.segments || [],
+        material_extraction: materialExtraction,
+        material_clips: materialExtraction.clips
+      };
 
       this.searchIndexer.indexVideo({
         bvid,
         duration,
-        frames: visualFrames.length ? visualFrames : fallbackFrames,
+        frames: materialSourceFrames,
         transcriptSegments: finalResult.transcript_segments,
         visualCuts,
         segments: finalResult.final_segments

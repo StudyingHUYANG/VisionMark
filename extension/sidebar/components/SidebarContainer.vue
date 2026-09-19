@@ -36,6 +36,16 @@
         :hot-words="hotWords"
       />
 
+      <MaterialClips
+        v-if="!loading && !error"
+        :bvid="bvid"
+        :video-title="aiTitle"
+        :clips="materialClips"
+        @seek="handleSeek"
+      />
+
+      <LocalClipCollection />
+
       <TimelineList
         :segments="segments"
         :active-key="activeKey"
@@ -67,6 +77,8 @@ import SemanticSearch from './SemanticSearch.vue';
 import AnalysisProgress from './AnalysisProgress.vue';
 import SummaryCard from './SummaryCard.vue';
 import AIAnalysisDetails from './AIAnalysisDetails.vue';
+import MaterialClips from './MaterialClips.vue';
+import LocalClipCollection from './LocalClipCollection.vue';
 import TimelineList from './TimelineList.vue';
 import ConfirmDialog from './ConfirmDialog.vue';
 import ModelConfigDialog from './ModelConfigDialog.vue';
@@ -109,6 +121,10 @@ const props = defineProps({
     default: () => []
   },
   hotWords: {
+    type: Array,
+    default: () => []
+  },
+  materialClips: {
     type: Array,
     default: () => []
   },
