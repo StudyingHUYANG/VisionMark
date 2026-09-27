@@ -12,6 +12,7 @@
   "options_page": "options/options.html",
   "host_permissions": [
     "https://www.bilibili.com/*",
+    "https://*.bilibili.com/*",
     "http://localhost:8080/*",
     "http://localhost:3000/*",
     "http://127.0.0.1:8080/*",
@@ -23,6 +24,9 @@
       "16": "icons/icon16.png",
       "48": "icons/icon48.png"
     }
+  },
+  "background": {
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {

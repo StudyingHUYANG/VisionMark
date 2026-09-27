@@ -17,14 +17,14 @@
               <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
             </button>
           </div>
-          
+
           <div class="vm-dialog__content">
             <div v-if="timestamp" class="vm-dialog__time">
               <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
               出现时间: {{ timestamp }}
             </div>
             <div class="vm-dialog__desc">
-              <span class="vm-dialog__desc-label">释义:</span> 
+              <span class="vm-dialog__desc-label">释义:</span>
               {{ explanation || '暂无释义' }}
             </div>
           </div>

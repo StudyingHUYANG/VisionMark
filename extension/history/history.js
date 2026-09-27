@@ -29,7 +29,6 @@ async function getToken() {
 async function loadSegments() {
   console.log('正在加载标注记录...');
   const token = await getToken();
-  console.log('获取到的token:', token ? '存在' : '不存在');
   if (!token) {
     document.getElementById('segments-body').innerHTML =
       '<tr><td colspan="5" class="empty">请先登录插件</td></tr>';
@@ -38,7 +37,7 @@ async function loadSegments() {
 
   try {
     // 使用正确的API端点，并添加分页参数
-    const response = await fetch(`${API_BASE}/stats/user/contributions`, {
+    const response = await fetch(`${API_BASE}/segments/user`, {
       headers: {
         'Authorization': `Bearer ${token}`
       }
@@ -47,7 +46,7 @@ async function loadSegments() {
     if (!response.ok) {
       if (response.status === 404) {
         document.getElementById('segments-body').innerHTML =
-          '<tr><td colspan="5" class="empty">后端API暂未实现（需要添加 GET /api/v1/segments/user 接口）</td></tr>';
+          '<tr><td colspan="5" class="empty">标注历史接口不可用</td></tr>';
         return;
       }
       throw new Error('加载失败');
@@ -84,15 +83,15 @@ function renderPage() {
 
   if (pageSegments.length === 0) {
     document.getElementById('segments-body').innerHTML =
-      '<tr><td colspan="6" class="empty">暂无标注记录</td></tr>';
+      '<tr><td colspan="5" class="empty">暂无标注记录</td></tr>';
     return;
   }
 
   const html = pageSegments.map(seg => `
     <tr>
       <td><a href="https://www.bilibili.com/video/${seg.bvid}" target="_blank" class="bilibili-link">${seg.bvid}</a></td>
-      <td>${seg.start_time.toFixed(1)}s - ${seg.end_time.toFixed(1)}s</td>
-      <td><span class="type-badge type-${seg.ad_type.replace('_ad', '').replace('product_', '')}">${typeLabels[seg.ad_type] || seg.ad_type}</span></td>
+      <td>${Number(seg.start_time).toFixed(1)}s - ${Number(seg.end_time).toFixed(1)}s</td>
+      <td><span class="type-badge type-${String(seg.ad_type).replace('_ad', '').replace('product_', '')}">${typeLabels[seg.ad_type] || seg.ad_type}</span></td>
       <td>${new Date(seg.created_at || Date.now()).toLocaleDateString()}</td>
       <td>
         <button class="btn-jump" onclick="jumpToVideo('${seg.bvid}', ${seg.start_time})">跳转</button>
@@ -151,29 +150,6 @@ function jumpToVideo(bvid, startTime) {
     url: `https://www.bilibili.com/video/${bvid}?t=${Math.floor(startTime)}`
   });
 }
-  if (!confirm(`确定要删除视频 ${bvid} 的这条标注吗？`)) return;
-
-  const token = await getToken();
-  try {
-    const response = await fetch(`${API_BASE}/segments/${id}`, {
-      method: 'DELETE',
-      headers: {
-        'Authorization': `Bearer ${token}`
-      }
-    });
-
-    if (!response.ok) throw new Error('删除失败');
-
-    // Remove from local list
-    allSegments = allSegments.filter(seg => seg.id !== id);
-    filterAndRender();
-    updateStats();
-
-  } catch (error) {
-    alert('删除失败: ' + error.message);
-  }
-
-
 // Event listeners
 document.addEventListener('DOMContentLoaded', () => {
   loadSegments();

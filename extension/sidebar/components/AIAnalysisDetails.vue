@@ -51,8 +51,8 @@
         </span>
       </div>
     </div>
-    
-    <HotWordDialog 
+
+    <HotWordDialog
       v-model:visible="dialogVisible"
       :word="currentWord"
       :explanation="currentExplanation"

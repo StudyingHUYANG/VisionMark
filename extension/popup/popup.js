@@ -84,14 +84,15 @@ async function safeFetch(url, options = {}) {
     throw createNetworkUnavailableError();
   }
 
+  const { timeoutMs = NETWORK_TIMEOUT_MS, ...fetchOptions } = options;
   const controller = options.signal ? null : new AbortController();
   const timeoutId = setTimeout(() => {
     if (controller) controller.abort();
-  }, NETWORK_TIMEOUT_MS);
+  }, timeoutMs);
 
   try {
     const response = await fetch(url, {
-      ...options,
+      ...fetchOptions,
       signal: options.signal || (controller ? controller.signal : undefined)
     });
     clearTimeout(timeoutId);
@@ -147,6 +148,26 @@ function getStoredUser() {
   }
 }
 
+function clearStoredAuthSession() {
+  localStorage.removeItem('adskipper_token');
+  localStorage.removeItem('adskipper_user');
+  resetUserInfoCache();
+  chrome.storage.local.remove(['adskipper_token']);
+}
+
+function isJwtExpired(token) {
+  try {
+    const payloadPart = String(token || '').split('.')[1];
+    if (!payloadPart) return true;
+    const normalized = payloadPart.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
+    const payload = JSON.parse(atob(padded));
+    return !Number.isFinite(payload.exp) || payload.exp * 1000 <= Date.now();
+  } catch (error) {
+    return true;
+  }
+}
+
 // 统一的API请求函数
 async function apiRequest(endpoint, options = {}) {
   try {
@@ -169,7 +190,11 @@ async function apiRequest(endpoint, options = {}) {
     }
     
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || '请求失败');
+    if (res.status === 401) {
+      clearStoredAuthSession();
+      showLoginForm();
+    }
+    if (!res.ok) throw new Error(data.message || data.error || `请求失败（HTTP ${res.status}）`);
     return data;
   } catch(err) {
     if (err.code !== NETWORK_ERROR_CODE) {
@@ -183,6 +208,12 @@ async function apiRequest(endpoint, options = {}) {
 async function checkAuth() {
   const token = localStorage.getItem('adskipper_token');
   if (!token) {
+    showLoginForm();
+    return false;
+  }
+
+  if (isJwtExpired(token)) {
+    clearStoredAuthSession();
     showLoginForm();
     return false;
   }
@@ -248,20 +279,14 @@ async function showUserPanel(user) {
 // 加载用户标注数量
 async function loadUserContributionCount() {
   try {
-    // 首先获取当前用户的ID
-    const userInfo = await getCurrentUserInfo();
-    const userId = await getUserIdByUsername(userInfo.username);
-    
-    if (userId) {
-      // 调用用户贡献API获取标注总数
-      const response = await safeFetch(`${API_BASE}/stats/user/contributions?user_id=${userId}&page_size=1`);
-      if (response.ok) {
-        const data = await response.json();
-        if (data.code === 200) {
-          document.getElementById('display-count').textContent = data.data.total || 0;
-          console.log('[Popup] 标注数量已更新:', data.data.total);
-        }
-      }
+    const token = localStorage.getItem('adskipper_token');
+    if (!token) return;
+    const response = await safeFetch(`${API_BASE}/segments/user`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (response.ok) {
+      const data = await response.json();
+      document.getElementById('display-count').textContent = data.segments?.length || 0;
     }
   } catch(err) {
     if (err.code !== NETWORK_ERROR_CODE) {
@@ -392,13 +417,9 @@ function toggleMode() {
 }
 
 function logout() {
-  localStorage.removeItem('adskipper_token');
-  localStorage.removeItem('adskipper_user');
-  resetUserInfoCache();
+  clearStoredAuthSession();
   resetModelConfigForm();
   setModelConfigFeedback('', '');
-  // 同时清理 chrome.storage.local
-  chrome.storage.local.remove(['adskipper_token']);
   showLoginForm();
 }
 
@@ -706,9 +727,10 @@ async function handleModelConfigTest() {
 
   const trimmedApiKey = String(modelConfigState.form.apiKey || '').trim();
   const useDefaultKey = modelConfigState.effectiveSource === 'system_default' && !trimmedApiKey;
+  const hasSavedKey = modelConfigState.hasCustomConfig && modelConfigState.hasApiKey;
 
-  if (!trimmedApiKey && !useDefaultKey) {
-    setModelConfigFeedback('error', '请重新输入 API Key 以测试当前配置');
+  if (!trimmedApiKey && !useDefaultKey && !hasSavedKey) {
+    setModelConfigFeedback('error', '请先填写 API Key');
     renderModelConfigPanel();
     return;
   }
@@ -720,6 +742,7 @@ async function handleModelConfigTest() {
   try {
     const result = await apiRequest('/model-config/test', {
       method: 'POST',
+      timeoutMs: 30000,
       body: JSON.stringify({
         ...buildModelConfigPayload(true),
         useDefaultKey
