@@ -7,12 +7,52 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const config = require('./config.js');
+const modelConfigRouter = require('./routes/modelConfig.js');
+const http = require('http');
+const WebSocket = require('ws');
 
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 const JWT_SECRET = config.JWT_SECRET;
 
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
+app.use('/api/v1/model-config', modelConfigRouter);
+
+// WebSocket 连接处理
+wss.on('connection', (ws, req) => {
+  console.log('[WS] Client connected');
+
+  // 心跳检测
+  ws.isAlive = true;
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+
+  ws.on('message', (message) => {
+    console.log('[WS] Received:', message.toString());
+    // 这里可以添加消息处理逻辑，例如广播给其他客户端或处理特定业务
+    // ws.send(JSON.stringify({ type: 'echo', data: message }));
+  });
+
+  ws.on('close', () => {
+    console.log('[WS] Client disconnected');
+  });
+});
+
+// 定期发送 ping 以检测死连接
+const interval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
+wss.on('close', () => {
+  clearInterval(interval);
+});
 
 const db = require('./database/db');
 
@@ -40,12 +80,6 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS annotations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     video_id INTEGER NOT NULL,
-    start_time REAL,
-    end_time REAL,
-    ad_type TEXT,
-    contributor_id INTEGER,
-    is_active BOOLEAN DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     source_type TEXT NOT NULL,              -- AI / HUMAN
     submitter_id INTEGER,                   -- HUMAN时是用户id，AI时可为空
     submitter_name TEXT,                    -- HUMAN时是用户名，AI时写'AI'
@@ -56,7 +90,22 @@ db.exec(`
     transcript TEXT,
     score REAL,
     content_json TEXT NOT NULL,             -- 统一存完整JSON
-    model_name TEXT                        -- AI模型名
+    model_name TEXT,                        -- AI模型名
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS user_api_configs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'qwen',
+    api_key TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    is_enabled INTEGER DEFAULT 1,
+    extra_config TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, provider)
   );
 
 `);
@@ -131,21 +180,82 @@ app.get('/api/v1/segments', (req, res) => {
 
   if (!video) return res.json({ segments: [] });
 
-  const annotations = db.prepare(`
+  const allAnnotations = db.prepare(`
     SELECT *
     FROM annotations
     WHERE video_id = ?
+    ORDER BY id DESC
   `).all(video.id);
 
-  // 🔥 从 annotations 提取所有广告段
-  const segments = annotations
+  let ai_title = '';
+  let ai_summary = '';
+  let knowledge_points = [];
+  let hot_words = [];
+  let visual_cuts = [];
+  let visual_cut_stats = null;
+  let keyword_cuts = [];
+  let candidateCuts = [];
+  let segmentPipeline = null;
+  let final_segments = [];
+
+  const aiAnnotation = allAnnotations.find(row => row.source_type === 'AI' && row.annotation_type === 'full_analysis');
+  if (aiAnnotation) {
+    const content = safeParseContent(aiAnnotation.content_json);
+    if (content.meta) {
+      ai_title = content.meta.title || aiAnnotation.title || '';
+    }
+    if (content.content_analysis) {
+      ai_summary = content.content_analysis.summary || aiAnnotation.summary || '';
+      knowledge_points = content.content_analysis.knowledge_points || [];
+      hot_words = content.content_analysis.hot_words || [];
+      visual_cuts = content.content_analysis.visual_cuts || [];
+      visual_cut_stats = content.content_analysis.visual_cut_stats || null;
+      keyword_cuts = content.content_analysis.keyword_cuts || [];
+      candidateCuts = content.content_analysis.candidateCuts || [];
+      segmentPipeline = content.content_analysis.segmentPipeline || null;
+      final_segments = content.content_analysis.segments || [];
+    }
+  }
+
+  // 只保留最新的一条完整AI分析，或者人工标注
+  const validAnnotations = allAnnotations.filter(row => {
+    if (row.source_type === 'AI' && row.annotation_type === 'full_analysis') {
+      return aiAnnotation && row.id === aiAnnotation.id;
+    }
+    return true; // 保留所有 HUMAN/手工标注
+  });
+
+  // 🔥 从 validAnnotations 提取所有广告段，避免同个视频的多次AI分析产生大重负片段
+  const segments = validAnnotations
     .flatMap(row => {
       const content = safeParseContent(row.content_json);
-      return extractLegacyAdSegments(content);
+      return extractLegacyAdSegments(content).map((seg) => {
+        const shouldPopup = inferPopupAction(seg);
+        const segmentContent = resolveSegmentContent(seg, row);
+        return {
+          ...seg,
+          action: shouldPopup ? 'popup' : 'skip',
+          is_ai_segment: row.source_type === 'AI',
+          content: segmentContent,
+          description: segmentContent
+        };
+      });
     })
     .sort((a, b) => a.start_time - b.start_time);
 
-    res.json({ segments });
+    res.json({
+      segments,
+      ai_title,
+      ai_summary,
+      knowledge_points,
+      hot_words,
+      visual_cuts,
+      visual_cut_stats,
+      keyword_cuts,
+      candidateCuts,
+      segmentPipeline,
+      final_segments
+    });
   });
 
 app.post('/api/v1/segments', authenticateToken, (req, res) => {
@@ -255,13 +365,85 @@ function extractLegacyAdSegments(content) {
   return [];
 }
 
+function inferPopupAction(segment) {
+  if (!segment || typeof segment !== 'object') return false;
+
+  if (typeof segment.action === 'string') {
+    const action = segment.action.trim().toLowerCase();
+    if (action === 'popup') return true;
+    if (action === 'skip') return false;
+  }
+
+  const highlightValue = typeof segment.highlight === 'string'
+    ? segment.highlight.trim().toLowerCase()
+    : segment.highlight;
+
+  if (
+    highlightValue === true ||
+    highlightValue === 1 ||
+    highlightValue === '1' ||
+    highlightValue === 'true' ||
+    highlightValue === 'yes' ||
+    highlightValue === 'y' ||
+    highlightValue === 'popup' ||
+    highlightValue === 'high-energy' ||
+    highlightValue === 'high_energy'
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function pickText(...candidates) {
+  for (const value of candidates) {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+      continue;
+    }
+
+    if (value && typeof value === 'object') {
+      const nestedText = pickText(
+        value.text,
+        value.content,
+        value.description,
+        value.desc,
+        value.explanation,
+        value.reason,
+        value.note,
+        value.summary,
+        value.title
+      );
+      if (nestedText) return nestedText;
+    }
+  }
+
+  return null;
+}
+
+function resolveSegmentContent(segment, annotationRow) {
+  return pickText(
+    segment?.content,
+    segment?.description,
+    segment?.desc,
+    segment?.explanation,
+    segment?.reason,
+    segment?.note,
+    segment?.text
+  );
+}
+
 // 引入路由文件
 const statsRouter = require('./routes/stats.js');
 const segmentsRouter = require('./routes/segments.js');
-const videoAnalysisRouter = require('./routes/videoAnalysis.js');
+const createVideoAnalysisRouter = require('./routes/videoAnalysis.js');
+const videoAnalysisRouter = createVideoAnalysisRouter(wss);
+const searchRouter = require('./routes/search.js');
 
 // 注册路由
 app.use('/api/v1/stats', statsRouter);
+app.use('/api/v1/search', searchRouter);
 // app.use('/api/v1/segments', segmentsRouter); // 已在上面定义了 segments 相关 API，这里注释掉路由注册
 app.use('/video-analysis', videoAnalysisRouter); // AI视频分析路由
 
@@ -311,6 +493,8 @@ app.get('/api/v1/video-view', authenticateToken, (req, res) => {
           summary: null,
           transcript: null,
           ad_segments: [],
+          visual_cuts: [],
+          visual_cut_stats: null,
           knowledge_points: [],
           hot_words: [],
           analyzed_at: null
@@ -318,20 +502,27 @@ app.get('/api/v1/video-view', authenticateToken, (req, res) => {
       });
     }
 
-    const annotations = db.prepare(`
+    const allAnnotations = db.prepare(`
       SELECT *
       FROM annotations
       WHERE video_id = ?
       ORDER BY id DESC
     `).all(video.id);
 
-    const latestAI = annotations.find(row => row.source_type === 'AI') || null;
+    const latestAI = allAnnotations.find(row => row.source_type === 'AI') || null;
 
     const aiContent = latestAI ? safeParseContent(latestAI.content_json) : null;
     const aiAnalysis = aiContent?.content_analysis || {};
 
+    const validAnnotations = allAnnotations.filter(row => {
+      if (row.source_type === 'AI' && row.annotation_type === 'full_analysis') {
+        return latestAI && row.id === latestAI.id;
+      }
+      return true;
+    });
+
     // 收集所有广告段，按时间顺序返回
-    const allAdSegments = annotations
+    const allAdSegments = validAnnotations
       .flatMap(row => {
         const content = safeParseContent(row.content_json);
         const segments = extractLegacyAdSegments(content);
@@ -339,9 +530,10 @@ app.get('/api/v1/video-view', authenticateToken, (req, res) => {
         return segments.map(seg => ({
           start_time: typeof seg.start_time === 'number' ? seg.start_time : 0,
           end_time: typeof seg.end_time === 'number' ? seg.end_time : 0,
-          description: seg.description || null,
+          description: resolveSegmentContent(seg, row),
           highlight: !!seg.highlight,
-          ad_type: seg.ad_type || 'soft_ad'
+          ad_type: seg.ad_type || 'soft_ad',
+          is_ai_segment: row.source_type === 'AI'
         }));
       })
       .sort((a, b) => a.start_time - b.start_time);
@@ -353,6 +545,8 @@ app.get('/api/v1/video-view', authenticateToken, (req, res) => {
       summary: aiAnalysis.summary || latestAI?.summary || null,
       transcript: aiAnalysis.transcript || latestAI?.transcript || null,
       ad_segments: allAdSegments,
+      visual_cuts: aiAnalysis.visual_cuts || [],
+      visual_cut_stats: aiAnalysis.visual_cut_stats || null,
       knowledge_points: aiAnalysis.knowledge_points || [],
       hot_words: aiAnalysis.hot_words || [],
       analyzed_at: aiAnalysis.analyzed_at || null
@@ -372,7 +566,8 @@ app.get('/api/v1/video-view', authenticateToken, (req, res) => {
 });
 
 // 使用配置文件的端口
-app.listen(config.PORT, '0.0.0.0', () => {
+server.listen(config.PORT, '0.0.0.0', () => {
   console.log('[Server] http://localhost:' + config.PORT);
+  console.log('[WS] WebSocket server is running');
   console.log('[Auth] admin/admin 登录');
 });

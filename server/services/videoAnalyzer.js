@@ -1,42 +1,21 @@
-﻿const axios = require('axios');
+const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
+const { exec, spawn, spawnSync } = require('child_process');
 const util = require('util');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const OpenAI = require('openai');
+const { buildEffectiveModelConfig } = require('./modelConfigService');
+const { ossClient, hasOssConfig } = require('../utils/oss');
+const EmbeddingService = require('./embeddingService');
+const vectorDb = require('./vectorDb');
+const BilibiliDownloader = require('./bilibiliDownloader');
+const { analyzeVisualCuts, analyzeSceneCutsWithFfmpeg } = require('./visualCutDetector');
+const keywordCutService = require('./segment/keywordCuts');
+const { detectAudioCuts } = require('./segment/audioCuts');
+const { runSegmentPipeline } = require('./segmentPipeline');
 
 const execPromise = util.promisify(exec);
-
-// 通义千问API配置 - 使用OpenAI兼容模式
-const QWEN_API_KEY = process.env.QWEN_API_KEY || 'sk-df7f07a45dee431fb8cc9b6453df5f34';
-
-// 创建OpenAI客户端
-const openaiClient = new OpenAI({
-  apiKey: QWEN_API_KEY,
-  baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-});
-
-// 阿里云OSS配置 - 用于上传音频文件
-const OSS = require('ali-oss');
-
-const hasOssConfig = Boolean(
-  process.env.OSS_ACCESS_KEY_ID &&
-  process.env.OSS_ACCESS_KEY_SECRET &&
-  process.env.OSS_BUCKET
-);
-
-let ossClient = null;
-if (hasOssConfig) {
-  ossClient = new OSS({
-    region: process.env.OSS_REGION || 'oss-cn-beijing',
-    accessKeyId: process.env.OSS_ACCESS_KEY_ID,
-    accessKeySecret: process.env.OSS_ACCESS_KEY_SECRET,
-    bucket: process.env.OSS_BUCKET
-  });
-} else {
-  console.warn('[VideoAnalyzer] OSS config missing, audio transcription upload will be skipped.');
-}
 
 // 时间格式化辅助函数
 function formatTime(seconds) {
@@ -45,10 +24,104 @@ function formatTime(seconds) {
   return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
 
+function clampPercent(percent) {
+  const numericPercent = Number(percent);
+  if (!Number.isFinite(numericPercent)) return null;
+  return Math.max(0, Math.min(100, Math.round(numericPercent)));
+}
+
+function resolveFfprobePath() {
+  const siblingFfprobePath = ffmpegPath.replace(/ffmpeg$/, 'ffprobe');
+  if (fs.existsSync(siblingFfprobePath)) return siblingFfprobePath;
+
+  const probe = spawnSync('ffprobe', ['-version'], { encoding: 'utf8' });
+  if (!probe.error && probe.status === 0) return 'ffprobe';
+
+  return null;
+}
+
+function parsePtsTimes(text) {
+  return [...String(text || '').matchAll(/pts_time:([0-9]+(?:\.[0-9]+)?)/g)]
+    .map(match => Number(match[1]))
+    .filter(time => Number.isFinite(time) && time >= 0)
+    .filter((time, index, list) => index === 0 || Math.abs(time - list[index - 1]) > 0.001);
+}
+
+function buildFallbackAnalysisResult(reason, transcript = null, visualCuts = [], visualCutStats = null) {
+  const transcriptPreview = typeof transcript === 'string'
+    ? transcript
+      .split(/\r?\n/)
+      .map(line => line.replace(/^\[[^\]]+\]\s*/, '').trim())
+      .filter(Boolean)
+      .slice(0, 8)
+      .join(' ')
+    : '';
+
+  return {
+    title: 'AI分析暂不可用',
+    tags: [],
+    summary: transcriptPreview || '大模型分析暂不可用，已保留基础视频证据并进入降级分段流程。',
+    segments: [],
+    knowledge_points: [],
+    hot_words: [],
+    visual_cuts: visualCuts,
+    visual_cut_stats: visualCutStats,
+    raw_response: null,
+    fallback_reason: reason
+  };
+}
+
 class VideoAnalyzer {
-  constructor() {
-    this.downloadDir = path.join(__dirname, '../../downloads');
+  constructor(downloadDir, wss = null) {
+    this.downloadDir = downloadDir || path.join(__dirname, '../../downloads');
+    this.wss = wss; // WebSocket 服务器实例
     this.ensureDownloadDir();
+  }
+
+  getEffectiveModelConfig(userConfig = null) {
+    return buildEffectiveModelConfig(userConfig);
+  }
+
+  createOpenAIClient(modelConfig) {
+    return new OpenAI({
+      apiKey: modelConfig.apiKey,
+      baseURL: modelConfig.baseUrl
+    });
+  }
+
+  reportProgress(onProgress, stage, percent, message, detail = null) {
+    const progressData = {
+      stage,
+      percent: clampPercent(percent),
+      message,
+      detail,
+      updatedAt: new Date().toISOString()
+    };
+    
+    // 通过 WebSocket 推送给所有连接的客户端
+    if (this.wss) {
+      this.wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          try {
+            client.send(JSON.stringify({
+              type: 'progress',
+              data: progressData
+            }));
+          } catch (error) {
+            console.warn('[VideoAnalyzer] WebSocket 推送失败:', error.message);
+          }
+        }
+      });
+    }
+    
+    // 保持原有的回调方式兼容
+    if (typeof onProgress === 'function') {
+      try {
+        onProgress(progressData);
+      } catch (error) {
+        console.warn('[VideoAnalyzer] 进度上报失败:', error.message);
+      }
+    }
   }
 
   ensureDownloadDir() {
@@ -70,9 +143,9 @@ class VideoAnalyzer {
   }
 
   /**
-   * 使用yt-dlp下载B站视频
+   * 使用yt-dlp下载B站视频（支持手动cookies文件）
    */
-  async downloadVideo(bvid, url) {
+  async downloadVideo(bvid, url, onProgress = null, cookiesPath = null) {
     const outputTemplate = path.join(this.downloadDir, `${bvid}.%(ext)s`);
 
     // 检查是否已下载（查找匹配的文件）
@@ -80,17 +153,122 @@ class VideoAnalyzer {
     if (existingFiles.length > 0) {
       const existingPath = path.join(this.downloadDir, existingFiles[0]);
       console.log(`[VideoAnalyzer] 视频已存在: ${existingPath}`);
+      this.reportProgress(onProgress, 'download', 20, '视频已缓存，跳过下载');
       return existingPath;
     }
 
     console.log(`[VideoAnalyzer] 开始下载视频 ${bvid}...`);
+    this.reportProgress(onProgress, 'download', 5, '正在下载 0%');
+
+    // 构建基础参数（避免过多浏览器专有请求头触发风控）
+    const commonArgs = [
+      '-m', 'yt_dlp',
+      '--newline',
+      '--ffmpeg-location', ffmpegPath,
+      '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      '--referer', 'https://www.bilibili.com/',
+      '--no-check-certificate',
+      '--ignore-config',
+      '--no-warnings'
+    ];
+
+    const primaryArgs = [
+      ...commonArgs,
+      '--extractor-args', 'bilibili:use_wbi=true',
+      '--add-header', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      '--add-header', 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8',
+      '--extractor-retries', '2',
+      '--retries', '2',
+      '--fragment-retries', '2'
+    ];
+
+    const fallbackArgs = [
+      ...commonArgs,
+      '--extractor-args', 'bilibili:use_wbi=false',
+      '--extractor-retries', '3',
+      '--retries', '3',
+      '--fragment-retries', '3'
+    ];
+
+    const hasCookies = Boolean(cookiesPath && fs.existsSync(cookiesPath));
+
+    // 如果有cookies文件，添加 --cookies 参数
+    if (hasCookies) {
+      primaryArgs.push('--cookies', cookiesPath);
+      fallbackArgs.push('--cookies', cookiesPath);
+      console.log('[VideoAnalyzer] 使用临时 cookies 文件进行下载');
+
+      try {
+        const cookiesContent = fs.readFileSync(cookiesPath, 'utf8');
+        const requiredCookies = ['SESSDATA', 'bili_jct', 'DedeUserID'];
+        const missing = requiredCookies.filter(name => !new RegExp(`(?:^|\\n)[^\\n]*\\t${name}\\t`).test(cookiesContent));
+        if (missing.length > 0) {
+          console.warn(`[VideoAnalyzer] cookies 可能不完整，缺少: ${missing.join(', ')}`);
+        }
+      } catch (error) {
+        console.warn('[VideoAnalyzer] 读取 cookies 文件失败，继续尝试下载:', error.message);
+      }
+    } else {
+      console.log('[VideoAnalyzer] 无 cookies 文件，使用无认证模式下载');
+    }
+
+    primaryArgs.push('-o', outputTemplate, url);
+    fallbackArgs.push('-o', outputTemplate, url);
+
+    const runYtDlp = (args, modeLabel) => new Promise((resolve, reject) => {
+      const child = spawn('python', args, { windowsHide: true });
+      let outputTail = '';
+      let lastReportedPercent = -1;
+
+      const appendOutput = (text) => {
+        outputTail = `${outputTail}${text}`.slice(-8000);
+      };
+
+      const handleOutput = (chunk) => {
+        const text = chunk.toString();
+        appendOutput(text);
+
+        const matches = [...text.matchAll(/\[download\]\s+(\d+(?:\.\d+)?)%/g)];
+        if (matches.length === 0) return;
+
+        const rawPercent = Number(matches[matches.length - 1][1]);
+        if (!Number.isFinite(rawPercent)) return;
+
+        const downloadPercent = Math.max(0, Math.min(100, rawPercent));
+        const wholePercent = Math.floor(downloadPercent);
+        if (wholePercent === lastReportedPercent) return;
+
+        lastReportedPercent = wholePercent;
+        const mappedPercent = 5 + (downloadPercent / 100) * 15;
+        this.reportProgress(onProgress, 'download', mappedPercent, `正在下载 ${wholePercent}%`);
+      };
+
+      child.stdout.on('data', handleOutput);
+      child.stderr.on('data', handleOutput);
+      child.on('error', reject);
+      child.on('close', (code) => {
+        if (code === 0) {
+          this.reportProgress(onProgress, 'download', 20, '视频下载完成');
+          resolve();
+          return;
+        }
+        reject(new Error(`yt-dlp退出码 ${code}(${modeLabel}): ${outputTail || '无输出'}`));
+      });
+    });
 
     try {
-      // 使用yt-dlp下载（使用shell:true来确保找到正确的命令）
-      // 使用 @ffmpeg-installer/ffmpeg 提供的路径，避免依赖系统 ffmpeg
-      const command = `python -m yt_dlp --ffmpeg-location "${ffmpegPath}" -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${outputTemplate}" "${url}"`;
+      try {
+        await runYtDlp(primaryArgs, 'primary');
+      } catch (firstError) {
+        const firstMessage = String(firstError?.message || '');
+        const isLikely412 = /412|Precondition Failed/i.test(firstMessage);
+        if (!isLikely412) throw firstError;
 
-      await execPromise(command, { shell: true });
+        console.warn('[VideoAnalyzer] 检测到 B 站风控 412，切换兼容参数重试一次');
+        this.reportProgress(onProgress, 'download', 8, '检测到风控，正在重试下载');
+        await runYtDlp(fallbackArgs, 'fallback');
+      }
 
       // 查找下载的视频文件
       const downloadedFiles = fs.readdirSync(this.downloadDir).filter(f => f.startsWith(bvid) && f.endsWith('.mp4'));
@@ -100,10 +278,48 @@ class VideoAnalyzer {
 
       const videoPath = path.join(this.downloadDir, downloadedFiles[0]);
       console.log(`[VideoAnalyzer] 视频下载完成: ${videoPath}`);
+      
+      if (cookiesPath && fs.existsSync(cookiesPath)) {
+        console.log('[VideoAnalyzer] 成功使用 cookies 下载高画质视频');
+      } else {
+        console.log('[VideoAnalyzer] 使用无 cookies 模式下载（可能为低画质）');
+      }
+      
       return videoPath;
     } catch (error) {
       console.error('[VideoAnalyzer] 下载失败:', error);
-      throw new Error(`视频下载失败: ${error.message}`);
+      
+      if (!hasCookies) {
+        const finalError = new Error(`视频下载失败: ${error.message}。建议：请确保已登录 Bilibili 账号以获得最佳分析体验。`);
+        console.error('[VideoAnalyzer] 下载失败详情:', finalError);
+        throw finalError;
+      } else {
+        const finalError = new Error(`视频下载失败: ${error.message}。即使使用了 cookies 仍然失败，请刷新 Bilibili 登录状态、更新 yt-dlp 后重试。`);
+        console.error('[VideoAnalyzer] 下载失败详情:', finalError);
+        throw finalError;
+      }
+    }
+  }
+
+  /**
+   * 混合下载策略：优先使用 Bilibili 专用下载器，失败后回退到 yt-dlp
+   */
+  async downloadVideoHybrid(bvid, url, onProgress = null, cookiesPath = null) {
+    // 先尝试 Bilibili 专用下载器
+    try {
+      console.log('[VideoAnalyzer] 尝试使用 Bilibili 专用下载器...');
+      const bilibiliDownloader = new BilibiliDownloader();
+      const result = await bilibiliDownloader.downloadVideo(url, (progress) => {
+        this.reportProgress(onProgress, progress.stage, progress.percent, progress.message);
+      });
+      console.log('[VideoAnalyzer] Bilibili 专用下载器成功');
+      return result;
+    } catch (bilibiliError) {
+      console.warn('[VideoAnalyzer] Bilibili 专用下载器失败:', bilibiliError.message);
+      
+      // 回退到 yt-dlp
+      console.log('[VideoAnalyzer] 回退到 yt-dlp 下载器...');
+      return await this.downloadVideo(bvid, url, onProgress, cookiesPath);
     }
   }
 
@@ -140,14 +356,25 @@ class VideoAnalyzer {
    */
   async extractKeyframeTimestamps(videoPath) {
     try {
-      const command = `"${ffmpegPath.replace(/ffmpeg$/, 'ffprobe')}" -v error -select_streams v -skip_frame nokey -show_entries frame=pkt_pts_time -of csv=p=0 "${videoPath}"`;
-      const { stdout } = await execPromise(command, { shell: true });
-      const timestamps = stdout
-        .split(/\r?\n/)
-        .map(line => line.trim())
-        .filter(line => line)
-        .map(line => parseFloat(line))
-        .filter(t => !Number.isNaN(t));
+      const ffprobePath = resolveFfprobePath();
+      if (ffprobePath) {
+        const command = `"${ffprobePath}" -v error -select_streams v -skip_frame nokey -show_entries frame=pkt_pts_time -of csv=p=0 "${videoPath}"`;
+        const { stdout } = await execPromise(command, { shell: true, maxBuffer: 8 * 1024 * 1024 });
+        const timestamps = stdout
+          .split(/\r?\n/)
+          .map(line => line.trim())
+          .filter(line => line)
+          .map(line => parseFloat(line))
+          .filter(t => !Number.isNaN(t));
+        if (timestamps.length > 0) return timestamps;
+      }
+
+      const command = `"${ffmpegPath}" -skip_frame nokey -i "${videoPath}" -map 0:v:0 -an -vf showinfo -f null -`;
+      const { stderr } = await execPromise(command, { shell: true, maxBuffer: 16 * 1024 * 1024 });
+      const timestamps = parsePtsTimes(stderr);
+      if (timestamps.length > 0) {
+        console.log(`[VideoAnalyzer] 使用 ffmpeg showinfo 提取关键帧时间戳: ${timestamps.length} 个`);
+      }
       return timestamps;
     } catch (error) {
       console.warn('[VideoAnalyzer] 提取关键帧时间戳失败，回退到均匀采样', error.message);
@@ -160,7 +387,7 @@ class VideoAnalyzer {
    * @param {string} videoPath - 视频路径
    * @param {string} bvid - 视频BV号
    */
-  async extractFrames(videoPath, bvid) {
+  async extractFrames(videoPath, bvid, onProgress = null) {
     const framesDir = path.join(this.downloadDir, `${bvid}_frames`);
 
     if (!fs.existsSync(framesDir)) {
@@ -168,10 +395,12 @@ class VideoAnalyzer {
     }
 
     console.log(`[VideoAnalyzer] 提取视频关键帧...`);
+    this.reportProgress(onProgress, 'frames', 22, '正在准备抽帧');
 
     try {
       // 获取视频实际时长
       const duration = await this.getVideoDuration(videoPath);
+      this.reportProgress(onProgress, 'frames', 24, '正在定位关键帧');
 
       // 尝试使用ffprobe获取关键帧时间戳（更接近场景切换）
       let timestamps = await this.extractKeyframeTimestamps(videoPath);
@@ -192,6 +421,7 @@ class VideoAnalyzer {
       }
 
       console.log(`[VideoAnalyzer] 将提取 ${timestamps.length} 张关键帧（基于场景/关键帧，间隔可变）`);
+      this.reportProgress(onProgress, 'frames', 25, `正在抽帧 0/${timestamps.length}`);
 
       // 提取关键帧截图，文件名包含时间戳（毫秒），便于后续排序和提示
       for (let i = 0; i < timestamps.length; i++) {
@@ -200,9 +430,12 @@ class VideoAnalyzer {
         const outputPath = path.join(framesDir, `frame_${String(i + 1).padStart(3, '0')}_${ms}.jpg`);
         const command = `"${ffmpegPath}" -ss ${ts} -i "${videoPath}" -frames:v 1 -q:v 2 -vf "scale=640:-1" "${outputPath}" -y`;
         await execPromise(command, { shell: true });
+        const framePercent = 25 + ((i + 1) / Math.max(timestamps.length, 1)) * 15;
+        this.reportProgress(onProgress, 'frames', framePercent, `正在抽帧 ${i + 1}/${timestamps.length}`);
       }
 
       console.log(`[VideoAnalyzer] 关键帧提取完成，保存在: ${framesDir}`);
+      this.reportProgress(onProgress, 'frames', 40, '关键帧提取完成');
       return { framesDir, duration };
     } catch (error) {
       console.error('[VideoAnalyzer] 关键帧提取失败:', error);
@@ -211,24 +444,125 @@ class VideoAnalyzer {
   }
 
   /**
+   * 抽取用于视觉切点检测的低分辨率连续采样帧。
+   * 这组帧和发给大模型的关键帧分开，避免 30 帧上限影响切点召回。
+   */
+  async extractVisualProbeFrames(videoPath, bvid, duration, onProgress = null, options = {}) {
+    const framesDir = path.join(this.downloadDir, `${bvid}_visual_frames`);
+    const manifestPath = path.join(framesDir, 'manifest.json');
+    const sampleFps = Number.isFinite(Number(options.sampleFps)) && Number(options.sampleFps) > 0
+      ? Number(options.sampleFps)
+      : 1;
+    const maxFrames = Number.isFinite(Number(options.maxFrames)) && Number(options.maxFrames) > 1
+      ? Math.floor(Number(options.maxFrames))
+      : 900;
+    const scaleWidth = Number.isFinite(Number(options.scaleWidth)) && Number(options.scaleWidth) > 0
+      ? Math.floor(Number(options.scaleWidth))
+      : 320;
+    const safeDuration = Number.isFinite(Number(duration)) && Number(duration) > 0
+      ? Number(duration)
+      : 300;
+    const targetFrames = Math.max(2, Math.min(maxFrames, Math.ceil(safeDuration * sampleFps)));
+    const effectiveFps = targetFrames / safeDuration;
+
+    if (fs.existsSync(manifestPath)) {
+      try {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        const cacheMatchesOptions =
+          Math.abs(Number(manifest.sample_fps) - sampleFps) < 0.0001 &&
+          Number(manifest.scale_width) === scaleWidth &&
+          Number(manifest.max_frames || maxFrames) === maxFrames &&
+          path.resolve(String(manifest.source_video || '')) === path.resolve(videoPath) &&
+          Math.abs(Number(manifest.duration || 0) - safeDuration) < 0.5;
+        const cachedFrames = Array.isArray(manifest.frames)
+          ? manifest.frames
+            .map(frame => ({
+              framePath: path.join(framesDir, frame.file),
+              time: Number(frame.time)
+            }))
+            .filter(frame => fs.existsSync(frame.framePath) && Number.isFinite(frame.time))
+          : [];
+
+        if (cacheMatchesOptions && cachedFrames.length >= 2) {
+          console.log(`[VideoAnalyzer] 视觉检测帧已缓存: ${cachedFrames.length} 张`);
+          this.reportProgress(onProgress, 'visual', 41, '视觉检测帧已缓存');
+          return cachedFrames;
+        }
+      } catch (error) {
+        console.warn('[VideoAnalyzer] 读取视觉帧缓存失败，将重新抽帧:', error.message);
+      }
+    }
+
+    if (!fs.existsSync(framesDir)) {
+      fs.mkdirSync(framesDir, { recursive: true });
+    }
+
+    for (const file of fs.readdirSync(framesDir)) {
+      if (/\.(jpe?g|png)$/i.test(file)) {
+        fs.unlinkSync(path.join(framesDir, file));
+      }
+    }
+
+    console.log(`[VideoAnalyzer] 抽取视觉检测帧: target=${targetFrames}, fps=${effectiveFps.toFixed(4)}`);
+    this.reportProgress(onProgress, 'visual', 41, '正在抽取视觉检测帧');
+
+    const outputPattern = path.join(framesDir, 'visual_%06d.jpg');
+    const command = `"${ffmpegPath}" -i "${videoPath}" -vf "fps=${effectiveFps.toFixed(4)},scale=${scaleWidth}:-1" -q:v 5 "${outputPattern}" -y`;
+    await execPromise(command, { shell: true });
+
+    const files = fs.readdirSync(framesDir)
+      .filter(file => /^visual_\d+\.jpg$/i.test(file))
+      .sort();
+
+    const frames = files.map((file, index) => ({
+      framePath: path.join(framesDir, file),
+      time: Number((index / effectiveFps).toFixed(3))
+    }));
+
+    fs.writeFileSync(
+      manifestPath,
+      JSON.stringify({
+        generated_at: new Date().toISOString(),
+        source_video: videoPath,
+        duration: safeDuration,
+        sample_fps: sampleFps,
+        max_frames: maxFrames,
+        effective_fps: effectiveFps,
+        scale_width: scaleWidth,
+        frames: frames.map(frame => ({
+          file: path.basename(frame.framePath),
+          time: frame.time
+        }))
+      }, null, 2),
+      'utf8'
+    );
+
+    console.log(`[VideoAnalyzer] 视觉检测帧抽取完成: ${frames.length} 张`);
+    return frames;
+  }
+
+  /**
    * 从视频中提取音频
    * @param {string} videoPath - 视频路径
    * @param {string} bvid - 视频BV号
    */
-  async extractAudio(videoPath, bvid) {
+  async extractAudio(videoPath, bvid, onProgress = null) {
     const audioPath = path.join(this.downloadDir, `${bvid}.wav`);
 
     // 检查是否已提取（同时检查旧的.mp3文件）
     const oldMp3Path = path.join(this.downloadDir, `${bvid}.mp3`);
     if (fs.existsSync(audioPath)) {
       console.log(`[VideoAnalyzer] 音频已存在: ${audioPath}`);
+      this.reportProgress(onProgress, 'audio', 44, '音频已缓存，准备识别');
       return audioPath;
     } else if (fs.existsSync(oldMp3Path)) {
       console.log(`[VideoAnalyzer] 找到旧的MP3音频，将使用: ${oldMp3Path}`);
+      this.reportProgress(onProgress, 'audio', 44, '音频已缓存，准备识别');
       return oldMp3Path;
     }
 
     console.log(`[VideoAnalyzer] 提取音频为WAV格式...`);
+    this.reportProgress(onProgress, 'audio', 42, '正在提取音频');
 
     try {
       // 使用ffmpeg提取音频，采样率16000Hz，单声道，使用WAV格式（更兼容paraformer-v2）
@@ -236,6 +570,7 @@ class VideoAnalyzer {
       await execPromise(command, { shell: true });
 
       console.log(`[VideoAnalyzer] 音频提取完成: ${audioPath}`);
+      this.reportProgress(onProgress, 'audio', 44, '音频提取完成');
       return audioPath;
     } catch (error) {
       console.error('[VideoAnalyzer] 音频提取失败:', error);
@@ -248,12 +583,17 @@ class VideoAnalyzer {
    * @param {string} audioPath - 音频文件路径
    * @param {string} bvid - 视频BV号
    */
-  async transcribeAudio(audioPath, bvid) {
+  async transcribeAudio(audioPath, bvid, userConfig = null, onProgress = null) {
     console.log('[VideoAnalyzer] 开始语音识别...');
+    this.reportProgress(onProgress, 'speech', 45, '正在准备语音识别');
+
+    const modelConfig = this.getEffectiveModelConfig(userConfig);
+    const asrApiKey = modelConfig.apiKey;
 
     try {
       if (!ossClient) {
         console.warn('[VideoAnalyzer] OSS client unavailable, skip transcription.');
+        this.reportProgress(onProgress, 'speech', 58, '跳过语音识别，继续画面分析');
         return null;
       }
 
@@ -264,6 +604,7 @@ class VideoAnalyzer {
       // WAV文件较大，限制100MB（大约对应5-10分钟视频）
       if (fileSizeMB > 100) {
         console.warn(`[VideoAnalyzer] 音频文件过大(${fileSizeMB.toFixed(2)}MB)，跳过语音识别`);
+        this.reportProgress(onProgress, 'speech', 58, '音频较大，跳过语音识别');
         return null;
       }
 
@@ -271,6 +612,7 @@ class VideoAnalyzer {
 
       // 1. 上传音频到阿里云OSS
       console.log('[VideoAnalyzer] 上传音频到OSS...');
+      this.reportProgress(onProgress, 'speech', 47, '正在上传音频');
       const ossObjectName = `audio/${bvid}/${path.basename(audioPath)}`;
 
       try {
@@ -288,10 +630,11 @@ class VideoAnalyzer {
 
       // Step 1: 提交异步任务
       console.log('[VideoAnalyzer] 提交语音识别任务...');
+      this.reportProgress(onProgress, 'speech', 49, '正在提交语音识别任务');
       const submitResponse = await axios.post(
         'https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription',
         {
-          model: 'paraformer-v2',
+          model: modelConfig.asrModel,
           input: {
             file_urls: [audioUrl]
           },
@@ -304,7 +647,7 @@ class VideoAnalyzer {
         },
         {
           headers: {
-            'Authorization': `Bearer ${QWEN_API_KEY}`,
+            'Authorization': `Bearer ${asrApiKey}`,
             'Content-Type': 'application/json',
             'X-DashScope-Async': 'enable'  // 启用异步模式
           }
@@ -317,6 +660,7 @@ class VideoAnalyzer {
 
       const taskId = submitResponse.data.output.task_id;
       console.log('[VideoAnalyzer] 任务已提交，task_id:', taskId);
+      this.reportProgress(onProgress, 'speech', 50, '正在等待语音识别结果');
 
       // Step 2: 轮询任务结果
       console.log('[VideoAnalyzer] 等待任务完成...');
@@ -332,7 +676,7 @@ class VideoAnalyzer {
             `https://dashscope.aliyuncs.com/api/v1/tasks/${taskId}`,
             {
               headers: {
-                'Authorization': `Bearer ${QWEN_API_KEY}`,
+                'Authorization': `Bearer ${asrApiKey}`,
                 'Content-Type': 'application/json'
               }
             }
@@ -341,6 +685,8 @@ class VideoAnalyzer {
           const taskStatus = resultResponse.data.output?.task_status;
 
           console.log(`[VideoAnalyzer] 任务状态: ${taskStatus} (${attempts}/${maxAttempts})`);
+          const speechPercent = 50 + (attempts / maxAttempts) * 8;
+          this.reportProgress(onProgress, 'speech', speechPercent, `正在识别音频 ${attempts}/${maxAttempts}`);
 
           if (taskStatus === 'SUCCEEDED') {
             // 任务成功完成
@@ -416,6 +762,7 @@ class VideoAnalyzer {
 
                   console.log('[VideoAnalyzer] 语音识别完成（从transcription_url下载）');
                   console.log('[VideoAnalyzer] 转录内容预览:', transcriptText.substring(0, 500).replace(/\n/g, ' '));
+                  this.reportProgress(onProgress, 'speech', 58, '语音识别完成');
                   return transcriptText;
                 } catch (error) {
                   console.error('[VideoAnalyzer] 下载转录结果失败:', error.message);
@@ -435,10 +782,12 @@ class VideoAnalyzer {
 
                 console.log('[VideoAnalyzer] 语音识别完成');
                 console.log('[VideoAnalyzer] 转录内容预览:', transcript.substring(0, 500).replace(/\n/g, ' '));
+                this.reportProgress(onProgress, 'speech', 58, '语音识别完成');
                 return transcript;
               }
             }
             console.warn('[VideoAnalyzer] 任务成功但没有返回转录结果');
+            this.reportProgress(onProgress, 'speech', 58, '语音识别完成，未获得转录文本');
             return null;
           } else if (taskStatus === 'FAILED') {
             throw new Error('语音识别任务失败: ' + JSON.stringify(resultResponse.data.output?.message));
@@ -460,6 +809,7 @@ class VideoAnalyzer {
     } catch (error) {
       console.error('[VideoAnalyzer] 语音识别失败:', error.response?.data || error.message);
       // 如果识别失败，返回null，继续使用画面分析
+      this.reportProgress(onProgress, 'speech', 58, '语音识别失败，继续画面分析');
       return null;
     }
   }
@@ -468,14 +818,16 @@ class VideoAnalyzer {
    * 从音频中提取知识点
    * @param {string} transcript - 音频转录文本
    */
-  async extractKnowledgePoints(transcript) {
+  async extractKnowledgePoints(transcript, userConfig = null) {
     if (!transcript) return null;
 
     console.log('[VideoAnalyzer] 提取知识点...');
+    const modelConfig = this.getEffectiveModelConfig(userConfig);
+    const client = this.createOpenAIClient(modelConfig);
 
     try {
-      const response = await openaiClient.chat.completions.create({
-        model: 'qwen-turbo',
+      const response = await client.chat.completions.create({
+        model: modelConfig.textModel,
         messages: [
           {
             role: 'user',
@@ -522,14 +874,17 @@ ${transcript}
    * 识别热词和网络梗（仅提取转录文本中原有的词）
    * @param {string} transcript - 音频转录文本
    */
-  async extractHotWords(transcript) {
+  async extractHotWords(transcript, userConfig = null) {
     if (!transcript) return null;
 
     console.log('[VideoAnalyzer] 识别热词和梗...');
 
+    const modelConfig = this.getEffectiveModelConfig(userConfig);
+    const client = this.createOpenAIClient(modelConfig);
+
     try {
-      const response = await openaiClient.chat.completions.create({
-        model: 'qwen-turbo',
+      const response = await client.chat.completions.create({
+        model: modelConfig.textModel,
         messages: [
           {
             role: 'user',
@@ -546,6 +901,7 @@ ${transcript}
     {
       "word": "从转录文本中直接提取的热词（必须是原文中出现的词）",
       "meaning": "简要解释这个词的含义",
+      "explanation": "简要解释这个词的含义",
       "category": "分类（如：网络梗/流行语/饭圈用语等）",
       "timestamp": "出现时间点(格式必须为MM:SS)。必须直接使用转录文本中的[MM:SS]标记。"
     }
@@ -586,8 +942,14 @@ ${transcript}
    * @param {number} duration - 视频时长（秒）
    * @param {string} transcript - 音频转录文本（可选）
    */
-  async analyzeWithQwen(videoPath, framesDir, duration, transcript = null) {
+  async analyzeWithQwen(videoPath, framesDir, duration, transcript = null, userConfig = null, onProgress = null, progressOptions = {}) {
     console.log('[VideoAnalyzer] 调用通义千问API进行视频分析...');
+    const modelStartPercent = Number.isFinite(Number(progressOptions.modelStartPercent))
+      ? Number(progressOptions.modelStartPercent)
+      : 42;
+    this.reportProgress(onProgress, 'model', modelStartPercent, '正在整理关键帧与分析上下文');
+    const modelConfig = this.getEffectiveModelConfig(userConfig);
+    const client = this.createOpenAIClient(modelConfig);
 
     // 获取所有帧图片，并从文件名中解析时间戳（毫秒）
     const frames = fs.readdirSync(framesDir)
@@ -606,6 +968,7 @@ ${transcript}
     }
 
     console.log(`[VideoAnalyzer] 共有 ${frames.length} 张关键帧`);
+    this.reportProgress(onProgress, 'model', modelStartPercent + 2, `正在准备 ${frames.length} 张关键帧`);
 
     // 生成时间戳（秒）列表，供提示词使用
     const frameTimestamps = frames.map(f => f.timestampMs / 1000);
@@ -613,6 +976,19 @@ ${transcript}
       .slice(0, 10)
       .map(t => formatTime(t))
       .join(', ');
+    const visualCuts = Array.isArray(progressOptions.visualCuts)
+      ? progressOptions.visualCuts
+      : [];
+    const visualCutsText = visualCuts.length > 0
+      ? visualCuts
+        .slice(0, 20)
+        .map(cut => {
+          const reasons = Array.isArray(cut.reasons) ? cut.reasons.join('/') : 'visual_change';
+          const score = Number.isFinite(Number(cut.score)) ? Number(cut.score).toFixed(2) : '0.00';
+          return `- ${formatTime(Number(cut.time) || 0)} score=${score} method=${cut.method || 'visual'} reasons=${reasons}`;
+        })
+        .join('\n')
+      : '无高置信视觉候选切点';
 
     // 构建提示词 - 结合音视频进行综合分析
     const promptText = `请作为一个资深B站用户和百科全书，对这段视频内容进行深度分析。
@@ -624,6 +1000,9 @@ ${transcript || '无语音内容'}
 
 关键帧分析（仅用于分段和视觉理解）：
 我已上传 ${frames.length} 张关键帧截图，按时间顺序排列。它们对应的视频时间点会根据场景/画面内容变化（不固定长度）。示例时间点（仅供参考）：${frameTimesText}。
+
+视觉候选切点（由 SSIM / histogram diff / pHash / 峰值检测生成，仅作为候选边界，不是最终结论）：
+${visualCutsText}
 
 请输出JSON格式报告：
 {
@@ -648,7 +1027,7 @@ ${transcript || '无语音内容'}
   "hot_words": [
     {
       "word": "从转录文本中直接提取的热词（必须是原文中出现的词）",
-      "meaning": "简要解释",
+      "explanation": "简要解释该热词或梗的含义",
       "timestamp": "MM:SS (必须直接使用语音转录文本中的[MM:SS]标记)"
     }
   ]
@@ -661,7 +1040,8 @@ ${transcript || '无语音内容'}
 4. 只提取那些在转录文本中能明确找到时间戳的知识点和热词
 5. 分段的start_time和end_time由关键帧画面分析决定
 6. 知识点要硬核且有趣，适合B站用户口味
-7. 只有真正有价值的内容才提取，不要凑数`;
+7. 只有真正有价值的内容才提取，不要凑数
+8. 视觉候选切点可作为片段边界参考，但必须结合语义和转录内容判断，不要机械照搬`;
 
     // 构建多模态消息
     const content = [
@@ -686,9 +1066,10 @@ ${transcript || '无语音内容'}
     }
 
     try {
+      this.reportProgress(onProgress, 'model', modelStartPercent + 4, '大模型分析中');
       // 使用OpenAI兼容模式调用通义千问
-      const completion = await openaiClient.chat.completions.create({
-        model: 'qwen-vl-max',
+      const completion = await client.chat.completions.create({
+        model: modelConfig.visionModel,
         messages: [
           {
             role: 'user',
@@ -703,10 +1084,11 @@ ${transcript || '无语音内容'}
         const aiResponse = completion.choices[0].message.content;
         console.log('[VideoAnalyzer] AI分析完成');
         console.log('[VideoAnalyzer] AI完整返回内容:\n', aiResponse);
+        this.reportProgress(onProgress, 'model', 96, '大模型分析完成');
 
         // 尝试解析JSON
         try {
-          // 提取JSON部分（AI可能返回markdown格式的json）
+          // 提取JSON部分（AI可能返回``json\n``）
           const jsonMatch = aiResponse.match(/```json\n([\s\S]*?)\n```/) ||
                            aiResponse.match(/\{[\s\S]*\}/);
 
@@ -722,6 +1104,8 @@ ${transcript || '无语音内容'}
               segments: parsed.segments || [],
               knowledge_points: parsed.knowledge_points || [],
               hot_words: parsed.hot_words || [],
+              visual_cuts: visualCuts,
+              visual_cut_stats: progressOptions.visualCutStats || null,
               raw_response: aiResponse // 包含原始响应以便前端调试
             };
 
@@ -741,8 +1125,7 @@ ${transcript || '无语音内容'}
               console.log('[VideoAnalyzer] 验证知识点时间戳...');
               const transcriptLines = (transcript || '').split('\n');
               result.knowledge_points.forEach((kp, i) => {
-                const timestampPattern = new RegExp(`\\[${kp.timestamp}\\]`);
-                const foundInTranscript = transcriptLines.some(line => timestampPattern.test(line));
+                const foundInTranscript = transcriptLines.some(line => line.includes(kp.timestamp));
                 console.log(`  [${i+1}] "${kp.term}" (${kp.timestamp}) ${foundInTranscript ? '✓ 在转录文本中找到' : '✗ 未在转录文本中找到'}`);
               });
             }
@@ -754,10 +1137,9 @@ ${transcript || '无语音内容'}
 
               // 验证时间戳是否在转录文本中
               console.log('[VideoAnalyzer] 验证热词时间戳...');
-              const transcriptLines = (transcript || '').split('\n');
+              const transcriptLinesHw = (transcript || '').split('\n');
               result.hot_words.forEach((hw, i) => {
-                const timestampPattern = new RegExp(`\\[${hw.timestamp}\\]`);
-                const foundInTranscript = transcriptLines.some(line => timestampPattern.test(line));
+                const foundInTranscript = transcriptLinesHw.some(line => line.includes(hw.timestamp));
                 console.log(`  [${i+1}] "${hw.word}" (${hw.timestamp}) ${foundInTranscript ? '✓ 在转录文本中找到' : '✗ 未在转录文本中找到'}`);
               });
             }
@@ -774,6 +1156,8 @@ ${transcript || '无语音内容'}
             segments: [],
             knowledge_points: [],
             hot_words: [],
+            visual_cuts: visualCuts,
+            visual_cut_stats: progressOptions.visualCutStats || null,
             raw_response: aiResponse,
             parse_error: '无法提取JSON格式的分析结果'
           };
@@ -786,6 +1170,8 @@ ${transcript || '无语音内容'}
             segments: [],
             knowledge_points: [],
             hot_words: [],
+            visual_cuts: visualCuts,
+            visual_cut_stats: progressOptions.visualCutStats || null,
             raw_response: aiResponse,
             parse_error: parseError.message
           };
@@ -795,48 +1181,264 @@ ${transcript || '无语音内容'}
       }
     } catch (error) {
       console.error('[VideoAnalyzer] API调用失败:', error.response?.data || error.message);
-      throw new Error(`AI分析失败: ${error.message}`);
+      this.reportProgress(onProgress, 'model', 96, '大模型分析失败，使用降级结果继续');
+      return buildFallbackAnalysisResult(
+        `AI分析失败: ${error.message}`,
+        transcript,
+        visualCuts,
+        progressOptions.visualCutStats || null
+      );
     }
+  }
+
+  /**
+   * 将提取的帧转存为向量DB
+   */
+  async storeFrameVectors(bvid, framesDir, onVectorProgress = null) {
+    // 跳过图像向量提取，因为多模态API不稳定
+    console.log('[VideoAnalyzer] 跳过图像向量提取（多模态API暂时禁用）');
+    if (onVectorProgress) {
+      onVectorProgress(100, 'completed', '图像向量提取已禁用');
+    }
+    return;
+    
+    /* 
+    // 原始代码已注释
+    if (!vectorDb.isReady()) {
+      console.warn('[VideoAnalyzer] VectorDB 未初始化，跳过帧向量提取');
+      if (onVectorProgress) onVectorProgress(100, 'error', 'VectorDB 未初始化，跳过帧向量提取');
+      return;
+    }
+    const embeddingService = new EmbeddingService();
+    if (!embeddingService.isReady()) {
+      console.warn('[VideoAnalyzer] 未配置 DASHSCOPE_API_KEY，跳过帧向量提取');
+      if (onVectorProgress) onVectorProgress(100, 'error', '未配置环境变量 DASHSCOPE_API_KEY，跳过语义搜索功能');
+      return;
+    }
+
+    try {
+      if (onVectorProgress) onVectorProgress(5, 'running', '正在读取视频帧...');
+      const files = fs.readdirSync(framesDir).filter(f => f.endsWith('.jpg')).sort();
+      if (files.length === 0) {
+        if (onVectorProgress) onVectorProgress(100, 'completed', '没有可以入库的帧');
+        return;
+      }
+
+      console.log(`[VideoAnalyzer] 开始提取并存储 ${files.length} 个帧向量...`);
+      const points = [];
+      const total = files.length;
+
+      for (let i = 0; i < total; i++) {
+        const file = files[i];
+        // 文件名格式 frame_001_12345.jpg，其中12345是毫秒
+        const match = file.match(/_(\d+)\.jpg$/);
+        if (!match) continue;
+        const timestampMs = parseInt(match[1], 10);
+        const timestampSec = timestampMs / 1000.0;
+        const filePath = path.join(framesDir, file);
+
+        try {
+          const vector = await embeddingService.embedLocalImage(bvid, timestampMs, filePath);
+          if (vector) {
+            points.push({
+              timestamp: timestampSec,
+              vector: vector
+            });
+          }
+        } catch (err) {
+          console.error(`[VideoAnalyzer] embedLocalImage 失败: ${file}`, err.message);
+        }
+
+        const percent = 5 + Math.round(((i + 1) / total) * 90);
+        if (onVectorProgress) onVectorProgress(percent, 'running', `正在调用百炼多模态模型向量化画面: ${i + 1}/${total} 帧...`);
+      }
+
+      if (points.length > 0) {
+        if (onVectorProgress) onVectorProgress(96, 'running', '正在存入本地LanceDB向量数据库...');
+        await vectorDb.upsertFramePoints(bvid, points);
+      }
+      
+      if (onVectorProgress) onVectorProgress(100, 'completed', '多模态帧向量提取完毕！现在可以正常使用语义搜索了。');
+    } catch (error) {
+      console.error('[VideoAnalyzer] storeFrameVectors 失败:', error.message);
+      if (onVectorProgress) onVectorProgress(100, 'error', `后台提取失败: ${error.message}`);
+    }
+    */
   }
 
   /**
    * 完整的视频分析流程（支持音视频结合分析）
    */
-  async analyzeVideo(url, useAudio = true) {
+  async analyzeVideo(url, useAudio = true, userConfig = null, options = {}) {
+    const onProgress = typeof options === 'function' ? options : options?.onProgress;
+    const bilibiliCookies = options?.bilibiliCookies; // 接收前端传来的 cookies
+    let bvid = null;
+    let tempCookiesPath = null;
+    
     try {
       // 1. 提取视频信息
-      const { bvid } = this.extractBilibiliInfo(url);
+      ({ bvid } = this.extractBilibiliInfo(url));
       console.log(`[VideoAnalyzer] 开始分析视频: ${bvid}`);
+      this.reportProgress(onProgress, 'prepare', 2, '准备分析视频');
 
-      // 2. 下载视频
-      const videoPath = await this.downloadVideo(bvid, url);
-
-      // 3. 提取关键帧（用于视觉理解）
-      const { framesDir, duration } = await this.extractFrames(videoPath, bvid);
-
-      // 4. 提取音频并进行语音识别（可选）
-      let transcript = null;
-
-      if (useAudio) {
+      // 2. 如果有 cookies，保存为临时文件，仅在下载阶段使用
+      if (bilibiliCookies) {
         try {
-          const audioPath = await this.extractAudio(videoPath, bvid);
-          transcript = await this.transcribeAudio(audioPath, bvid);
+          const tempDir = path.join(this.downloadDir, 'temp');
+          if (!fs.existsSync(tempDir)) {
+            fs.mkdirSync(tempDir, { recursive: true });
+          }
+          tempCookiesPath = path.join(tempDir, `${bvid}_cookies.txt`);
+          fs.writeFileSync(tempCookiesPath, bilibiliCookies, 'utf8');
+          console.log('[VideoAnalyzer] 已启用临时 cookies 进行下载');
         } catch (error) {
-          console.warn('[VideoAnalyzer] 音频处理失败，继续使用画面分析:', error.message);
+          console.warn('[VideoAnalyzer] 保存 cookies 文件失败:', error.message);
+          tempCookiesPath = null;
         }
       }
 
-      // 5. AI分析（基于关键帧、时长和音频转录），知识点和热词从分析结果中获取
-      const analysisResult = await this.analyzeWithQwen(videoPath, framesDir, duration, transcript);
+      // 3. 下载视频（传递 cookies 路径）- 使用混合策略
+      const videoPath = await this.downloadVideoHybrid(bvid, url, onProgress, tempCookiesPath);
 
-      // 6. 整合所有分析结果
+      // 4. 提取关键帧（用于视觉理解）
+      const { framesDir, duration } = await this.extractFrames(videoPath, bvid, onProgress);
+
+      // 后台异步执行向量提取
+      this.storeFrameVectors(bvid, framesDir, options?.onVectorProgress).catch(err => {
+        console.error('[VideoAnalyzer] 后台提取向量失败:', err);
+      });
+
+      // 5. 视觉候选切点检测（确定性信号，供分段参考）
+      let visualCuts = [];
+      let visualCutStats = null;
+      try {
+        const visualFrames = await this.extractVisualProbeFrames(
+          videoPath,
+          bvid,
+          duration,
+          onProgress,
+          options?.visualProbe
+        );
+        const visualResult = await analyzeVisualCuts(visualFrames, options?.visualCuts);
+        visualCuts = visualResult.visualCuts || [];
+        visualCutStats = visualResult.stats || null;
+        console.log(`[VideoAnalyzer] 视觉候选切点检测完成: ${visualCuts.length} 个`);
+        this.reportProgress(onProgress, 'visual', 42, `检测到 ${visualCuts.length} 个视觉候选切点`);
+      } catch (error) {
+        console.warn('[VideoAnalyzer] Python视觉候选切点检测失败，尝试 ffmpeg scene fallback:', error.message);
+        try {
+          const fallbackVisualResult = await analyzeSceneCutsWithFfmpeg(videoPath, {
+            ...(options?.visualCuts || {}),
+            timeoutMs: 120000
+          });
+          visualCuts = fallbackVisualResult.visualCuts || [];
+          visualCutStats = {
+            ...(fallbackVisualResult.stats || {}),
+            fallbackFrom: 'python_visual_metrics',
+            fallbackReason: error.message
+          };
+          console.log(`[VideoAnalyzer] ffmpeg视觉候选切点检测完成: ${visualCuts.length} 个`);
+          this.reportProgress(onProgress, 'visual', 42, `检测到 ${visualCuts.length} 个视觉候选切点`);
+        } catch (fallbackError) {
+          console.warn('[VideoAnalyzer] 视觉候选切点检测失败，继续后续分析:', fallbackError.message);
+          this.reportProgress(onProgress, 'visual', 42, '视觉切点检测失败，继续分析');
+        }
+      }
+
+      // 6. 提取音频并进行语音识别（可选）
+      let transcript = null;
+      const shouldAnalyzeAudio = Boolean(useAudio && hasOssConfig);
+
+      if (shouldAnalyzeAudio) {
+        try {
+          const audioPath = await this.extractAudio(videoPath, bvid, onProgress);
+          transcript = await this.transcribeAudio(audioPath, bvid, userConfig, onProgress);
+        } catch (error) {
+          console.warn('[VideoAnalyzer] 音频处理失败，继续使用画面分析:', error.message);
+          this.reportProgress(onProgress, 'speech', 58, '音频处理失败，继续画面分析');
+        }
+      } else {
+        this.reportProgress(onProgress, 'model', 42, '跳过音频，准备大模型分析');
+      }
+
+      let keywordCuts = [];
+      let audioCuts = [];
+      if (transcript) {
+        try {
+          keywordCuts = keywordCutService.mergeNearbyDetections(
+            keywordCutService.detectKeywordCuts(transcript),
+            5
+          );
+          console.log(`[VideoAnalyzer] 关键词候选切点检测完成: ${keywordCuts.length} 个`);
+        } catch (error) {
+          console.warn('[VideoAnalyzer] 关键词切点检测失败，继续分析:', error.message);
+        }
+      }
+
+      // 6.5 音频切点检测（静音 + 音量变化）
+      if (shouldAnalyzeAudio) {
+        try {
+          const audioPathForCuts = path.join(this.downloadDir, `${bvid}.wav`);
+          if (fs.existsSync(audioPathForCuts)) {
+            audioCuts = await detectAudioCuts(audioPathForCuts);
+            console.log(`[VideoAnalyzer] 音频切点检测完成: ${audioCuts.length} 个`);
+          }
+        } catch (error) {
+          console.warn('[VideoAnalyzer] 音频切点检测失败，继续分析:', error.message);
+        }
+      }
+
+      // 7. AI分析（基于关键帧、时长、视觉切点和音频转录），知识点和热词从分析结果中获取
+      const analysisResult = await this.analyzeWithQwen(videoPath, framesDir, duration, transcript, userConfig, onProgress, {
+        modelStartPercent: shouldAnalyzeAudio ? 60 : 42,
+        visualCuts,
+        visualCutStats
+      });
+
+      // 8. 整合所有分析结果
+      this.reportProgress(onProgress, 'finalize', 98, '正在整理分析结果');
+      let segmentPipeline = null;
+      try {
+        const frameTimes = fs.readdirSync(framesDir)
+          .filter(file => file.endsWith('.jpg'))
+          .map(file => {
+            const match = file.match(/frame_\d+_(\d+)\.jpg$/);
+            return match ? Number(match[1]) / 1000 : null;
+          })
+          .filter(time => Number.isFinite(time));
+        const modelConfig = this.getEffectiveModelConfig(userConfig);
+        segmentPipeline = await runSegmentPipeline({
+          videoId: bvid,
+          bvid,
+          duration,
+          frameTimes,
+          transcript,
+          visualCuts,
+          audioCuts,
+          keywordCuts,
+          existingAnalysis: analysisResult,
+          modelConfig
+        }, {
+          modelClient: this.createOpenAIClient(modelConfig)
+        });
+        console.log(`[VideoAnalyzer] 分段主流程完成: ${segmentPipeline.segments.length} 个最终片段`);
+      } catch (error) {
+        console.warn('[VideoAnalyzer] 分段主流程运行失败，保留原分析结果:', error.message);
+      }
+
       const finalResult = {
         ...analysisResult,
         // 添加音频转录文本（如果有）
-        transcript: transcript
+        transcript: transcript,
+        keyword_cuts: keywordCuts,
+        visual_cuts: visualCuts,
+        visual_cut_stats: visualCutStats,
+        candidateCuts: segmentPipeline?.candidateCuts || [],
+        segmentPipeline,
+        final_segments: segmentPipeline?.segments || []
       };
 
-      // 7. 返回结果
+      // 9. 返回结果
       return {
         bvid,
         video_path: videoPath,
@@ -846,6 +1448,16 @@ ${transcript || '无语音内容'}
     } catch (error) {
       console.error('[VideoAnalyzer] 视频分析失败:', error);
       throw error;
+    } finally {
+      // 清理临时 cookies 文件（成功或失败都执行）
+      if (tempCookiesPath && fs.existsSync(tempCookiesPath)) {
+        try {
+          fs.unlinkSync(tempCookiesPath);
+          console.log('[VideoAnalyzer] 临时 cookies 已清理');
+        } catch (error) {
+          console.warn('[VideoAnalyzer] 清理临时 cookies 文件失败:', error.message);
+        }
+      }
     }
   }
 

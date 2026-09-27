@@ -4,19 +4,109 @@
  */
 
 const express = require('express');
-const router = express.Router();
 const VideoAnalyzer = require('../services/videoAnalyzer');
 const { authenticateToken } = require('../middlewares/auth.js');
 const db = require('../database/db');
+const { getLatestEnabledUserModelConfig } = require('../services/modelConfigService');
+const { getLatestDebugArtifact } = require('../services/segmentPipeline/debugArtifactWriter');
 
-// 创建视频分析器实例
-const videoAnalyzer = new VideoAnalyzer();
+// 进度存储（保持全局）
+const analysisProgressStore = new Map();
+const vectorProgressStore = new Map();
+const PROGRESS_TTL_MS = 15 * 60 * 1000;
+
+function clampPercent(percent) {
+  const numericPercent = Number(percent);
+  if (!Number.isFinite(numericPercent)) return 0;
+  return Math.max(0, Math.min(100, Math.round(numericPercent)));
+}
+
+function getProgressKey(userId, bvid) {
+  return `${userId || 'anonymous'}:${String(bvid || '').trim()}`;
+}
+
+function pruneProgressStore() {
+  const now = Date.now();
+  analysisProgressStore.forEach((progress, key) => {
+    const updatedMs = progress.updatedMs || 0;
+    if (now - updatedMs > PROGRESS_TTL_MS) {
+      analysisProgressStore.delete(key);
+    }
+  });
+}
 
 /**
- * POST /api/v1/video-analysis/analyze
- * 分析单个视频
+ * 创建视频分析路由
+ * @param {Object} wss - WebSocket Server 实例 (可选)
+ * @returns {express.Router}
  */
-router.post('/analyze', authenticateToken, async (req, res) => {
+function createVideoAnalysisRouter(wss = null) {
+  const router = express.Router();
+
+  // 创建视频分析器实例（传入 WebSocket 服务器）
+  const videoAnalyzer = new VideoAnalyzer(null, wss);
+
+  function setVectorProgress(bvid, update) {
+    const p = vectorProgressStore.get(bvid) || { status: 'idle', percent: 0, message: '' };
+    vectorProgressStore.set(bvid, { ...p, ...update, updatedMs: Date.now() });
+  }
+
+  router.get('/vector-progress', (req, res) => {
+    const { bvid } = req.query;
+    const p = vectorProgressStore.get(bvid) || { status: 'idle', percent: 0, message: '' };
+    res.json(p);
+  });
+
+  function setAnalysisProgress(userId, bvid, update = {}) {
+    pruneProgressStore();
+
+    const key = getProgressKey(userId, bvid);
+    const previous = analysisProgressStore.get(key) || {};
+    const nowIso = new Date().toISOString();
+    const next = {
+      bvid,
+      status: update.status || previous.status || 'running',
+      stage: update.stage || previous.stage || 'prepare',
+      percent: clampPercent(update.percent ?? previous.percent ?? 0),
+      message: update.message || previous.message || '准备分析视频',
+      detail: update.detail !== undefined ? update.detail : previous.detail || null,
+      startedAt: update.startedAt || previous.startedAt || nowIso,
+      updatedAt: update.updatedAt || nowIso,
+      finishedAt: update.finishedAt !== undefined ? update.finishedAt : previous.finishedAt || null,
+      updatedMs: Date.now()
+    };
+
+    analysisProgressStore.set(key, next);
+    return next;
+  }
+
+  function getAnalysisProgress(userId, bvid) {
+    pruneProgressStore();
+
+    const progress = analysisProgressStore.get(getProgressKey(userId, bvid));
+    if (progress) {
+      const { updatedMs, ...publicProgress } = progress;
+      return publicProgress;
+    }
+
+    return {
+      bvid,
+      status: 'idle',
+      stage: 'idle',
+      percent: 0,
+      message: '等待分析',
+      detail: null,
+      startedAt: null,
+      updatedAt: null,
+      finishedAt: null
+    };
+  }
+
+  /**
+   * POST /api/v1/video-analysis/analyze
+   * 分析单个视频
+   */
+  router.post('/analyze', authenticateToken, async (req, res) => {
   try {
     const { bvid } = req.body;
 
@@ -25,12 +115,38 @@ router.post('/analyze', authenticateToken, async (req, res) => {
     }
 
     console.log(`[API] 开始分析视频: ${bvid}`);
+    const userId = req.user.userId;
+    const userConfig = getLatestEnabledUserModelConfig(userId);
+    const runtimeModelConfig = videoAnalyzer.getEffectiveModelConfig(userConfig);
+    setAnalysisProgress(userId, bvid, {
+      status: 'running',
+      stage: 'prepare',
+      percent: 1,
+      message: '准备分析视频',
+      startedAt: new Date().toISOString(),
+      finishedAt: null
+    });
+    const reportProgress = (progress) => {
+      setAnalysisProgress(userId, bvid, {
+        ...progress,
+        status: 'running'
+      });
+    };
 
     // 构建B站视频URL
     const videoUrl = `https://www.bilibili.com/video/${bvid}`;
 
+    // 获取前端发送的 cookies（如果有）
+    const bilibiliCookies = req.body.bilibili_cookies;
+
     // 调用新的 VideoAnalyzer
-    const result = await videoAnalyzer.analyzeVideo(videoUrl, true);
+    const result = await videoAnalyzer.analyzeVideo(videoUrl, true, userConfig, {
+      onProgress: reportProgress,
+      onVectorProgress: (percent, status, message) => {
+        setVectorProgress(bvid, { percent, status, message });
+      },
+      bilibiliCookies: bilibiliCookies
+    });
 
     // 转换数据格式以适配前端
     const adaptedData = {
@@ -39,6 +155,12 @@ router.post('/analyze', authenticateToken, async (req, res) => {
       tags: result.analysis.tags,
       summary: result.analysis.summary,
       transcript: result.analysis.transcript,
+      visual_cuts: result.analysis.visual_cuts || [],
+      visual_cut_stats: result.analysis.visual_cut_stats || null,
+      keyword_cuts: result.analysis.keyword_cuts || [],
+      candidateCuts: result.analysis.candidateCuts || [],
+      segmentPipeline: result.analysis.segmentPipeline || null,
+      segments: result.analysis.final_segments || [],
       // 将 segments 映射为 ad_segments
       ad_segments: result.analysis.segments ? result.analysis.segments.map(seg => ({
         start_time: parseTimeToSeconds(seg.start_time),
@@ -69,6 +191,12 @@ router.post('/analyze', authenticateToken, async (req, res) => {
         knowledge_points: result.analysis.knowledge_points || [],
         hot_words: result.analysis.hot_words || [],
         tags: result.analysis.tags || [],
+        visual_cuts: result.analysis.visual_cuts || [],
+        visual_cut_stats: result.analysis.visual_cut_stats || null,
+        keyword_cuts: result.analysis.keyword_cuts || [],
+        candidateCuts: result.analysis.candidateCuts || [],
+        segmentPipeline: result.analysis.segmentPipeline || null,
+        segments: result.analysis.final_segments || [],
         analyzed_at: result.analyzed_at || null,
         ad_segments: result.analysis.segments
           ? result.analysis.segments.map(seg => ({
@@ -109,8 +237,15 @@ router.post('/analyze', authenticateToken, async (req, res) => {
       adaptedData.transcript || null,
       null,
       JSON.stringify(normalizedContent),
-      'qwen-vl-max'
+      runtimeModelConfig.visionModel
     );
+    setAnalysisProgress(userId, bvid, {
+      status: 'completed',
+      stage: 'completed',
+      percent: 100,
+      message: '分析完成',
+      finishedAt: new Date().toISOString()
+    });
 
     res.json({
       success: true,
@@ -118,17 +253,26 @@ router.post('/analyze', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     console.error('[API] 视频分析失败:', error);
+    if (req.body?.bvid && req.user?.userId) {
+      setAnalysisProgress(req.user.userId, req.body.bvid, {
+        status: 'failed',
+        stage: 'failed',
+        percent: 100,
+        message: '视频分析失败，请稍后重试',
+        finishedAt: new Date().toISOString()
+      });
+    }
     res.status(500).json({
       error: '视频分析失败',
-      message: error.message
+      message: '视频分析失败，请稍后重试'
     });
   }
-});
+  });
 
-/**
- * 将时间格式 MM:SS 或 HH:MM:SS 转换为秒数
- */
-function parseTimeToSeconds(timeStr) {
+  /**
+   * 将时间格式 MM:SS 或 HH:MM:SS 转换为秒数
+   */
+  function parseTimeToSeconds(timeStr) {
   if (!timeStr) return 0;
   if (typeof timeStr === 'number') return timeStr;
 
@@ -148,14 +292,14 @@ function parseTimeToSeconds(timeStr) {
   if (parts.length === 1) {
     return parts[0];
   }
-  return 0;
-}
+    return 0;
+  }
 
-/**
- * POST /api/v1/video-analysis/batch
- * 批量分析视频
- */
-router.post('/batch', authenticateToken, async (req, res) => {
+  /**
+   * POST /api/v1/video-analysis/batch
+   * 批量分析视频
+   */
+  router.post('/batch', authenticateToken, async (req, res) => {
   try {
     const { videos } = req.body;
 
@@ -166,10 +310,14 @@ router.post('/batch', authenticateToken, async (req, res) => {
     console.log(`[API] 开始批量分析 ${videos.length} 个视频`);
 
     const results = [];
+
+    const userId = req.user.userId;
+    const userConfig = getLatestEnabledUserModelConfig(userId);
+
     for (const video of videos) {
       try {
         const videoUrl = `https://www.bilibili.com/video/${video.bvid}`;
-        const result = await videoAnalyzer.analyzeVideo(videoUrl, true);
+        const result = await videoAnalyzer.analyzeVideo(videoUrl, true, userConfig);
 
         // 转换数据格式
         const adaptedData = {
@@ -177,6 +325,12 @@ router.post('/batch', authenticateToken, async (req, res) => {
           title: result.analysis.title,
           tags: result.analysis.tags,
           summary: result.analysis.summary,
+          visual_cuts: result.analysis.visual_cuts || [],
+          visual_cut_stats: result.analysis.visual_cut_stats || null,
+          keyword_cuts: result.analysis.keyword_cuts || [],
+          candidateCuts: result.analysis.candidateCuts || [],
+          segmentPipeline: result.analysis.segmentPipeline || null,
+          segments: result.analysis.final_segments || [],
           ad_segments: result.analysis.segments ? result.analysis.segments.map(seg => ({
             start_time: parseTimeToSeconds(seg.start_time),
             end_time: parseTimeToSeconds(seg.end_time),
@@ -205,25 +359,54 @@ router.post('/batch', authenticateToken, async (req, res) => {
       message: error.message
     });
   }
-});
-
-/**
- * GET /api/v1/video-analysis/status/:bvid
- * 获取视频分析状态（如果实现了任务队列）
- */
-router.get('/status/:bvid', authenticateToken, (req, res) => {
-  // TODO: 实现任务状态查询
-  res.json({
-    status: 'not_implemented',
-    message: '任务状态查询功能待实现'
   });
-});
 
-/**
- * POST /api/v1/video-analysis/extract-keyframes
- * 提取视频关键帧
- */
-router.post('/extract-keyframes', authenticateToken, async (req, res) => {
+  /**
+   * GET /api/v1/video-analysis/status/:bvid
+   * 获取视频分析状态（如果实现了任务队列）
+   */
+  router.get('/status/:bvid', authenticateToken, (req, res) => {
+  res.json({
+    success: true,
+    data: getAnalysisProgress(req.user.userId, req.params.bvid)
+  });
+  });
+
+  router.get('/segments/:videoId/debug', authenticateToken, (req, res) => {
+  try {
+    const artifact = getLatestDebugArtifact(req.params.videoId);
+    if (!artifact) {
+      return res.status(404).json({
+        success: false,
+        error: '未找到分段调试产物'
+      });
+    }
+    const content = artifact.content || {};
+    return res.json({
+      videoId: req.params.videoId,
+      latestArtifact: artifact.path,
+      evidence: content.evidence || null,
+      candidateCuts: content.candidateCuts || [],
+      finalSegments: content.finalSegments || [],
+      warnings: content.warnings || [],
+      mode: content.mode || 'fallback',
+      confidence: content.confidence || 'low'
+    });
+  } catch (error) {
+    console.error('[API] 读取分段调试产物失败:', error);
+    return res.status(500).json({
+      success: false,
+      error: '读取分段调试产物失败',
+      message: error.message
+    });
+  }
+  });
+
+  /**
+   * POST /api/v1/video-analysis/extract-keyframes
+   * 提取视频关键帧
+   */
+  router.post('/extract-keyframes', authenticateToken, async (req, res) => {
   try {
     const { bvid, cid, interval = 10 } = req.body;
 
@@ -248,6 +431,9 @@ router.post('/extract-keyframes', authenticateToken, async (req, res) => {
       message: error.message
     });
   }
-});
+  });
 
-module.exports = router;
+  return router;
+}
+
+module.exports = createVideoAnalysisRouter;
