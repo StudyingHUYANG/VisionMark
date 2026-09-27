@@ -15,9 +15,7 @@ window.CONFIG = {
 const AD_TYPES = {
   HARD_AD: 'hard_ad',
   SOFT_AD: 'soft_ad',
-  PRODUCT_PLACEMENT: 'product_placement',
-  INTRO_AD: 'intro_ad',
-  MID_AD: 'mid_ad'
+  PRODUCT_PLACEMENT: 'product_placement'
 };
 
 const STORAGE_KEYS = {

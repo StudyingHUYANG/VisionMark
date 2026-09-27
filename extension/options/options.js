@@ -10,8 +10,6 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('type-hard').checked = types.includes('hard_ad');
     document.getElementById('type-soft').checked = types.includes('soft_ad');
     document.getElementById('type-placement').checked = types.includes('product_placement');
-    document.getElementById('type-intro').checked = types.includes('intro_ad');
-    document.getElementById('type-mid').checked = types.includes('mid_ad');
   });
 
   // Bind skip mode buttons
@@ -46,8 +44,6 @@ function saveSettings() {
   if (document.getElementById('type-hard').checked) skipTypes.push('hard_ad');
   if (document.getElementById('type-soft').checked) skipTypes.push('soft_ad');
   if (document.getElementById('type-placement').checked) skipTypes.push('product_placement');
-  if (document.getElementById('type-intro').checked) skipTypes.push('intro_ad');
-  if (document.getElementById('type-mid').checked) skipTypes.push('mid_ad');
 
   chrome.storage.local.set({ skip_types: skipTypes }, () => {
     const btn = document.getElementById('save-btn');

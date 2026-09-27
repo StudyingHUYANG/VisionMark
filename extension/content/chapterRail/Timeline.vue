@@ -7,7 +7,7 @@
       v-if="isLoading"
       class="vm-ai-timeline__status vm-ai-timeline__status--loading"
     >
-      AI 章节解析中...
+      章节解析中...
     </div>
 
     <div
@@ -15,7 +15,7 @@
       class="vm-ai-timeline__status vm-ai-timeline__status--error"
       :title="errorMessage"
     >
-      AI 解析失败: {{ errorMessage }}
+      章节解析失败: {{ errorMessage }}
     </div>
 
     <div
@@ -199,6 +199,7 @@ function extractChapterPayload(data) {
   }
 
   const chapterCandidates = [
+    payload?.final_segments,
     payload?.chapters,
     payload?.chapter_timeline,
     payload?.chapterTimeline,
@@ -207,7 +208,7 @@ function extractChapterPayload(data) {
   ];
 
   for (const candidate of chapterCandidates) {
-    if (Array.isArray(candidate)) {
+    if (Array.isArray(candidate) && candidate.length > 0) {
       return candidate;
     }
   }

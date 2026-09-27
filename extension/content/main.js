@@ -1,5 +1,6 @@
-﻿import { createChapterTimelineInjector, watchBilibiliSpaRoute } from './chapterRail/inject.js';
+import { createChapterTimelineInjector, watchBilibiliSpaRoute } from './chapterRail/inject.js';
 import { ANALYSIS_UPDATED_EVENT } from './events.js';
+import './utils.js';
 
 (function () {
   'use strict';
@@ -36,9 +37,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
   const typeLabels = {
     'hard_ad': '商业内容',
     'soft_ad': '推广内容',
-    'product_placement': '品牌植入',
-    'intro_ad': '片头广告',
-    'mid_ad': '中段广告'
+    'product_placement': '品牌植入'
   };
 
   class AdSkipperCore {
@@ -55,6 +54,9 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       // 手动跳过功能
       this.skipMode = 'auto';
       this.skipButton = null;
+      // WebSocket 连接
+      this.websocket = null;
+      this.currentAnalysisBvid = null;
       // 日志控制变量
       this.noSegmentLogPrinted = false;
       this.coolDownLogPrinted = false;
@@ -90,24 +92,25 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       this.chapterTimelineController = createChapterTimelineInjector();
       this.routeWatcherCleanup = null;
       this.lastRouteBvid = null;
+      this.hotWordPopupLayer = null;
+      this.currentHotWordId = null;
+      this.runtimeMessageListenerBound = false;
+      this.analysisProgressPollTimer = null;
+      this.analysisProgressBvid = null;
     }
 
     init() {
       console.log("[AdSkipper] 初始化...");
       this.chapterTimelineController.init();
-      this.player.init().then(ok => {
-        if (!ok) return;
 
-        this.lastRouteBvid = this.player.currentBvid || null;
-        this.startSpaRouteWatcher();
+      // 1. Load preferences
+      this.initPrefs();
 
-        // 检查登录状态
-        chrome.storage.local.get(['adskipper_token'], (storage) => {
-          const token = storage.adskipper_token;
-          console.log('[AdSkipper] 登录状态:', token ? '已登录' : '未登录');
-        });
+      // 2. Start UI Keeper to ensure buttons persist
+      this.startUiKeeper();
 
       // 3. Init global event listeners
+      this.initRuntimeMessageListener();
       this.initGlobalListeners();
 
       // 4. Initialize player connection
@@ -116,6 +119,8 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
            console.log('[AdSkipper] 暂未找到播放器，Keeper将继续尝试');
            return;
         }
+        this.lastRouteBvid = this.player.currentBvid || null;
+        this.startSpaRouteWatcher();
         this.onPlayerReady();
       });
     }
@@ -146,7 +151,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
                 console.log('[AdSkipper] Keeper: Restore AI FAB');
                 this.initAiFloatingButton();
             }
-            
+
             const sidebarRoot = document.getElementById('vm-sidebar-root');
             if (!sidebarRoot) {
                 // console.log('[AdSkipper] Keeper: Restore Sidebar Root'); // Reduce log noise
@@ -158,7 +163,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
                  const markers = document.querySelectorAll('.adskipper-progress-marker');
                  if (markers.length === 0) {
                      // Check if progress bar exists before trying to add
-                     const progressBar = document.querySelector('.bpx-player-progress') || 
+                     const progressBar = document.querySelector('.bpx-player-progress') ||
                                          document.querySelector('.bilibili-player-progress') ||
                                          document.querySelector('.bpx-player-progress-wrap');
                      if (progressBar) {
@@ -177,6 +182,9 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       });
       document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
+          if (sidebarState?.modelConfigVisible) {
+            return;
+          }
           this.togglePopover(false);
           if (this.sidebarController) this.sidebarController.hide();
         }
@@ -190,13 +198,13 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
            this.refreshAnalysisForBvid(this.player.currentBvid, { forceAnalyze: true });
         }
       });
-
       window.addEventListener('visionmark:delete-segment', (event) => {
         const segmentId = Number(event?.detail?.segmentId);
         this.handleSidebarDelete(segmentId);
       });
 
       window.addEventListener('beforeunload', () => {
+        this.stopAnalysisProgressPolling();
         if (this.routeWatcherCleanup) {
           this.routeWatcherCleanup();
           this.routeWatcherCleanup = null;
@@ -209,11 +217,37 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       console.log('[AdSkipper] 调试模式已启用');
     }
 
+    initRuntimeMessageListener() {
+      if (this.runtimeMessageListenerBound) return;
+
+      chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+        if (message?.action !== 'openModelConfigModal') {
+          return false;
+        }
+
+        this.openModelConfigModal()
+          .then(() => {
+            sendResponse({ success: true });
+          })
+          .catch((error) => {
+            console.error('[AdSkipper] 打开自定义 API 弹窗失败:', error);
+            sendResponse({
+              success: false,
+              error: error?.message || '打开失败'
+            });
+          });
+
+        return true;
+      });
+
+      this.runtimeMessageListenerBound = true;
+    }
+
     onPlayerReady() {
         console.log('[AdSkipper] Player Ready');
         this.player.onTimeUpdate = (t) => this.checkSkip(t);
         this.startInjectionObserver();
-        
+
         const bvid = this.player.currentBvid;
         if (bvid) {
           this.refreshAnalysisForBvid(bvid).then(() => window.adSkipper = this);
@@ -256,6 +290,9 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       this.allSegments = [];
       this.currentSegmentIds = [];
       this.analysisBvid = null;
+      this.stopAnalysisProgressPolling();
+      this.disconnectWebSocket();
+      this.currentAnalysisBvid = null;
       this.clearKnowledgeDanmuState();
 
       if (sidebarState) {
@@ -267,6 +304,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         sidebarState.knowledgePoints = [];
         sidebarState.hotWords = [];
         sidebarState.loadError = null;
+        sidebarState.analysisProgress = null;
         sidebarState.segments = [];
         sidebarState.activeSegmentKey = null;
       }
@@ -384,12 +422,34 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       return Boolean(this.sidebarController);
     }
 
+    async openModelConfigModal() {
+      if (!await this.ensureSidebarReady()) {
+        throw new Error('设置面板初始化失败');
+      }
+
+      if (typeof this.sidebarController.showModelConfig !== 'function') {
+        throw new Error('设置面板暂不可用');
+      }
+
+      this.sidebarController.showModelConfig();
+    }
+
     async refreshAnalysisForBvid(bvid, options = {}) {
       if (!bvid) return;
-      await this.loadSegments(bvid);
-      const shouldAnalyze = Boolean(options.forceAnalyze) || this.segments.length === 0 || !this.aiSummary;
-      if (shouldAnalyze) {
-        await this.analyzeVideo(bvid);
+      if (this.refreshInFlight?.bvid === bvid) return this.refreshInFlight.promise;
+      const promise = (async () => {
+        const loaded = await this.loadSegments(bvid);
+        if (!loaded) return;
+        if (this.player.currentBvid && this.player.currentBvid !== bvid) return;
+        if (Boolean(options.forceAnalyze) || !this.hasAnalysis) {
+          await this.analyzeVideo(bvid);
+        }
+      })();
+      this.refreshInFlight = { bvid, promise };
+      try {
+        await promise;
+      } finally {
+        if (this.refreshInFlight?.promise === promise) this.refreshInFlight = null;
       }
     }
 
@@ -397,7 +457,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       if (!await this.ensureSidebarReady()) return;
 
       if (options.refresh && this.player.currentBvid) {
-        await this.refreshAnalysisForBvid(this.player.currentBvid, { forceAnalyze: true });
+        await this.refreshAnalysisForBvid(this.player.currentBvid);
       }
 
       this.sidebarController.show();
@@ -438,6 +498,82 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           resolve(storage.adskipper_token);
         });
       });
+    }
+
+    async connectWebSocket(token, bvid) {
+      // 断开现有连接
+      this.disconnectWebSocket();
+
+      if (!token) {
+        console.log('[AdSkipper] WebSocket: 无 token，跳过连接');
+        return;
+      }
+
+      try {
+        // 构建 WebSocket URL（使用与 API 相同的 base URL）
+        const wsUrl = VIDEO_ANALYSIS_BASE.replace(/^http/, 'ws') + '/?token=' + encodeURIComponent(token) + '&bvid=' + encodeURIComponent(bvid);
+        console.log('[AdSkipper] WebSocket: 连接中...');
+
+        const socket = new WebSocket(wsUrl);
+        this.websocket = socket;
+
+        socket.onopen = () => {
+          console.log('[AdSkipper] WebSocket: 连接成功');
+        };
+
+        socket.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'progress' && data.data?.bvid === bvid && this.websocket === socket) {
+              this.handleWebSocketProgress(data.data);
+            }
+          } catch (error) {
+            console.warn('[AdSkipper] WebSocket: 消息解析失败', error);
+          }
+        };
+
+        socket.onerror = (error) => {
+          console.error('[AdSkipper] WebSocket: 连接错误', error);
+        };
+
+        socket.onclose = (event) => {
+          console.log('[AdSkipper] WebSocket: 连接关闭', event.code, event.reason);
+          if (this.websocket === socket) this.websocket = null;
+        };
+      } catch (error) {
+        console.error('[AdSkipper] WebSocket: 连接失败', error);
+      }
+    }
+
+    disconnectWebSocket() {
+      if (this.websocket) {
+        this.websocket.close();
+        this.websocket = null;
+      }
+    }
+
+    handleWebSocketProgress(progressData) {
+      if (!progressData?.bvid || progressData.bvid !== this.currentAnalysisBvid
+          || (this.player.currentBvid && progressData.bvid !== this.player.currentBvid)) return;
+      // 更新进度显示
+      if (sidebarState && this.currentAnalysisBvid) {
+        sidebarState.analysisProgress = this.normalizeAnalysisProgress({
+          status: progressData.percent >= 100 ? 'completed' : 'running',
+          stage: progressData.stage,
+          percent: progressData.percent,
+          message: progressData.message
+        });
+      }
+
+      // 如果分析完成或失败，断开 WebSocket 连接
+      if (progressData.percent >= 100 || progressData.message?.includes('失败')) {
+        setTimeout(() => {
+          if (this.currentAnalysisBvid === progressData.bvid) {
+            this.disconnectWebSocket();
+            this.currentAnalysisBvid = null;
+          }
+        }, 5000);
+      }
     }
 
     createNetworkUnavailableError() {
@@ -517,12 +653,16 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
     }
 
     async loadSegments(bvid) {
-      if (!bvid || this.isLoadingSegments) return;
+      if (!bvid || this.loadingSegmentsBvid === bvid) return false;
       const previousAnalysisBvid = this.analysisBvid;
+      if (previousAnalysisBvid !== bvid) this.hasAnalysis = false;
+      this.loadingSegmentsBvid = bvid;
       this.isLoadingSegments = true;
       if (sidebarState) {
+        sidebarState.bvid = bvid;
         sidebarState.isLoading = true;
         sidebarState.loadError = null;
+        sidebarState.analysisProgress = null;
       }
 
       try {
@@ -536,6 +676,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         }
 
         const data = await res.json();
+        if (this.player.currentBvid && this.player.currentBvid !== bvid) return false;
         console.log("[AdSkipper] 后端返回的数据结构:", Object.keys(data));
         console.log("[AdSkipper] data.ai_title:", data.ai_title);
         console.log("[AdSkipper] data.knowledge_points:", data.knowledge_points);
@@ -552,6 +693,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           return skipTypes.includes(segment.ad_type || 'hard_ad');
         });
         this.aiSummary = typeof data.ai_summary === 'string' ? data.ai_summary.trim() : '';
+        this.hasAnalysis = data.has_analysis === true;
         this.currentSegmentIds = this.segments.map(seg => seg.id).filter(id => id);
         this.analysisBvid = bvid;
         if (Array.isArray(data.knowledge_points)) {
@@ -574,7 +716,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           if (data.hot_words !== undefined) {
             sidebarState.hotWords = data.hot_words || [];
           }
-          sidebarState.segments = this.segments;
+          sidebarState.segments = this.buildSidebarSegments(this.segments, data.final_segments, bvid);
           sidebarState.activeSegmentKey = null;
 
           console.log("[AdSkipper] 侧边栏状态更新后:");
@@ -587,8 +729,9 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         }
 
         this.addSegmentMarkers();
-      this.scheduleSegmentMarkerRetry(2);
+        return true;
       } catch (error) {
+        if (this.player.currentBvid && this.player.currentBvid !== bvid) return false;
         if (error.code !== 'NETWORK_UNAVAILABLE') {
           console.error('[AdSkipper] 加载片段失败:', error);
         }
@@ -602,22 +745,68 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           sidebarState.aiSummary = '总结加载失败';
           sidebarState.loadError = error.message || '加载失败';
         }
+        return false;
       } finally {
-        this.isLoadingSegments = false;
-        if (sidebarState) {
+        if (this.loadingSegmentsBvid === bvid) {
+          this.loadingSegmentsBvid = null;
+          this.isLoadingSegments = false;
+        }
+        if (sidebarState?.bvid === bvid) {
           sidebarState.isLoading = false;
         }
       }
+    }
+
+    buildSidebarSegments(actionSegments, chapters, bvid) {
+      const chapterItems = (Array.isArray(chapters) ? chapters : [])
+        .map((chapter, index) => ({
+          id: `chapter-${bvid}-${index}`,
+          start_time: Number(chapter.start ?? chapter.start_time ?? 0),
+          end_time: Number(chapter.end ?? chapter.end_time ?? 0),
+          content: String(chapter.title || chapter.summary || `章节 ${index + 1}`),
+          action: 'chapter',
+          is_chapter: true,
+          is_ai_segment: true
+        }))
+        .filter(chapter => Number.isFinite(chapter.start_time)
+          && Number.isFinite(chapter.end_time)
+          && chapter.end_time > chapter.start_time);
+      return [...chapterItems, ...(actionSegments || [])]
+        .sort((left, right) => left.start_time - right.start_time);
     }
 
     normalizeSegment(segment, index) {
       const start = Number(segment.start ?? segment.start_time ?? 0);
       const end = Number(segment.end ?? segment.end_time ?? 0);
       const candidateAction = typeof segment.action === 'string' ? segment.action.toLowerCase() : '';
-      const action = candidateAction === 'popup' || candidateAction === 'skip' ? candidateAction : 'skip';
+      const hasLegacyHighlight = segment.highlight !== undefined && segment.highlight !== null;
+      const legacyHighlightValue = typeof segment.highlight === 'string'
+        ? segment.highlight.trim().toLowerCase()
+        : segment.highlight;
+      const legacyPopup =
+        legacyHighlightValue === true ||
+        legacyHighlightValue === 1 ||
+        legacyHighlightValue === '1' ||
+        legacyHighlightValue === 'true' ||
+        legacyHighlightValue === 'yes' ||
+        legacyHighlightValue === 'y' ||
+        legacyHighlightValue === 'popup' ||
+        legacyHighlightValue === 'high-energy' ||
+        legacyHighlightValue === 'high_energy';
+      const action = candidateAction === 'popup' || candidateAction === 'skip'
+        ? candidateAction
+        : (legacyPopup ? 'popup' : 'skip');
+      const isAiSegment = Boolean(segment.is_ai_segment);
+      const aiSegmentDisplayType = isAiSegment
+        ? (segment.ai_segment_display_type === 'high-energy' || segment.ai_segment_display_type === 'clip'
+          ? segment.ai_segment_display_type
+          : (action === 'popup' ? 'high-energy' : 'clip'))
+        : null;
 
-      const rawContent = typeof segment.content === 'string' ? segment.content.trim() : null;
-      const content = action === 'popup' ? (rawContent || null) : null;
+      const rawContent = typeof segment.content === 'string'
+        ? segment.content.trim()
+        : (typeof segment.description === 'string' ? segment.description.trim() : null);
+      const content = rawContent || null;
 
       return {
         ...segment,
@@ -628,8 +817,53 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         end_time: end,
         action,
         content,
+        is_ai_segment: isAiSegment,
+        ai_segment_display_type: aiSegmentDisplayType,
         ad_type: segment.ad_type || (action === 'skip' ? 'hard_ad' : 'mid_ad'),
-        hasActionField: typeof segment.action === 'string'
+        hasActionField: typeof segment.action === 'string' || hasLegacyHighlight
+      };
+    }
+
+    getAiSegmentDisplayType(segment) {
+      if (!segment?.is_ai_segment) return null;
+
+      if (segment.ai_segment_display_type === 'high-energy' || segment.ai_segment_display_type === 'clip') {
+        return segment.ai_segment_display_type;
+      }
+
+      return segment.action === 'popup' ? 'high-energy' : 'clip';
+    }
+
+    getOfficialProgressPresentation(segment) {
+      const aiSegmentDisplayType = this.getAiSegmentDisplayType(segment);
+
+      if (aiSegmentDisplayType === 'high-energy') {
+        return {
+          badgeText: '高能',
+          badgeClass: 'visionmark-progress-hover__badge--ai-high-energy',
+          markerColor: 'rgba(34, 197, 94, 0.88)',
+          actionText: '高能',
+          includeContentInMarkerTitle: true
+        };
+      }
+
+      if (aiSegmentDisplayType === 'clip') {
+        return {
+          badgeText: '片段',
+          badgeClass: 'visionmark-progress-hover__badge--ai-clip',
+          markerColor: 'rgba(250, 204, 21, 0.88)',
+          actionText: '片段',
+          includeContentInMarkerTitle: true
+        };
+      }
+
+      const isPopup = segment?.action === 'popup';
+      return {
+        badgeText: isPopup ? '重点' : '跳过',
+        badgeClass: isPopup ? 'visionmark-progress-hover__badge--popup' : 'visionmark-progress-hover__badge--skip',
+        markerColor: isPopup ? 'rgba(71, 167, 255, 0.88)' : 'rgba(251, 114, 153, 0.82)',
+        actionText: isPopup ? '重点' : '跳过',
+        includeContentInMarkerTitle: isPopup
       };
     }
 
@@ -685,6 +919,13 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         .visionmark-progress-hover__badge--skip {
           background: linear-gradient(135deg, #fb7299, #ff9a8b);
         }
+        .visionmark-progress-hover__badge--ai-high-energy {
+          background: linear-gradient(135deg, #16a34a, #4ade80);
+        }
+        .visionmark-progress-hover__badge--ai-clip {
+          background: linear-gradient(135deg, #eab308, #fde047);
+          color: #3b2f00;
+        }
         .visionmark-progress-hover__title {
           margin: 0 0 8px;
           font-size: 14px;
@@ -718,11 +959,35 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       if (!card) {
         card = document.createElement('div');
         card.id = 'visionmark-progress-hover-card';
-        document.body.appendChild(card);
       }
+
+      const host = this.getProgressHoverCardHost();
+      if (card.parentNode !== host) {
+        host.appendChild(card);
+      }
+
+      card.style.position = host === document.body ? 'fixed' : 'absolute';
 
       this.progressHoverCard = card;
       return card;
+    }
+
+    getProgressHoverCardHost() {
+      const fullscreenHost = document.fullscreenElement
+        || document.webkitFullscreenElement
+        || document.mozFullScreenElement
+        || document.msFullscreenElement;
+
+      if (fullscreenHost instanceof HTMLElement) {
+        const computedStyle = window.getComputedStyle(fullscreenHost);
+        if (computedStyle.position === 'static') {
+          fullscreenHost.dataset.visionmarkHoverHost = 'true';
+          fullscreenHost.style.position = 'relative';
+        }
+        return fullscreenHost;
+      }
+
+      return document.body;
     }
 
     hideProgressHoverCard() {
@@ -845,8 +1110,18 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
     }
 
     positionProgressHoverCard(card, anchorClientX, progressRect) {
-      const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
-      const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+      const host = this.getProgressHoverCardHost();
+      const isBodyHost = host === document.body;
+      const hostRect = isBodyHost
+        ? {
+            left: 0,
+            top: 0,
+            width: window.innerWidth || document.documentElement.clientWidth || 0,
+            height: window.innerHeight || document.documentElement.clientHeight || 0
+          }
+        : host.getBoundingClientRect();
+      const viewportWidth = hostRect.width || window.innerWidth || document.documentElement.clientWidth || 0;
+      const viewportHeight = hostRect.height || window.innerHeight || document.documentElement.clientHeight || 0;
       const preview = this.findNativeProgressPreview();
       const cardRect = card.getBoundingClientRect();
       const gap = 16;
@@ -874,6 +1149,11 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         top = Math.max(12, viewportHeight - cardRect.height - 12);
       }
 
+      if (!isBodyHost) {
+        left -= hostRect.left;
+        top -= hostRect.top;
+      }
+
       card.style.left = `${Math.round(left)}px`;
       card.style.top = `${Math.round(top)}px`;
     }
@@ -896,8 +1176,8 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
 
       const card = this.getProgressHoverCard();
       const segmentKey = this.getSegmentKey(segment);
-      const isPopup = segment.action === 'popup';
-      const badgeText = isPopup ? '重点' : '跳过';
+      const presentation = this.getOfficialProgressPresentation(segment);
+      const badgeText = presentation.badgeText;
       const titleText = this.escapeHtml(details[0]);
       const extraDetails = details.slice(1);
       const timeLabel = `${this.formatTimeLabel(segment.start_time)} - ${this.formatTimeLabel(segment.end_time)}`;
@@ -905,7 +1185,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       if (this.hoveredSegmentKey !== segmentKey) {
         card.innerHTML = `
           <div class="visionmark-progress-hover__eyebrow">
-            <span class="visionmark-progress-hover__badge ${isPopup ? 'visionmark-progress-hover__badge--popup' : 'visionmark-progress-hover__badge--skip'}">${badgeText}</span>
+            <span class="visionmark-progress-hover__badge ${presentation.badgeClass}">${badgeText}</span>
             <span>${this.escapeHtml(timeLabel)}</span>
           </div>
           <p class="visionmark-progress-hover__title">${titleText}</p>
@@ -1040,7 +1320,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       const explanation = typeof point.explanation === 'string' ? point.explanation.trim() : '';
       // 处理热词（hot_words）
       const word = typeof point.word === 'string' ? point.word.trim() : '';
-      const meaning = typeof point.meaning === 'string' ? point.meaning.trim() : '';
+      const meaning = typeof (point.meaning || point.explanation) === 'string' ? (point.meaning || point.explanation).trim() : '';
 
       // 知识点格式：术语: 解释
       // 热词格式：[热词] 解释
@@ -1069,14 +1349,16 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           if (!Number.isFinite(seconds) || !text) return null;
 
           // 判断是热词还是知识点
-          const isHotWord = typeof point === 'object' && point.word && point.meaning;
+          const isHotWord = typeof point === 'object' && point.word && (point.meaning || point.explanation);
           const type = isHotWord ? 'hot-word' : 'knowledge-point';
 
           return {
             id: `${bvid || 'unknown'}-${Math.round(seconds * 10)}-${index}`,
             timeSec: seconds,
             text,
-            type // 添加类型标识
+            type, // 添加类型标识
+            rawWord: point.word || point.term || null,
+            rawExplanation: point.explanation || point.meaning || null
           };
         })
         .filter(Boolean)
@@ -1111,6 +1393,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       this.lastNativeSpeedSampleTs = 0;
       this.nativeDanmuTrackSample = null;
       this.clearKnowledgeDanmuNodes();
+      this.hideHotWordPopup();
     }
 
     ensureKnowledgeDanmuLayer() {
@@ -1479,12 +1762,194 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       this.syncKnowledgeDanmuAnimationState();
     }
 
+    ensureHotWordPopupLayer() {
+      const container = document.querySelector('.bpx-player-video-wrap') ||
+        document.querySelector('.bpx-player-video-area') ||
+        document.querySelector('.bpx-player-container') ||
+        document.querySelector('#bilibili-player');
+
+      if (!container) return null;
+
+      if (getComputedStyle(container).position === 'static') {
+        container.style.position = 'relative';
+      }
+
+      if (!this.hotWordPopupLayer || !document.body.contains(this.hotWordPopupLayer)) {
+        this.hotWordPopupLayer = document.createElement('div');
+        this.hotWordPopupLayer.className = 'visionmark-hotword-popup-layer';
+        this.hotWordPopupLayer.style.cssText = `
+          position: absolute;
+          bottom: 60px; /* 进度条上方 */
+          left: 20px;   /* 视频界面左下角 */
+          z-index: 99999;
+          pointer-events: none;
+          transition: opacity 0.3s ease, transform 0.3s ease;
+          opacity: 0;
+          transform: translateY(10px);
+        `;
+        container.appendChild(this.hotWordPopupLayer);
+      }
+      return this.hotWordPopupLayer;
+    }
+
+    renderHotWordPopup(item) {
+      const layer = this.ensureHotWordPopupLayer();
+      if (!layer) return;
+
+      if (this.currentHotWordId === item.id) return; // 防止重复渲染
+      this.currentHotWordId = item.id;
+
+      const word = item.rawWord || '小知识';
+      const explanation = item.rawExplanation || '暂无详细解释';
+
+      layer.innerHTML = `
+        <div style="background: rgba(0, 0, 0, 0.3);
+                    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+                    border-radius: 8px; padding: 10px 14px;
+                    max-width: 320px; pointer-events: none;
+                    display: flex; flex-direction: column; gap: 6px;">
+           <div style="display: flex; align-items: center; gap: 6px;">
+             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fb7299" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 2c0 0-5 6-5 12a5 5 0 0 0 10 0c0-6-5-12-5-12Z"/>
+                <path d="M12 2v10"/>
+             </svg>
+             <span style="font-size: 16px; font-weight: bold; color: #fb7299; margin: 0; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);">${this.escapeHtml(word)}</span>
+           </div>
+           <div style="font-size: 13px; color: #fff; line-height: 1.5; font-weight: 500; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);">${this.escapeHtml(explanation)}</div>
+        </div>
+      `;
+
+      layer.style.opacity = '1';
+      layer.style.transform = 'translateY(0)';
+    }
+
+    hideHotWordPopup() {
+      if (this.hotWordPopupLayer && this.hotWordPopupLayer.style.opacity !== '0') {
+        this.hotWordPopupLayer.style.opacity = '0';
+        this.hotWordPopupLayer.style.transform = 'translateY(10px)';
+        this.currentHotWordId = null;
+      }
+    }
+
+    handleHotWordPopup(currentTime) {
+      if (!Number.isFinite(currentTime) || !this.knowledgeDanmuQueue || !this.knowledgeDanmuQueue.length) {
+        this.hideHotWordPopup();
+        return;
+      }
+
+      // 寻找当前时间点处于 [timeSec, timeSec + 5秒] 内的热词
+      let activeHotWord = null;
+      for (const item of this.knowledgeDanmuQueue) {
+        if (item.type === 'hot-word') {
+          if (currentTime >= item.timeSec && currentTime <= item.timeSec + 5) {
+            activeHotWord = item;
+            break;
+          }
+        }
+      }
+
+      if (activeHotWord) {
+        this.renderHotWordPopup(activeHotWord);
+      } else {
+        this.hideHotWordPopup();
+      }
+    }
+
+    normalizeAnalysisProgress(progress, fallback = {}) {
+      const percent = Number(progress?.percent);
+      const status = progress?.status || fallback.status || 'running';
+      const stage = progress?.stage || fallback.stage || 'prepare';
+      const stageChanged = stage !== fallback.stage || status !== fallback.status;
+      const localStageStartedAt = stageChanged ? Date.now() : (fallback.localStageStartedAt || Date.now());
+      let normalizedPercent = Number.isFinite(percent)
+        ? Math.max(0, Math.min(100, Math.round(percent)))
+        : (fallback.percent || 0);
+
+      if (status === 'running' && stage === 'model') {
+        const elapsedMs = Math.max(0, Date.now() - localStageStartedAt);
+        const estimatedModelPercent = Math.round(42 + (54 * (1 - Math.exp(-elapsedMs / 90000))));
+        normalizedPercent = Math.max(
+          normalizedPercent,
+          fallback.stage === 'model' ? (fallback.percent || 0) : 0,
+          Math.min(96, estimatedModelPercent)
+        );
+      }
+
+      return {
+        status,
+        stage,
+        percent: normalizedPercent,
+        message: progress?.message || fallback.message || '准备分析视频',
+        detail: progress?.detail || fallback.detail || null,
+        updatedAt: progress?.updatedAt || fallback.updatedAt || null,
+        localStageStartedAt
+      };
+    }
+
+    setAnalysisProgress(progress) {
+      if (!sidebarState) return;
+      sidebarState.analysisProgress = progress
+        ? this.normalizeAnalysisProgress(progress, sidebarState.analysisProgress || {})
+        : null;
+    }
+
+    stopAnalysisProgressPolling() {
+      if (this.analysisProgressPollTimer) {
+        clearInterval(this.analysisProgressPollTimer);
+        this.analysisProgressPollTimer = null;
+      }
+    }
+
+    async requestAnalysisProgress(bvid, token) {
+      const url = `${VIDEO_ANALYSIS_BASE}/video-analysis/status/${encodeURIComponent(bvid)}`;
+
+      try {
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: {
+            'Authorization': 'Bearer ' + token
+          }
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        return await response.json();
+      } catch (error) {
+        console.warn('[AdSkipper] 获取分析进度失败:', error);
+        throw error;
+      }
+    }
+
+    // WebSocket now handles real-time progress updates
 
     async requestAnalysis(bvid, token) {
       const url = VIDEO_ANALYSIS_BASE + "/video-analysis/analyze";
       console.log('[AdSkipper] 请求URL:', url);
-      console.log('[AdSkipper] 请求体:', JSON.stringify({ bvid }));
-      console.log('[AdSkipper] 注意：视频分析无超时限制，可能需要几分钟时间');
+
+      // 自动获取 Bilibili cookies（如果可用）
+      let bilibiliCookies = null;
+      try {
+        if (window.VisionMarkCookieUtils?.getBilibiliCookiesForYtDlp) {
+          bilibiliCookies = await window.VisionMarkCookieUtils.getBilibiliCookiesForYtDlp();
+          if (bilibiliCookies) {
+            console.log('[AdSkipper] 成功获取 Bilibili cookies，将用于视频下载');
+          } else {
+            console.log('[AdSkipper] 未获取到 Bilibili cookies，将使用无 cookies 模式');
+          }
+        }
+      } catch (error) {
+        console.warn('[AdSkipper] 获取 cookies 时出错:', error.message);
+      }
+
+      const requestBody = { bvid };
+      if (bilibiliCookies) {
+        requestBody.bilibili_cookies = bilibiliCookies;
+      }
+
+      console.log('[AdSkipper] 请求体:', JSON.stringify({ bvid })); // 注意：不记录 cookies 内容
+      console.log('[AdSkipper] 注意：视频分析无超时限制');
 
       // 直接使用原生 fetch，不设置超时
       // 视频分析需要很长时间（下载、提取、AI分析），不能有超时限制
@@ -1494,7 +1959,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           'Content-Type': 'application/json',
           'Authorization': 'Bearer ' + token
         },
-        body: JSON.stringify({ bvid })
+        body: JSON.stringify(requestBody)
       });
 
       console.log('[AdSkipper] 响应状态:', res.status, res.statusText);
@@ -1502,7 +1967,12 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       let payload = null;
       try {
         payload = await res.json();
-        console.log('[AdSkipper] 响应数据:', payload);
+        console.log('[AdSkipper] 响应摘要:', {
+          ok: res.ok,
+          status: res.status,
+          success: payload?.success === true,
+          hasData: Boolean(payload?.data)
+        });
       } catch (error) {
         console.error('[AdSkipper] 解析JSON失败:', error);
         payload = null;
@@ -1527,7 +1997,8 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           action: segment.highlight ? 'popup' : 'skip',
           content: typeof segment.description === 'string' ? segment.description : '',
           ad_type: segment.ad_type || (segment.highlight ? 'hard_ad' : 'soft_ad'),
-          is_ai_segment: true
+          is_ai_segment: true,
+          ai_segment_display_type: segment.highlight ? 'high-energy' : 'clip'
         }, index))
         .filter(segment => Number.isFinite(segment.start_time) && Number.isFinite(segment.end_time) && segment.end_time > segment.start_time);
 
@@ -1549,12 +2020,12 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
 
       this.analysisBvid = bvid;
       this.aiSummary = typeof analysisData.summary === 'string' ? analysisData.summary.trim() : '';
+      this.hasAnalysis = true;
       this.segments = aiSegments;
       this.allSegments = aiSegments;
       this.currentSegmentIds = [];
       this.updateKnowledgeDanmuSource(allDanmuItems, bvid);
       this.addSegmentMarkers();
-        this.scheduleSegmentMarkerRetry(2);
 
       if (sidebarState) {
         sidebarState.aiSummary = this.aiSummary || '暂无总结';
@@ -1563,7 +2034,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         sidebarState.hotWords = hotWords;
         sidebarState.bvid = bvid;
         sidebarState.cid = this.player.currentCid || null;
-        sidebarState.segments = aiSegments;
+        sidebarState.segments = this.buildSidebarSegments(aiSegments, analysisData.segments, bvid);
         sidebarState.activeSegmentKey = null;
       }
 
@@ -1632,15 +2103,18 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
               console.log("[AdSkipper] 发现", result.data.ad_segments.length, "个 AI 分析分段");
 
               // 将 AI 分段转换为 TimelineItem 期望的格式
-              const aiSegments = result.data.ad_segments.map((seg, index) => ({
-                id: `ai-${bvid}-${index}`, // 生成唯一 ID
-                start_time: seg.start_time,
-                end_time: seg.end_time,
-                action: seg.highlight ? 'popup' : 'skip', // highlight 为 true 时为重点
-                content: seg.description || '',
-                ad_type: seg.ad_type || (seg.highlight ? 'hard_ad' : 'soft_ad'),
-                is_ai_segment: true // 标记为 AI 分析的片段
-              }));
+              const aiSegments = result.data.ad_segments
+                .map((seg, index) => this.normalizeSegment({
+                  id: `ai-${bvid}-${index}`, // 生成唯一 ID
+                  start_time: Number(seg.start_time ?? seg.start ?? 0),
+                  end_time: Number(seg.end_time ?? seg.end ?? 0),
+                  action: seg.highlight ? 'popup' : 'skip', // highlight 为 true 时为重点
+                  content: typeof seg.description === 'string' ? seg.description : '',
+                  ad_type: seg.ad_type || (seg.highlight ? 'hard_ad' : 'soft_ad'),
+                  is_ai_segment: true, // 标记为 AI 分析的片段
+                  ai_segment_display_type: seg.highlight ? 'high-energy' : 'clip'
+                }, index))
+                .filter(segment => Number.isFinite(segment.start_time) && Number.isFinite(segment.end_time) && segment.end_time > segment.start_time);
 
               // 将 AI 分段添加到侧边栏
               sidebarState.segments = aiSegments;
@@ -1675,7 +2149,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
 
         let token = '';
         token = await this.getToken();
-        console.log('[AdSkipper] Token:', token ? '已获取（前10位: ' + token.substring(0, 10) + '...）' : '未获取');
+        console.log('[AdSkipper] 登录状态:', token ? '已登录' : '未登录');
 
         if (!token) {
           console.log('[AdSkipper] 未登录，跳过视频分析');
@@ -1685,12 +2159,23 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           return;
         }
 
+        // 连接 WebSocket 获取实时进度
+        await this.connectWebSocket(token, bvid);
+        this.currentAnalysisBvid = bvid;
+
         if (sidebarState) {
           sidebarState.isLoading = true;
           sidebarState.loadError = null;
+          sidebarState.analysisProgress = this.normalizeAnalysisProgress({
+            status: 'running',
+            stage: 'prepare',
+            percent: 1,
+            message: '准备分析视频'
+          });
         }
 
         console.log('[AdSkipper] 开始请求分析API...');
+        // 不再需要轮询，直接发送分析请求
         const result = await this.requestAnalysis(bvid, token);
         console.log('[AdSkipper] API返回:', result);
 
@@ -1698,8 +2183,15 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           throw new Error('分析结果无效');
         }
 
+        if (this.player.currentBvid && this.player.currentBvid !== bvid) return;
         this.applyAnalysisData(bvid, result.data);
         if (sidebarState) {
+          sidebarState.analysisProgress = this.normalizeAnalysisProgress({
+            status: 'completed',
+            stage: 'completed',
+            percent: 100,
+            message: '分析完成'
+          }, sidebarState.analysisProgress || {});
           sidebarState.isLoading = false;
         }
         console.log('[AdSkipper] ========== 视频分析完成 ==========');
@@ -1710,10 +2202,18 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           code: error.code,
           stack: error.stack
         });
-        if (sidebarState) {
+        if (sidebarState && (!this.player.currentBvid || this.player.currentBvid === bvid)) {
+          sidebarState.analysisProgress = this.normalizeAnalysisProgress({
+            status: 'failed',
+            stage: 'failed',
+            percent: 100,
+            message: error.message || '分析失败'
+          }, sidebarState.analysisProgress || {});
           sidebarState.isLoading = false;
           sidebarState.loadError = '分析失败: ' + error.message;
         }
+      } finally {
+        this.stopAnalysisProgressPolling();
       }
     }
 
@@ -1743,6 +2243,13 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       if (!segment || segment.action !== 'skip') return;
 
       if (this.skipMode === 'auto') {
+        const segKey = this.getSegmentKey(segment);
+        if (!this.autoSkippedSegments) this.autoSkippedSegments = new Set();
+
+        // 确保每个片段在一次播放中只会被自动跳过一次
+        if (this.autoSkippedSegments.has(segKey)) return;
+        this.autoSkippedSegments.add(segKey);
+
         this.seekToSegmentEnd(segment);
         this.lastSkipTime = Date.now();
         this.showSkipNotification(segment);
@@ -1754,12 +2261,25 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       }
     }
 
-    // 鏇存柊鍚庣殑 checkSkip 鏂规硶
+    // 更新后的 checkSkip 方法
     checkSkip(currentTime) {
       if (this.analysisBvid && this.player.currentBvid && this.analysisBvid !== this.player.currentBvid) {
+        console.log('[AdSkipper] 视频切换检测到！由', this.analysisBvid, '切换为', this.player.currentBvid);
         this.clearKnowledgeDanmuState();
         this.analysisBvid = this.player.currentBvid;
+        this.autoSkippedSegments = new Set();
+
+        // 当页面未刷新单页跳转时，自动为新视频拉取总结/分析
+        this.refreshAnalysisForBvid(this.player.currentBvid);
       }
+
+      // 新增：检测进度条倒退（倒退超过2秒认为是回放或重播）
+      if (this.lastCheckedTime && currentTime < this.lastCheckedTime - 2) {
+          if (this.autoSkippedSegments) {
+              this.autoSkippedSegments.clear();
+          }
+      }
+      this.lastCheckedTime = currentTime;
 
       if (sidebarState) {
         sidebarState.currentTime = currentTime;
@@ -1772,6 +2292,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       }
 
       this.handleKnowledgeDanmu(currentTime);
+      this.handleHotWordPopup(currentTime);
 
       if (!this.segments.length) {
         if (sidebarState) {
@@ -1982,9 +2503,7 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       const types = [
         { val: 'hard_ad', text: '商业内容' },
         { val: 'soft_ad', text: '推广内容' },
-        { val: 'product_placement', text: '品牌植入' },
-        { val: 'intro_ad', text: '片头广告' },
-        { val: 'mid_ad', text: '中段广告' }
+        { val: 'product_placement', text: '品牌植入' }
       ];
       types.forEach((item) => {
         const option = document.createElement('option');
@@ -2225,12 +2744,10 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
       const headers = { "Content-Type": "application/json" };
       if (token) {
         headers['Authorization'] = 'Bearer ' + token;
-        console.log('[AdSkipper] 认证头:', 'Bearer ' + token.substring(0, 20) + '...');
       } else {
         console.warn('[AdSkipper] 警告：请求未携带令牌');
       }
 
-      console.log('[AdSkipper] 请求头:', headers);
 
       const res = await this.safeFetch(API_BASE + "/segments", {
         method: "POST",
@@ -2539,9 +3056,6 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         progressContainer.querySelector('.bili-progress-slip') ||
         progressContainer.querySelector('.bpx-player-progress-buffer');
       const markerHost = progressSlide || progressContainer;
-      if (!progressSlide) {
-        console.warn('[AdSkipper] progress hover: progressSlide not found, fallback to progressContainer', progressContainer.className || progressContainer.id);
-      }
 
       if (this.segmentMarkerRetryTimer) {
         clearTimeout(this.segmentMarkerRetryTimer);
@@ -2562,14 +3076,11 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
         const startPercent = (segment.start_time / duration) * 100;
         const endPercent = (segment.end_time / duration) * 100;
         const width = Math.max(endPercent - startPercent, 0.8);
+        const presentation = this.getOfficialProgressPresentation(segment);
 
         const marker = document.createElement('div');
         marker.className = 'adskipper-progress-marker';
         marker.setAttribute('data-segment-id', this.getSegmentKey(segment, index));
-
-        const markerColor = segment.action === 'popup'
-          ? 'rgba(71, 167, 255, 0.88)'
-          : 'rgba(251, 114, 153, 0.82)';
 
         marker.style.cssText = `
           position: absolute;
@@ -2577,17 +3088,16 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
           top: 0;
           bottom: 0;
           width: ${width}%;
-          background: ${markerColor} !important;
+          background: ${presentation.markerColor} !important;
           pointer-events: none;
           z-index: 999 !important;
           height: 100% !important;
         `;
 
-        const titleContent = segment.action === 'popup' && segment.content
+        const titleContent = presentation.includeContentInMarkerTitle && segment.content
           ? ` | ${segment.content.slice(0, 36)}`
           : '';
-        const actionText = segment.action === 'popup' ? '重点' : '跳过';
-        marker.title = `${segment.start_time.toFixed(1)}s - ${segment.end_time.toFixed(1)}s | ${actionText}${titleContent}`;
+        marker.title = `${segment.start_time.toFixed(1)}s - ${segment.end_time.toFixed(1)}s | ${presentation.actionText}${titleContent}`;
 
         markerHost.appendChild(marker);
       });
@@ -2600,12 +3110,3 @@ import { ANALYSIS_UPDATED_EVENT } from './events.js';
 
   new AdSkipperCore().init();
 })();
-
-
-
-
-
-
-
-
-

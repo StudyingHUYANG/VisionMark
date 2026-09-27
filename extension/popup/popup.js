@@ -7,6 +7,12 @@ const NETWORK_ERROR_CODE = 'NETWORK_UNAVAILABLE';
 const NETWORK_COOLDOWN_MS = 30000;
 const NETWORK_TIMEOUT_MS = 6000;
 const USER_CACHE_TTL_MS = 5000;
+const MODEL_DEFAULT_CONFIG = Object.freeze({
+  provider: 'qwen',
+  baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+  modelName: 'qwen-vl-max',
+  isEnabled: true
+});
 
 const networkState = {
   offlineUntil: 0,
@@ -18,6 +24,25 @@ const userInfoCache = {
   data: null,
   updatedAt: 0,
   pending: null
+};
+
+const modelConfigState = {
+  configured: false,
+  hasApiKey: false,
+  hasCustomConfig: false,
+  effectiveSource: 'none',
+  loading: false,
+  saving: false,
+  testing: false,
+  feedbackType: '',
+  feedbackMessage: '',
+  form: {
+    provider: MODEL_DEFAULT_CONFIG.provider,
+    baseUrl: MODEL_DEFAULT_CONFIG.baseUrl,
+    modelName: MODEL_DEFAULT_CONFIG.modelName,
+    apiKey: '',
+    isEnabled: MODEL_DEFAULT_CONFIG.isEnabled
+  }
 };
 
 function createNetworkUnavailableError() {
@@ -59,14 +84,15 @@ async function safeFetch(url, options = {}) {
     throw createNetworkUnavailableError();
   }
 
+  const { timeoutMs = NETWORK_TIMEOUT_MS, ...fetchOptions } = options;
   const controller = options.signal ? null : new AbortController();
   const timeoutId = setTimeout(() => {
     if (controller) controller.abort();
-  }, NETWORK_TIMEOUT_MS);
+  }, timeoutMs);
 
   try {
     const response = await fetch(url, {
-      ...options,
+      ...fetchOptions,
       signal: options.signal || (controller ? controller.signal : undefined)
     });
     clearTimeout(timeoutId);
@@ -107,6 +133,41 @@ function formatTierLabel(tier) {
   return '普通会员';
 }
 
+function showPanel(panelId) {
+  document.getElementById('auth-form').style.display = panelId === 'auth-form' ? 'block' : 'none';
+  document.getElementById('user-panel').style.display = panelId === 'user-panel' ? 'block' : 'none';
+  document.getElementById('model-config-panel').style.display = panelId === 'model-config-panel' ? 'block' : 'none';
+  document.body.classList.toggle('popup-mode-model-config', panelId === 'model-config-panel');
+}
+
+function getStoredUser() {
+  try {
+    return JSON.parse(localStorage.getItem('adskipper_user') || '{}');
+  } catch (error) {
+    return {};
+  }
+}
+
+function clearStoredAuthSession() {
+  localStorage.removeItem('adskipper_token');
+  localStorage.removeItem('adskipper_user');
+  resetUserInfoCache();
+  chrome.storage.local.remove(['adskipper_token']);
+}
+
+function isJwtExpired(token) {
+  try {
+    const payloadPart = String(token || '').split('.')[1];
+    if (!payloadPart) return true;
+    const normalized = payloadPart.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
+    const payload = JSON.parse(atob(padded));
+    return !Number.isFinite(payload.exp) || payload.exp * 1000 <= Date.now();
+  } catch (error) {
+    return true;
+  }
+}
+
 // 统一的API请求函数
 async function apiRequest(endpoint, options = {}) {
   try {
@@ -129,7 +190,11 @@ async function apiRequest(endpoint, options = {}) {
     }
     
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || '请求失败');
+    if (res.status === 401) {
+      clearStoredAuthSession();
+      showLoginForm();
+    }
+    if (!res.ok) throw new Error(data.message || data.error || `请求失败（HTTP ${res.status}）`);
     return data;
   } catch(err) {
     if (err.code !== NETWORK_ERROR_CODE) {
@@ -143,6 +208,12 @@ async function apiRequest(endpoint, options = {}) {
 async function checkAuth() {
   const token = localStorage.getItem('adskipper_token');
   if (!token) {
+    showLoginForm();
+    return false;
+  }
+
+  if (isJwtExpired(token)) {
+    clearStoredAuthSession();
     showLoginForm();
     return false;
   }
@@ -186,14 +257,12 @@ async function getCurrentUserInfo(forceRefresh = false) {
 }
 
 function showLoginForm() {
-  document.getElementById('auth-form').style.display = 'block';
-  document.getElementById('user-panel').style.display = 'none';
+  showPanel('auth-form');
 }
 
 // 显示用户面板并获取标注数量
 async function showUserPanel(user) {
-  document.getElementById('auth-form').style.display = 'none';
-  document.getElementById('user-panel').style.display = 'block';
+  showPanel('user-panel');
   document.getElementById('user-panel').classList.add('user-panel-active');
 
   document.getElementById('display-username').textContent = user.username;
@@ -210,20 +279,14 @@ async function showUserPanel(user) {
 // 加载用户标注数量
 async function loadUserContributionCount() {
   try {
-    // 首先获取当前用户的ID
-    const userInfo = await getCurrentUserInfo();
-    const userId = await getUserIdByUsername(userInfo.username);
-    
-    if (userId) {
-      // 调用用户贡献API获取标注总数
-      const response = await safeFetch(`${API_BASE}/stats/user/contributions?user_id=${userId}&page_size=1`);
-      if (response.ok) {
-        const data = await response.json();
-        if (data.code === 200) {
-          document.getElementById('display-count').textContent = data.data.total || 0;
-          console.log('[Popup] 标注数量已更新:', data.data.total);
-        }
-      }
+    const token = localStorage.getItem('adskipper_token');
+    if (!token) return;
+    const response = await safeFetch(`${API_BASE}/segments/user`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (response.ok) {
+      const data = await response.json();
+      document.getElementById('display-count').textContent = data.segments?.length || 0;
     }
   } catch(err) {
     if (err.code !== NETWORK_ERROR_CODE) {
@@ -354,11 +417,9 @@ function toggleMode() {
 }
 
 function logout() {
-  localStorage.removeItem('adskipper_token');
-  localStorage.removeItem('adskipper_user');
-  resetUserInfoCache();
-  // 同时清理 chrome.storage.local
-  chrome.storage.local.remove(['adskipper_token']);
+  clearStoredAuthSession();
+  resetModelConfigForm();
+  setModelConfigFeedback('', '');
   showLoginForm();
 }
 
@@ -388,24 +449,327 @@ function setSkipMode(mode) {
   });
 }
 
-// 刷新功能
-async function refreshAllData() {
-  const refreshBtn = document.getElementById('refresh-btn');
-  const originalText = refreshBtn.innerHTML;
-  refreshBtn.innerHTML = '🔄 刷新中...';
-  refreshBtn.disabled = true;
-  
-  try {
-    await refreshUserInfo();
-    showError('✓ 数据已刷新');
-  } catch(err) {
-    showError('刷新失败: ' + err.message);
-  } finally {
-    setTimeout(() => {
-      refreshBtn.innerHTML = originalText;
-      refreshBtn.disabled = false;
-    }, 1000);
+function getModelConfigElements() {
+  return {
+    panel: document.getElementById('model-config-panel'),
+    provider: document.getElementById('model-provider'),
+    baseUrl: document.getElementById('model-base-url'),
+    modelName: document.getElementById('model-name'),
+    apiKey: document.getElementById('model-api-key'),
+    toggle: document.getElementById('model-enabled-toggle'),
+    headerStatePill: document.getElementById('model-enabled-state-pill'),
+    status: document.getElementById('model-config-status'),
+    statusMeta: document.getElementById('model-config-status-meta'),
+    apiKeyStatus: document.getElementById('model-api-key-status'),
+    effectiveSource: document.getElementById('model-effective-source'),
+    apiKeyBadge: document.getElementById('model-api-key-badge'),
+    apiKeyHint: document.getElementById('model-api-key-hint'),
+    feedback: document.getElementById('model-config-feedback'),
+    testBtn: document.getElementById('model-test-btn'),
+    saveBtn: document.getElementById('model-save-btn'),
+    backBtn: document.getElementById('model-config-back')
+  };
+}
+
+function resetModelConfigForm() {
+  modelConfigState.configured = false;
+  modelConfigState.hasApiKey = false;
+  modelConfigState.hasCustomConfig = false;
+  modelConfigState.effectiveSource = 'none';
+  modelConfigState.form.provider = MODEL_DEFAULT_CONFIG.provider;
+  modelConfigState.form.baseUrl = MODEL_DEFAULT_CONFIG.baseUrl;
+  modelConfigState.form.modelName = MODEL_DEFAULT_CONFIG.modelName;
+  modelConfigState.form.apiKey = '';
+  modelConfigState.form.isEnabled = MODEL_DEFAULT_CONFIG.isEnabled;
+}
+
+function setModelConfigFeedback(type, message) {
+  modelConfigState.feedbackType = type || '';
+  modelConfigState.feedbackMessage = message || '';
+}
+
+function getModelConfigStatusLabel() {
+  if (modelConfigState.effectiveSource === 'user_custom') return '已配置（自定义）';
+  if (modelConfigState.effectiveSource === 'system_default' && modelConfigState.hasCustomConfig) {
+    return '已保存自定义配置';
   }
+  if (modelConfigState.effectiveSource === 'system_default') return '已配置（系统默认）';
+  return '未配置';
+}
+
+function getModelConfigStatusMeta() {
+  if (modelConfigState.effectiveSource === 'system_default' && modelConfigState.hasCustomConfig) {
+    return '当前生效：系统默认';
+  }
+  return '';
+}
+
+function getModelConfigEffectiveSourceLabel() {
+  if (modelConfigState.effectiveSource === 'user_custom') return '自定义配置';
+  if (modelConfigState.effectiveSource === 'system_default') return '系统默认';
+  return '暂无可用配置';
+}
+
+function getModelConfigApiKeyStatusLabel() {
+  if (!modelConfigState.hasApiKey) return '未配置';
+  if (modelConfigState.effectiveSource === 'system_default' && !modelConfigState.hasCustomConfig) return '系统默认 Key 可用';
+  if (modelConfigState.effectiveSource === 'system_default' && modelConfigState.hasCustomConfig) return '已保存自定义 Key';
+  return '已配置';
+}
+
+function getModelConfigApiKeyHint() {
+  if (!modelConfigState.hasCustomConfig) {
+    return modelConfigState.effectiveSource === 'system_default'
+      ? '当前使用系统默认 Key；不保存新 Key 时继续沿用默认配置。'
+      : '首次保存前必须填写 API Key。';
+  }
+
+  if (modelConfigState.effectiveSource === 'user_custom') {
+    return '已保存自定义 Key；输入新值才会替换。';
+  }
+
+  return '当前使用系统默认 Key；已保存的自定义 Key 在重新启用后生效。';
+}
+
+function renderModelConfigPanel() {
+  const elements = getModelConfigElements();
+  if (!elements.panel) return;
+
+  const formDisabled = modelConfigState.loading || modelConfigState.saving || modelConfigState.testing;
+  const isBusy = modelConfigState.saving || modelConfigState.testing;
+  const trimmedApiKey = String(modelConfigState.form.apiKey || '').trim();
+  const testingSystemDefault = modelConfigState.effectiveSource === 'system_default' && !trimmedApiKey;
+
+  elements.provider.value = modelConfigState.form.provider;
+  elements.baseUrl.value = modelConfigState.form.baseUrl;
+  elements.modelName.value = modelConfigState.form.modelName;
+  elements.apiKey.value = modelConfigState.form.apiKey;
+
+  elements.panel.dataset.source = modelConfigState.effectiveSource;
+  elements.panel.dataset.configured = String(modelConfigState.configured);
+  elements.panel.dataset.custom = String(modelConfigState.hasCustomConfig);
+  elements.panel.dataset.enabled = String(modelConfigState.form.isEnabled);
+
+  elements.status.textContent = getModelConfigStatusLabel();
+  elements.statusMeta.textContent = getModelConfigStatusMeta();
+  elements.statusMeta.style.display = elements.statusMeta.textContent ? 'block' : 'none';
+  elements.apiKeyStatus.textContent = getModelConfigApiKeyStatusLabel();
+  elements.effectiveSource.textContent = getModelConfigEffectiveSourceLabel();
+  elements.apiKeyBadge.textContent = modelConfigState.hasApiKey ? '已配置' : '未配置';
+  elements.apiKeyBadge.classList.toggle('active', modelConfigState.hasApiKey);
+  elements.apiKeyHint.textContent = getModelConfigApiKeyHint();
+
+  if (elements.headerStatePill) {
+    let stateLabel = '待配置';
+    let isInactive = true;
+
+    if (modelConfigState.hasCustomConfig) {
+      stateLabel = modelConfigState.form.isEnabled ? '当前启用' : '已暂停';
+      isInactive = !modelConfigState.form.isEnabled;
+    } else if (modelConfigState.effectiveSource === 'system_default') {
+      stateLabel = '默认兜底';
+      isInactive = false;
+    }
+
+    elements.headerStatePill.textContent = stateLabel;
+    elements.headerStatePill.classList.toggle('inactive', isInactive);
+  }
+
+  elements.toggle.classList.toggle('active', modelConfigState.form.isEnabled);
+  elements.toggle.setAttribute('aria-checked', String(modelConfigState.form.isEnabled));
+
+  elements.provider.disabled = formDisabled;
+  elements.baseUrl.disabled = formDisabled;
+  elements.modelName.disabled = formDisabled;
+  elements.apiKey.disabled = formDisabled;
+  elements.toggle.disabled = formDisabled;
+  elements.testBtn.disabled = formDisabled;
+  elements.saveBtn.disabled = formDisabled;
+  elements.backBtn.disabled = isBusy;
+
+  elements.testBtn.textContent = modelConfigState.testing
+    ? '测试中...'
+    : testingSystemDefault
+      ? '测试默认连接'
+      : '测试连接';
+  elements.saveBtn.textContent = modelConfigState.saving
+    ? '保存中...'
+    : modelConfigState.hasCustomConfig
+      ? '保存配置'
+      : '保存为自定义配置';
+
+  elements.feedback.className = 'panel-feedback';
+  elements.feedback.textContent = '';
+  if (modelConfigState.feedbackMessage) {
+    elements.feedback.classList.add(`panel-feedback--${modelConfigState.feedbackType || 'info'}`);
+    elements.feedback.textContent = modelConfigState.feedbackMessage;
+  }
+}
+
+function openModelConfigPanel() {
+  showPanel('model-config-panel');
+  renderModelConfigPanel();
+  loadModelConfig();
+}
+
+function closeModelConfigPanel() {
+  const user = getStoredUser();
+  if (user.username) {
+    showPanel('user-panel');
+  } else {
+    showLoginForm();
+  }
+}
+
+function validateModelConfigFields() {
+  if (!String(modelConfigState.form.provider || '').trim()) return '请选择 Provider';
+  if (!String(modelConfigState.form.baseUrl || '').trim()) return '请填写 Base URL';
+  if (!String(modelConfigState.form.modelName || '').trim()) return '请填写 Model Name';
+  return '';
+}
+
+function buildModelConfigPayload(includeApiKey = false) {
+  const payload = {
+    provider: String(modelConfigState.form.provider || '').trim(),
+    baseUrl: String(modelConfigState.form.baseUrl || '').trim(),
+    modelName: String(modelConfigState.form.modelName || '').trim(),
+    isEnabled: Boolean(modelConfigState.form.isEnabled)
+  };
+
+  const trimmedApiKey = String(modelConfigState.form.apiKey || '').trim();
+  if (includeApiKey) {
+    payload.apiKey = trimmedApiKey;
+  } else if (trimmedApiKey) {
+    payload.apiKey = trimmedApiKey;
+  }
+
+  return payload;
+}
+
+async function loadModelConfig(options = {}) {
+  modelConfigState.loading = true;
+  if (!options.keepFeedback) {
+    setModelConfigFeedback('info', '正在同步当前配置...');
+  }
+  renderModelConfigPanel();
+
+  try {
+    const result = await apiRequest('/model-config', { method: 'GET' });
+    const incoming = result?.data || null;
+
+    modelConfigState.configured = Boolean(result?.configured);
+    modelConfigState.hasCustomConfig = Boolean(result?.hasCustomConfig);
+    modelConfigState.effectiveSource = typeof result?.effectiveSource === 'string' ? result.effectiveSource : 'none';
+    modelConfigState.hasApiKey = Boolean(incoming?.hasApiKey);
+    modelConfigState.form.provider = incoming?.provider || MODEL_DEFAULT_CONFIG.provider;
+    modelConfigState.form.baseUrl = incoming?.baseUrl || MODEL_DEFAULT_CONFIG.baseUrl;
+    modelConfigState.form.modelName = incoming?.modelName || MODEL_DEFAULT_CONFIG.modelName;
+    modelConfigState.form.apiKey = '';
+    modelConfigState.form.isEnabled = typeof incoming?.isEnabled === 'boolean'
+      ? incoming.isEnabled
+      : MODEL_DEFAULT_CONFIG.isEnabled;
+
+    if (!options.keepFeedback) {
+      setModelConfigFeedback('', '');
+    }
+  } catch (error) {
+    resetModelConfigForm();
+    setModelConfigFeedback('error', error.message || '读取配置失败，请稍后重试');
+  } finally {
+    modelConfigState.loading = false;
+    renderModelConfigPanel();
+  }
+}
+
+async function handleModelConfigSave() {
+  const validationError = validateModelConfigFields();
+  if (validationError) {
+    setModelConfigFeedback('error', validationError);
+    renderModelConfigPanel();
+    return;
+  }
+
+  const requiresApiKey = !modelConfigState.hasCustomConfig || !modelConfigState.hasApiKey;
+  if (requiresApiKey && !String(modelConfigState.form.apiKey || '').trim()) {
+    setModelConfigFeedback('error', '首次保存前请先填写 API Key');
+    renderModelConfigPanel();
+    return;
+  }
+
+  modelConfigState.saving = true;
+  setModelConfigFeedback('', '');
+  renderModelConfigPanel();
+
+  try {
+    await apiRequest('/model-config', {
+      method: 'POST',
+      body: JSON.stringify(buildModelConfigPayload(false))
+    });
+
+    modelConfigState.form.apiKey = '';
+    await loadModelConfig({ keepFeedback: true });
+    setModelConfigFeedback('success', '配置保存成功');
+  } catch (error) {
+    setModelConfigFeedback('error', error.message || '保存配置失败');
+  } finally {
+    modelConfigState.saving = false;
+    renderModelConfigPanel();
+  }
+}
+
+async function handleModelConfigTest() {
+  const validationError = validateModelConfigFields();
+  if (validationError) {
+    setModelConfigFeedback('error', validationError);
+    renderModelConfigPanel();
+    return;
+  }
+
+  const trimmedApiKey = String(modelConfigState.form.apiKey || '').trim();
+  const useDefaultKey = modelConfigState.effectiveSource === 'system_default' && !trimmedApiKey;
+  const hasSavedKey = modelConfigState.hasCustomConfig && modelConfigState.hasApiKey;
+
+  if (!trimmedApiKey && !useDefaultKey && !hasSavedKey) {
+    setModelConfigFeedback('error', '请先填写 API Key');
+    renderModelConfigPanel();
+    return;
+  }
+
+  modelConfigState.testing = true;
+  setModelConfigFeedback('', '');
+  renderModelConfigPanel();
+
+  try {
+    const result = await apiRequest('/model-config/test', {
+      method: 'POST',
+      timeoutMs: 30000,
+      body: JSON.stringify({
+        ...buildModelConfigPayload(true),
+        useDefaultKey
+      })
+    });
+
+    setModelConfigFeedback('success', result?.message || result?.reply || '连接成功');
+  } catch (error) {
+    setModelConfigFeedback('error', error.message || '测试连接失败');
+  } finally {
+    modelConfigState.testing = false;
+    renderModelConfigPanel();
+  }
+}
+
+function handleModelConfigInputChange() {
+  const elements = getModelConfigElements();
+  modelConfigState.form.provider = elements.provider.value;
+  modelConfigState.form.baseUrl = elements.baseUrl.value;
+  modelConfigState.form.modelName = elements.modelName.value;
+  modelConfigState.form.apiKey = elements.apiKey.value;
+}
+
+function toggleModelConfigEnabled() {
+  if (modelConfigState.loading || modelConfigState.saving || modelConfigState.testing) return;
+  modelConfigState.form.isEnabled = !modelConfigState.form.isEnabled;
+  renderModelConfigPanel();
 }
 
 // 初始化
@@ -424,8 +788,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('switch-text').onclick = toggleMode;
   document.getElementById('logout-btn').onclick = logout;
   document.getElementById('history-btn').onclick = openHistoryPage;
-  // 绑定刷新按钮
-  document.getElementById('refresh-btn').onclick = refreshAllData;
+  document.getElementById('model-config-btn').onclick = openModelConfigPanel;
+  document.getElementById('model-config-back').onclick = closeModelConfigPanel;
+  document.getElementById('model-enabled-toggle').onclick = toggleModelConfigEnabled;
+  document.getElementById('model-test-btn').onclick = handleModelConfigTest;
+  document.getElementById('model-save-btn').onclick = handleModelConfigSave;
+  document.getElementById('model-provider').onchange = handleModelConfigInputChange;
+  document.getElementById('model-base-url').oninput = handleModelConfigInputChange;
+  document.getElementById('model-name').oninput = handleModelConfigInputChange;
+  document.getElementById('model-api-key').oninput = handleModelConfigInputChange;
+  renderModelConfigPanel();
 
   // 绑定登录后面板的跳过模式切换按钮
   document.getElementById('user-mode-auto').onclick = () => setSkipMode('auto');

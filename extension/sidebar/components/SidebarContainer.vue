@@ -12,6 +12,17 @@
     />
 
     <div class="vm-sidebar__content">
+      <AnalysisProgress
+        v-if="loading && analysisProgress"
+        :progress="analysisProgress"
+      />
+
+      <SemanticSearch
+        v-if="!loading && !error && summary"
+        :bvid="bvid"
+        @seek="handleSeek"
+      />
+
       <SummaryCard
         :summary="summary"
         :loading="loading"
@@ -41,16 +52,24 @@
       @confirm="handleDeleteConfirm"
       @cancel="handleDeleteCancel"
     />
+
+    <ModelConfigDialog
+      :visible="modelConfigVisible"
+      @update:visible="handleModelConfigVisibility"
+    />
   </aside>
 </template>
 
 <script setup>
 import { ref, computed, watch } from 'vue';
 import SidebarHeader from './SidebarHeader.vue';
+import SemanticSearch from './SemanticSearch.vue';
+import AnalysisProgress from './AnalysisProgress.vue';
 import SummaryCard from './SummaryCard.vue';
 import AIAnalysisDetails from './AIAnalysisDetails.vue';
 import TimelineList from './TimelineList.vue';
 import ConfirmDialog from './ConfirmDialog.vue';
+import ModelConfigDialog from './ModelConfigDialog.vue';
 
 const props = defineProps({
   visible: {
@@ -101,6 +120,14 @@ const props = defineProps({
     type: String,
     default: null
   },
+  analysisProgress: {
+    type: Object,
+    default: null
+  },
+  modelConfigVisible: {
+    type: Boolean,
+    default: false
+  },
   loading: {
     type: Boolean,
     default: false
@@ -139,7 +166,7 @@ watch(() => props.error, (newVal) => {
   console.log('[SidebarContainer] error changed:', newVal);
 }, { immediate: true });
 
-const emit = defineEmits(['update:visible', 'seek', 'refresh', 'delete']);
+const emit = defineEmits(['update:visible', 'update:modelConfigVisible', 'seek', 'refresh', 'delete']);
 
 // Delete dialog state
 const showDeleteDialog = ref(false);
@@ -178,6 +205,10 @@ function handleDeleteConfirm() {
 
 function handleDeleteCancel() {
   pendingDeleteId.value = null;
+}
+
+function handleModelConfigVisibility(value) {
+  emit('update:modelConfigVisible', value);
 }
 </script>
 

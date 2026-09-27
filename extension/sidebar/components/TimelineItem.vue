@@ -28,14 +28,17 @@
           </svg>
         </button>
       </div>
-      <p v-if="segment.action === 'popup'" class="vm-timeline-item__desc">
+      <p v-if="segment.is_chapter" class="vm-timeline-item__desc">
+        {{ segment.content }}
+      </p>
+      <p v-else-if="segment.action === 'popup'" class="vm-timeline-item__desc">
         {{ segment.content || '该片段暂无文案' }}
       </p>
       <p v-else-if="segment.is_ai_segment" class="vm-timeline-item__desc">
         {{ segment.content || '视频片段' }}
       </p>
       <p v-else class="vm-timeline-item__desc vm-timeline-item__desc--skip">
-        该片段将在自动模式下快进
+        {{ segment.content || '该片段将在自动模式下快进' }}
       </p>
     </div>
   </div>
@@ -58,11 +61,13 @@ const props = defineProps({
 const emit = defineEmits(['seek', 'delete']);
 
 const tagType = computed(() => {
+  if (props.segment.is_chapter) return 'chapter';
   return props.segment.action === 'popup' ? 'highlight' : 'skip';
 });
 
 const tagText = computed(() => {
   if (props.segment.is_ai_segment) {
+    if (props.segment.is_chapter) return '章节';
     return props.segment.action === 'popup' ? '高能' : '片段';
   }
   return props.segment.action === 'popup' ? '重点' : '跳过';
@@ -192,6 +197,17 @@ function handleDelete() {
   color: var(--vm-color-highlight);
   border: 1px solid rgba(25, 118, 210, 0.15);
   box-shadow: 0 1px 3px rgba(25, 118, 210, 0.08);
+}
+
+.vm-tag--chapter {
+  background: rgba(33, 150, 243, 0.1);
+  color: #1976d2;
+  border: 1px solid rgba(33, 150, 243, 0.2);
+}
+
+.vm-timeline-item__node--chapter {
+  background: #2196f3;
+  border-color: #1976d2;
 }
 
 .vm-tag--skip {
