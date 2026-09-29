@@ -1,38 +1,43 @@
 
-# Dependencies
+# ===== 依赖 =====
 node_modules/
 .venv/
+venv/
 
-# Database
+# ===== 数据库 =====
 *.db
 *.db-shm
 *.db-wal
+# 规范要求显式声明
 server/database/app.db
 
-# Environment variables
+# ===== 环境变量 =====
 .env
+.env.*
+!.env.example
 
-# Logs
+# ===== 日志 / 系统文件 =====
 *.log
-
-# System files
 .DS_Store
 Thumbs.db
 
-# 忽略SQLite数据库文件（规范要求）
-server/database/app.db
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
 
-# 忽略日志/临时文件
-*.log
-
-.agent
-.claude
-CLAUDE.md
-
+# ===== 构建产物 =====
+dist/
+# extension/dist 被 extension/manifest.json 直接引用，必须提交
+!extension/dist/
 build_output.txt
-dist
 build_test.js
 downloads/
 
-# Local configuration
+# ===== 本地配置 =====
+.agent
 .claude/settings.local.json
+CLAUDE.md
+
+# ===== 调试产物 =====
+server/debug/

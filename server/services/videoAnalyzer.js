@@ -10,6 +10,21 @@ const { ossClient, hasOssConfig } = require('../utils/oss');
 const EmbeddingService = require('./embeddingService');
 const vectorDb = require('./vectorDb');
 const BilibiliDownloader = require('./bilibiliDownloader');
+const {
+  ERROR_CODES,
+  ERROR_REASONS,
+  ERROR_STAGES,
+  DownloadError,
+  isDownloadError,
+  isFatalDownloadError,
+  classifyYtDlpFailure,
+  attemptEntryFromError,
+  finalizeDownloadError,
+  withAttempts,
+  buildUserFacingMessage,
+  scrubSecrets,
+  AttemptLog
+} = BilibiliDownloader;
 const { analyzeVisualCuts, analyzeSceneCutsWithFfmpeg } = require('./visualCutDetector');
 const keywordCutService = require('./segment/keywordCuts');
 const { detectAudioCuts } = require('./segment/audioCuts');
@@ -30,9 +45,27 @@ function clampPercent(percent) {
   return Math.max(0, Math.min(100, Math.round(numericPercent)));
 }
 
+const YTDLP_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+/** 取 yt-dlp 输出末尾若干行用于诊断，先脱敏再截断 */
+function truncateTail(text, maxLength = 400) {
+  const lines = scrubSecrets(text || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const tail = lines.slice(-4).join(' | ');
+  return tail.length > maxLength ? `${tail.slice(0, maxLength)}…` : (tail || '无输出');
+}
+
+/** 判断错误是否属于 B 站风控（412） */
+function isRiskControlError(error) {
+  return isDownloadError(error) && error.code === ERROR_CODES.RISK_CONTROL_412;
+}
+
 function resolveFfprobePath() {
-  const siblingFfprobePath = ffmpegPath.replace(/ffmpeg$/, 'ffprobe');
-  if (fs.existsSync(siblingFfprobePath)) return siblingFfprobePath;
+  // 注意 @ffmpeg-installer 在 Windows 下给的是 ffmpeg.exe，必须连扩展名一起替换
+  const siblingFfprobePath = ffmpegPath.replace(/(ffmpeg)(\.exe)?$/i, (_match, _name, ext) => `ffprobe${ext || ''}`);
+  if (siblingFfprobePath !== ffmpegPath && fs.existsSync(siblingFfprobePath)) return siblingFfprobePath;
+
+  const repoSiblingPath = path.join(__dirname, '../../scripts/ffmpeg/ffprobe.exe');
+  if (fs.existsSync(repoSiblingPath)) return repoSiblingPath;
 
   const probe = spawnSync('ffprobe', ['-version'], { encoding: 'utf8' });
   if (!probe.error && probe.status === 0) return 'ffprobe';
@@ -72,10 +105,16 @@ function buildFallbackAnalysisResult(reason, transcript = null, visualCuts = [],
 }
 
 class VideoAnalyzer {
-  constructor(downloadDir, wss = null) {
+  constructor(downloadDir, wss = null, options = {}) {
     this.downloadDir = downloadDir || path.join(__dirname, '../../downloads');
     this.wss = wss; // WebSocket 服务器实例
+    this.spawnImpl = options.spawnImpl || spawn; // 便于测试注入
     this.ensureDownloadDir();
+    // 复用 BilibiliDownloader 的校验能力（ffprobe/体积），避免两套实现漂移
+    this.downloader = options.downloader || new BilibiliDownloader({ downloadDir: this.downloadDir });
+    this.maxYtDlpAttempts = Number.isFinite(options.maxYtDlpAttempts)
+      ? Math.max(1, options.maxYtDlpAttempts)
+      : 4;
   }
 
   getEffectiveModelConfig(userConfig = null) {
@@ -101,7 +140,8 @@ class VideoAnalyzer {
     // 通过 WebSocket 推送给所有连接的客户端
     if (this.wss) {
       this.wss.clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
+        // 1 === WebSocket.OPEN；此处不能直接引用 WebSocket 类，本模块未导入它
+        if (client.readyState === 1) {
           try {
             client.send(JSON.stringify({
               type: 'progress',
@@ -143,81 +183,93 @@ class VideoAnalyzer {
   }
 
   /**
-   * 使用yt-dlp下载B站视频（支持手动cookies文件）
+   * 查找并校验可用的缓存视频；校验不通过的文件会被删除，避免命中中断产物。
+   * 只认规范文件名 `{bvid}.mp4`：`{bvid}.durl-2.mp4`、`{bvid}.f80.mp4` 等是中断留下的
+   * 中间产物，本身也是合法 mp4，用模糊匹配会被误当成整片缓存。
    */
-  async downloadVideo(bvid, url, onProgress = null, cookiesPath = null) {
+  async findUsableCachedVideo(bvid) {
+    if (!bvid) return null;
+
+    const candidate = path.join(this.downloadDir, `${bvid}.mp4`);
+    if (!fs.existsSync(candidate)) return null;
+
+    if (await this.downloader.isUsableCache(candidate)) return candidate;
+    return null;
+  }
+
+  /** 只打印 Cookie 的缺失项，绝不输出 Cookie 值 */
+  logCookieDiagnostics(cookiesPath) {
+    try {
+      const cookiesContent = fs.readFileSync(cookiesPath, 'utf8');
+      const requiredCookies = ['SESSDATA', 'bili_jct', 'DedeUserID'];
+      const missing = requiredCookies.filter(name => !new RegExp(`(?:^|\\n)[^\\n]*\\t${name}\\t`).test(cookiesContent));
+      if (missing.length > 0) {
+        console.warn(`[VideoAnalyzer] cookies 可能不完整，缺少: ${missing.join(', ')}`);
+      }
+    } catch (error) {
+      console.warn('[VideoAnalyzer] 读取 cookies 文件失败，继续尝试下载:', scrubSecrets(error.message));
+    }
+  }
+
+  /**
+   * 单次 yt-dlp 尝试。失败时抛出带 code/reason 的 DownloadError。
+   */
+  async runYtDlpAttempt({
+    bvid,
+    url,
+    outputPath,
+    onProgress = null,
+    cookiesPath = null,
+    useWbi = true,
+    strategy = 'yt_dlp',
+    withCookie = false
+  }) {
     const outputTemplate = path.join(this.downloadDir, `${bvid}.%(ext)s`);
 
-    // 检查是否已下载（查找匹配的文件）
-    const existingFiles = fs.readdirSync(this.downloadDir).filter(f => f.startsWith(bvid) && f.endsWith('.mp4'));
-    if (existingFiles.length > 0) {
-      const existingPath = path.join(this.downloadDir, existingFiles[0]);
-      console.log(`[VideoAnalyzer] 视频已存在: ${existingPath}`);
-      this.reportProgress(onProgress, 'download', 20, '视频已缓存，跳过下载');
-      return existingPath;
-    }
-
-    console.log(`[VideoAnalyzer] 开始下载视频 ${bvid}...`);
-    this.reportProgress(onProgress, 'download', 5, '正在下载 0%');
-
     // 构建基础参数（避免过多浏览器专有请求头触发风控）
-    const commonArgs = [
+    const args = [
       '-m', 'yt_dlp',
       '--newline',
       '--ffmpeg-location', ffmpegPath,
       '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      '--remux-video', 'mp4',
+      '--user-agent', YTDLP_USER_AGENT,
       '--referer', 'https://www.bilibili.com/',
       '--no-check-certificate',
       '--ignore-config',
-      '--no-warnings'
+      '--no-warnings',
+      '--extractor-args', `bilibili:use_wbi=${useWbi ? 'true' : 'false'}`
     ];
 
-    const primaryArgs = [
-      ...commonArgs,
-      '--extractor-args', 'bilibili:use_wbi=true',
-      '--add-header', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      '--add-header', 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8',
-      '--extractor-retries', '2',
-      '--retries', '2',
-      '--fragment-retries', '2'
-    ];
-
-    const fallbackArgs = [
-      ...commonArgs,
-      '--extractor-args', 'bilibili:use_wbi=false',
-      '--extractor-retries', '3',
-      '--retries', '3',
-      '--fragment-retries', '3'
-    ];
-
-    const hasCookies = Boolean(cookiesPath && fs.existsSync(cookiesPath));
-
-    // 如果有cookies文件，添加 --cookies 参数
-    if (hasCookies) {
-      primaryArgs.push('--cookies', cookiesPath);
-      fallbackArgs.push('--cookies', cookiesPath);
-      console.log('[VideoAnalyzer] 使用临时 cookies 文件进行下载');
-
-      try {
-        const cookiesContent = fs.readFileSync(cookiesPath, 'utf8');
-        const requiredCookies = ['SESSDATA', 'bili_jct', 'DedeUserID'];
-        const missing = requiredCookies.filter(name => !new RegExp(`(?:^|\\n)[^\\n]*\\t${name}\\t`).test(cookiesContent));
-        if (missing.length > 0) {
-          console.warn(`[VideoAnalyzer] cookies 可能不完整，缺少: ${missing.join(', ')}`);
-        }
-      } catch (error) {
-        console.warn('[VideoAnalyzer] 读取 cookies 文件失败，继续尝试下载:', error.message);
-      }
+    if (useWbi) {
+      args.push(
+        '--add-header', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        '--add-header', 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8',
+        '--extractor-retries', '2',
+        '--retries', '2',
+        '--fragment-retries', '2'
+      );
     } else {
-      console.log('[VideoAnalyzer] 无 cookies 文件，使用无认证模式下载');
+      args.push('--extractor-retries', '3', '--retries', '3', '--fragment-retries', '3');
     }
 
-    primaryArgs.push('-o', outputTemplate, url);
-    fallbackArgs.push('-o', outputTemplate, url);
+    if (withCookie && cookiesPath) {
+      args.push('--cookies', cookiesPath);
+    }
 
-    const runYtDlp = (args, modeLabel) => new Promise((resolve, reject) => {
-      const child = spawn('python', args, { windowsHide: true });
+    args.push('-o', outputTemplate, url);
+
+    const progressReporter = (downloadPercent, wholePercent) => {
+      const mappedPercent = 5 + (downloadPercent / 100) * 15;
+      this.reportProgress(onProgress, 'download', mappedPercent, `正在下载 ${wholePercent}%`, {
+        strategy,
+        withCookie,
+        useWbi
+      });
+    };
+
+    const result = await new Promise((resolve) => {
+      const child = this.spawnImpl('python', args, { windowsHide: true });
       let outputTail = '';
       let lastReportedPercent = -1;
 
@@ -240,87 +292,205 @@ class VideoAnalyzer {
         if (wholePercent === lastReportedPercent) return;
 
         lastReportedPercent = wholePercent;
-        const mappedPercent = 5 + (downloadPercent / 100) * 15;
-        this.reportProgress(onProgress, 'download', mappedPercent, `正在下载 ${wholePercent}%`);
+        progressReporter(downloadPercent, wholePercent);
       };
 
-      child.stdout.on('data', handleOutput);
-      child.stderr.on('data', handleOutput);
-      child.on('error', reject);
-      child.on('close', (code) => {
-        if (code === 0) {
-          this.reportProgress(onProgress, 'download', 20, '视频下载完成');
-          resolve();
-          return;
-        }
-        reject(new Error(`yt-dlp退出码 ${code}(${modeLabel}): ${outputTail || '无输出'}`));
-      });
+      child.stdout?.on('data', handleOutput);
+      child.stderr?.on('data', handleOutput);
+      child.on('error', (error) => resolve({ code: -1, output: `${outputTail}\n${error.message}` }));
+      child.on('close', (code) => resolve({ code, output: outputTail }));
     });
 
-    try {
-      try {
-        await runYtDlp(primaryArgs, 'primary');
-      } catch (firstError) {
-        const firstMessage = String(firstError?.message || '');
-        const isLikely412 = /412|Precondition Failed/i.test(firstMessage);
-        if (!isLikely412) throw firstError;
-
-        console.warn('[VideoAnalyzer] 检测到 B 站风控 412，切换兼容参数重试一次');
-        this.reportProgress(onProgress, 'download', 8, '检测到风控，正在重试下载');
-        await runYtDlp(fallbackArgs, 'fallback');
+    if (result.code !== 0) {
+      const error = classifyYtDlpFailure(result.output, { stage: ERROR_STAGES.YT_DLP });
+      if (error.code === ERROR_CODES.DOWNLOAD_FAILED && error.reason === ERROR_REASONS.UNKNOWN) {
+        error.message = `yt-dlp 退出码 ${result.code}（${strategy}${withCookie ? '/cookie' : '/anonymous'}）: ${truncateTail(result.output)}`;
       }
-
-      // 查找下载的视频文件
-      const downloadedFiles = fs.readdirSync(this.downloadDir).filter(f => f.startsWith(bvid) && f.endsWith('.mp4'));
-      if (downloadedFiles.length === 0) {
-        throw new Error('视频下载完成但找不到文件');
-      }
-
-      const videoPath = path.join(this.downloadDir, downloadedFiles[0]);
-      console.log(`[VideoAnalyzer] 视频下载完成: ${videoPath}`);
-      
-      if (cookiesPath && fs.existsSync(cookiesPath)) {
-        console.log('[VideoAnalyzer] 成功使用 cookies 下载高画质视频');
-      } else {
-        console.log('[VideoAnalyzer] 使用无 cookies 模式下载（可能为低画质）');
-      }
-      
-      return videoPath;
-    } catch (error) {
-      console.error('[VideoAnalyzer] 下载失败:', error);
-      
-      if (!hasCookies) {
-        const finalError = new Error(`视频下载失败: ${error.message}。建议：请确保已登录 Bilibili 账号以获得最佳分析体验。`);
-        console.error('[VideoAnalyzer] 下载失败详情:', finalError);
-        throw finalError;
-      } else {
-        const finalError = new Error(`视频下载失败: ${error.message}。即使使用了 cookies 仍然失败，请刷新 Bilibili 登录状态、更新 yt-dlp 后重试。`);
-        console.error('[VideoAnalyzer] 下载失败详情:', finalError);
-        throw finalError;
-      }
+      throw error;
     }
+
+    if (!fs.existsSync(outputPath)) {
+      throw new DownloadError({
+        code: ERROR_CODES.DOWNLOAD_FAILED,
+        reason: ERROR_REASONS.FILE_NOT_FOUND,
+        stage: ERROR_STAGES.VALIDATE,
+        retryable: true,
+        message: 'yt-dlp 执行完成但找不到输出文件'
+      });
+    }
+
+    return outputPath;
   }
 
   /**
-   * 混合下载策略：优先使用 Bilibili 专用下载器，失败后回退到 yt-dlp
+   * 使用 yt-dlp 下载 B 站视频（支持手动 cookies 文件）。
+   *
+   * 策略：Cookie → 匿名；出现 412 时在同一 Cookie 策略内切换 use_wbi=false 兼容参数。
+   * 失败时抛出带 code/reason/stage/attempts 的 DownloadError。
+   *
+   * @param {string} bvid
+   * @param {string} url
+   * @param {Function|null} onProgress
+   * @param {string|null} cookiesPath
+   * @param {object} [options] { onAttempt } 用于向上层汇报每次尝试
+   * @returns {Promise<string>} 视频文件路径
    */
-  async downloadVideoHybrid(bvid, url, onProgress = null, cookiesPath = null) {
-    // 先尝试 Bilibili 专用下载器
+  async downloadVideo(bvid, url, onProgress = null, cookiesPath = null, options = {}) {
+    const onAttempt = typeof options.onAttempt === 'function' ? options.onAttempt : null;
+    const attempts = new AttemptLog();
+
+    const recordAttempt = (entry) => {
+      const stored = attempts.add(entry);
+      if (onAttempt) {
+        try { onAttempt({ ...stored }); } catch (_) { /* noop */ }
+      }
+      return stored;
+    };
+
+    // 缓存命中必须通过完整性校验
+    const cachedPath = await this.findUsableCachedVideo(bvid);
+    if (cachedPath) {
+      console.log(`[VideoAnalyzer] 视频已存在且校验通过: ${cachedPath}`);
+      this.reportProgress(onProgress, 'download', 20, '视频已缓存，跳过下载');
+      recordAttempt({ strategy: 'yt_dlp_cache', withCookie: false, ok: true, message: '命中有效缓存' });
+      return cachedPath;
+    }
+
+    const outputPath = path.join(this.downloadDir, `${bvid}.mp4`);
+    // 清掉上次异常中断留下的中间产物，避免堆积与误判
+    // downloader 是可注入依赖，这里用可选调用，不强制其实现该扩展方法
+    this.downloader.cleanupStaleArtifacts?.(bvid);
+
+    const hasCookies = Boolean(cookiesPath && fs.existsSync(cookiesPath));
+
+    if (hasCookies) {
+      this.logCookieDiagnostics(cookiesPath);
+      console.log('[VideoAnalyzer] 使用临时 cookies 文件进行下载');
+    } else {
+      console.log('[VideoAnalyzer] 无 cookies 文件，使用无认证模式下载');
+    }
+
+    // 每个策略最多一次；use_wbi=false 只在前一次遇到 412 时才追加
+    const plan = [
+      { withCookie: true, useWbi: true, when: () => hasCookies },
+      { withCookie: true, useWbi: false, when: previous => hasCookies && isRiskControlError(previous) },
+      { withCookie: false, useWbi: true, when: previous => !isFatalDownloadError(previous) },
+      { withCookie: false, useWbi: false, when: previous => isRiskControlError(previous) }
+    ].slice(0, this.maxYtDlpAttempts);
+
+    let lastError = null;
+    let cookieRejected = false;
+
+    for (const step of plan) {
+      if (step.withCookie && cookieRejected) continue;
+      if (!step.when(lastError)) continue;
+
+      const strategy = step.withCookie ? 'yt_dlp' : 'yt_dlp_anonymous';
+
+      try {
+        this.reportProgress(onProgress, 'download', 5, step.withCookie ? '正在使用 Cookie 下载' : '正在匿名下载', {
+          strategy,
+          withCookie: step.withCookie,
+          useWbi: step.useWbi
+        });
+
+        await this.runYtDlpAttempt({
+          bvid,
+          url,
+          outputPath,
+          onProgress,
+          cookiesPath: step.withCookie ? cookiesPath : null,
+          useWbi: step.useWbi,
+          strategy,
+          withCookie: step.withCookie
+        });
+
+        const validation = await this.downloader.validateVideoFile(outputPath, { label: 'yt-dlp 下载视频' });
+        recordAttempt({
+          strategy,
+          withCookie: step.withCookie,
+          ok: true,
+          message: `下载成功（${(validation.size / 1024 / 1024).toFixed(2)} MB）`
+        });
+        this.reportProgress(onProgress, 'download', 20, '视频下载完成');
+        console.log(`[VideoAnalyzer] 视频下载完成: ${outputPath}`);
+        return outputPath;
+      } catch (error) {
+        lastError = error;
+        try {
+          if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+        } catch (_) { /* noop */ }
+
+        const entry = recordAttempt(attemptEntryFromError(strategy, error, { withCookie: step.withCookie }));
+        console.warn(
+          `[VideoAnalyzer] ${strategy}${step.withCookie ? '(cookie)' : '(anonymous)'} use_wbi=${step.useWbi} 失败: ${entry.code}/${entry.reason} - ${entry.message}`
+        );
+
+        if (isFatalDownloadError(error)) throw withAttempts(error, attempts.toJSON());
+        if (entry.reason === ERROR_REASONS.COOKIE_INVALID_OR_EXPIRED) cookieRejected = true;
+      }
+    }
+
+    throw finalizeDownloadError({ attempts: attempts.toJSON(), lastError, stage: ERROR_STAGES.YT_DLP });
+  }
+
+  /**
+   * 混合下载策略（策略顺序）：
+   *   A. B 站接口 + Cookie
+   *   B. B 站接口 + 匿名   —— A→B 降级在 BilibiliDownloader 内部完成
+   *   C. yt-dlp + Cookie
+   *   D. yt-dlp + 匿名     —— C→D 降级在 downloadVideo 内部完成
+   *
+   * 任一步骤判定为 INVALID_INPUT / VIDEO_INACCESSIBLE 时立即中止，不做无意义重试；
+   * 最终错误由全部尝试记录统一分类（全 412 时必须是 RISK_CONTROL_412）。
+   */
+  async downloadVideoHybrid(bvid, url, onProgress = null, cookiesPath = null, options = {}) {
+    const attempts = [];
+    const forwardAttempt = typeof options.onAttempt === 'function' ? options.onAttempt : null;
+    const collectAttempt = (entry) => {
+      attempts.push(entry);
+      if (forwardAttempt) {
+        try { forwardAttempt(entry); } catch (_) { /* noop */ }
+      }
+    };
+
+    const reportProgress = (progress) => {
+      this.reportProgress(onProgress, progress.stage, progress.percent, progress.message, {
+        strategy: progress.strategy || null,
+        withCookie: progress.withCookie ?? null
+      });
+    };
+
+    const describe = (error) => (isDownloadError(error) ? `${error.code}/${error.reason}` : error?.message);
+
+    let lastError = null;
+
+    // A / B：B 站专用接口
     try {
       console.log('[VideoAnalyzer] 尝试使用 Bilibili 专用下载器...');
-      const bilibiliDownloader = new BilibiliDownloader();
-      const result = await bilibiliDownloader.downloadVideo(url, (progress) => {
-        this.reportProgress(onProgress, progress.stage, progress.percent, progress.message);
+      const result = await this.downloader.downloadVideo(url, reportProgress, {
+        cookiesPath,
+        onAttempt: collectAttempt
       });
       console.log('[VideoAnalyzer] Bilibili 专用下载器成功');
       return result;
-    } catch (bilibiliError) {
-      console.warn('[VideoAnalyzer] Bilibili 专用下载器失败:', bilibiliError.message);
-      
-      // 回退到 yt-dlp
-      console.log('[VideoAnalyzer] 回退到 yt-dlp 下载器...');
-      return await this.downloadVideo(bvid, url, onProgress, cookiesPath);
+    } catch (error) {
+      lastError = error;
+      console.warn(`[VideoAnalyzer] Bilibili 专用下载器失败: ${describe(error)}`);
+      if (isFatalDownloadError(error)) throw withAttempts(error, attempts);
     }
+
+    // C / D：yt-dlp
+    try {
+      console.log('[VideoAnalyzer] 回退到 yt-dlp 下载器...');
+      return await this.downloadVideo(bvid, url, onProgress, cookiesPath, { onAttempt: collectAttempt });
+    } catch (error) {
+      lastError = error;
+      console.warn(`[VideoAnalyzer] yt-dlp 下载器失败: ${describe(error)}`);
+      if (isFatalDownloadError(error)) throw withAttempts(error, attempts);
+    }
+
+    throw finalizeDownloadError({ attempts, lastError });
   }
 
   /**
@@ -1447,6 +1617,24 @@ ${visualCutsText}
       };
     } catch (error) {
       console.error('[VideoAnalyzer] 视频分析失败:', error);
+      // 下载阶段的错误已经分类，这里补一条可操作的用户提示，并保留结构化字段
+      if (isDownloadError(error)) {
+        const wrapped = new Error(buildUserFacingMessage(error));
+        wrapped.code = error.code;
+        wrapped.reason = error.reason;
+        wrapped.stage = error.stage;
+        wrapped.retryable = error.retryable;
+        wrapped.attempts = error.attempts;
+        wrapped.userMessage = wrapped.message;
+        wrapped.cause = error;
+        console.error('[VideoAnalyzer] 下载失败分类:', JSON.stringify({
+          code: error.code,
+          reason: error.reason,
+          stage: error.stage,
+          attempts: error.attempts
+        }));
+        throw wrapped;
+      }
       throw error;
     } finally {
       // 清理临时 cookies 文件（成功或失败都执行）
