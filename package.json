@@ -6,8 +6,9 @@
   "scripts": {
     "dev": "vite --config build/vite.config.js",
     "build": "vite build --config build/vite.config.js",
-    "test:plugin": "node --test extension/sidebar/materialCollection.test.mjs",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test:plugin": "node --test extension/sidebar/materialCollection.test.mjs extension/*.test.cjs",
+    "test": "npm run test:plugin && npm --prefix server test",
+    "test:backend": "npm --prefix server run test:backend"
   },
   "repository": {
     "type": "git",

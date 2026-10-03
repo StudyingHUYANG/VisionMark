@@ -15,7 +15,8 @@
     "http://localhost:8080/*",
     "http://localhost:3000/*",
     "http://127.0.0.1:8080/*",
-    "http://127.0.0.1:3000/*"
+    "http://127.0.0.1:3000/*",
+    "https://*.bilibili.com/*"
   ],
   "action": {
     "default_popup": "popup/popup.html",
@@ -51,7 +52,12 @@
         "history/history.js",
         "content/config.local.js"
       ],
-      "matches": ["<all_urls>"]
+      "matches": [
+        "<all_urls>"
+      ]
     }
-  ]
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
 }

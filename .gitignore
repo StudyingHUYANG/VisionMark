@@ -36,3 +36,6 @@ downloads/
 
 # Local configuration
 .claude/settings.local.json
+
+# Persistent local signing secret
+.jwt-secret
