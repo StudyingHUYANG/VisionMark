@@ -118,21 +118,30 @@ function normalizeCut(cut, source) {
   };
 }
 
-/** 转录文本 → [{ time, text }]，兼容数组与字符串（含全角冒号） */
+/**
+ * 转录文本 → [{ time, text }]，兼容数组与字符串（含全角冒号）。
+ *
+ * 归一化行（evidenceBuilder.normalizeTranscript 的产物）用 hasTimestamp 标记 start 的语义：
+ * false 表示 start 是数组下标（占位行号），不是秒数。这类行必须剔除 —— 若照常解析，
+ * 行号 0/1/2 会被当成第 0/1/2 秒，凭空衍生 text_topic_shift_* 语义切点。
+ * 字符串输入经由 normalizeTranscript 归一化，同样带该标记，因此天然被统一过滤覆盖。
+ * 未归一化的原始行没有 hasTimestamp 字段，照旧解析 start / time / timestamp，
+ * 能解析出时间就参与，保持既有调用方（原始对象数组）的行为不变。
+ */
 function transcriptRows(transcript) {
-  if (Array.isArray(transcript)) {
-    return transcript
-      .map(row => ({
-        time: parseTimeToSeconds(row?.start ?? row?.time ?? row?.timestamp),
-        text: String(row?.text ?? row?.content ?? '').trim()
-      }))
-      .filter(row => Number.isFinite(row.time) && row.text)
-      .sort((a, b) => a.time - b.time);
-  }
+  const rawRows = Array.isArray(transcript)
+    ? transcript
+    : (typeof transcript === 'string' ? normalizeTranscript(transcript) : []);
 
-  if (typeof transcript !== 'string') return [];
-
-  return normalizeTranscript(transcript).map(row => ({ time: row.start, text: row.text }));
+  return rawRows
+    // 只剔除显式标记为 false 的行；hasTimestamp === true 与无该字段的原始行一律照常参与。
+    .filter(row => !(row && typeof row === 'object' && row.hasTimestamp === false))
+    .map(row => ({
+      time: parseTimeToSeconds(row?.start ?? row?.time ?? row?.timestamp),
+      text: String(row?.text ?? row?.content ?? '').trim()
+    }))
+    .filter(row => Number.isFinite(row.time) && row.text)
+    .sort((a, b) => a.time - b.time);
 }
 
 /**

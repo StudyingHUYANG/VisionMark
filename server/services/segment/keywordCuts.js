@@ -191,6 +191,11 @@ const KEYWORD_RULES = [
  * 支持 number、"SS"、"MM:SS"、"HH:MM:SS"。
  */
 function parseTimeToSeconds(value) {
+  // 先显式挡掉 null / undefined / 空串：Number(null) === 0 且 Number('') === 0，
+  // 会把"没有时间信息"误解析成 0 秒，破坏本函数"解析不了就返回 null"的约定。
+  // 注意不能改用 > 0 规则：数字 0 是合法时间戳（视频开头），必须原样返回 0。
+  if (value === null || value === undefined || value === '') return null;
+
   if (Number.isFinite(Number(value))) return Number(value);
   if (typeof value !== 'string') return null;
 

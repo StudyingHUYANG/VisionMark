@@ -1,0 +1,37 @@
+{
+  "_comment": "正式基线需要团队确认的 5 个视频，待替换。本文件当前只有 3 个占位项：1 个本地文件 + 2 个公开 BV 号。请团队确认最终 5 个视频后替换本清单，并把 enabled 全部打开。",
+  "_usage": "node server/scripts/baselineMediaPipeline.js [--list <file>] [--only <id,id>] [--compare <A.json> <B.json>]",
+  "_bvidRule": "source=file 的项按优先级解析 bvid：a) 本项的 bvid 字段；b) 文件名里的真 BV 号（/BV[0-9A-Za-z]{10}/）；c) local-<entryId> 兜底。兜底形态一眼看得出不是 BV 号——代码里没有任何地方校验 bvid 格式，用 BVxxx 假号会静默流进 segmentId 与 debug 产物。source=bvid 的项不受此规则影响，bvid 就是 value。",
+  "_fields": {
+    "id": "清单内唯一标识，用于 --only 与 --compare 配对",
+    "source": "file=本地文件（跳过下载）；bvid=B 站 BV 号（会真实下载，命中缓存则复用）",
+    "value": "source=file 时为文件路径（相对仓库根目录或绝对路径）；source=bvid 时为 BV 号",
+    "bvid": "可选，仅 source=file 有意义：显式指定分析用的 bvid，优先于文件名推断",
+    "note": "备注，写清这项为什么在清单里",
+    "enabled": "false 时跑批跳过，并在摘要的「本轮跳过的条目」里列出；缺省视为 true"
+  },
+  "videos": [
+    {
+      "id": "local-1",
+      "source": "file",
+      "value": "downloads/BV1TiuZ6TEQw.mp4",
+      "bvid": "BV1TiuZ6TEQw",
+      "note": "占位：本机已有的本地样片，用于在无网络、无大模型 key 的情况下也能跑通整条链路。bvid 显式取自样片文件名里的真 BV 号（与文件名推断结果一致，这里只是写明，避免用假 BV 形态）。注意：本地文件项不覆盖下载链路。",
+      "enabled": true
+    },
+    {
+      "id": "bv-1",
+      "source": "bvid",
+      "value": "BV1GJ411x7h7",
+      "note": "占位：公开 BV 号，待团队确认。默认关闭——跑它需要真实下载（可能触发 B 站风控），确认后再打开。",
+      "enabled": false
+    },
+    {
+      "id": "bv-2",
+      "source": "bvid",
+      "value": "BV1xx411c7mD",
+      "note": "占位：公开 BV 号，待团队确认。默认关闭，同上。",
+      "enabled": false
+    }
+  ]
+}

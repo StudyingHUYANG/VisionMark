@@ -11,6 +11,10 @@
  *
  * 之所以不叫 confidence：evidence.confidence 是 high/medium/low 的整体置信度，
  * 同名会让下游误解；簇指标固定叫 sourceCount。
+ *
+ * 另：normalizeTranscript 必须幂等 —— 下游靠 hasTimestamp 布尔字段区分「真时间戳」与
+ * 「占位行号」，若把已归一化的数组再归一化，行号会被重新解析成合法秒数、洗白成时间戳，
+ * 无时间戳文本就会再次污染契约 description（详见 normalizeTranscript 上方注释）。
  */
 
 const TRANSCRIPT_LINE_PATTERN = /^\[(\d{1,3}:\d{1,2}(?::\d{1,2})?)\]\s*(.*)$/;
@@ -113,6 +117,15 @@ function parseTranscriptLine(line, fallbackIndex) {
   return { start: fallbackIndex, hasTimestamp: false, text: trimmed };
 }
 
+/**
+ * 转录归一化。必须幂等。
+ *
+ * 归一化行用 hasTimestamp 布尔字段标记 start 是「真时间戳」还是「数组下标（占位行号）」，
+ * 下游（transcriptSnippet、validator 的 summary 兜底）依赖该标记过滤无时间戳的行。
+ * 一旦对已归一化的数组再跑一次归一化，parseTimeToSeconds(0/1/2...) 会把占位行号解析成合法秒数，
+ * hasTimestamp 被洗白成 true，无时间戳文本就会重新污染契约 description。
+ * 因此数组分支遇到归一化行（hasTimestamp 为布尔值且 text 存在）必须原样保留，绝不重新解析 start。
+ */
 function normalizeTranscript(transcript) {
   if (Array.isArray(transcript)) {
     return transcript
@@ -124,6 +137,20 @@ function normalizeTranscript(transcript) {
         }
 
         const text = String(item?.text ?? item?.content ?? '').trim();
+
+        // 幂等保护：已是归一化行（hasTimestamp 为布尔值且有 text）→ 原样保留四个字段。
+        // 关键：不重新解析 start —— 无时间戳行的 start 是占位行号，重解析会把 hasTimestamp 洗白成 true。
+        // 只有 start/end 非有限数字的畸形行才按旧规则用数组下标补位，正常归一化行不受影响。
+        if (typeof item?.hasTimestamp === 'boolean' && text) {
+          const safeStart = Number.isFinite(item.start) ? item.start : index;
+          return {
+            start: safeStart,
+            end: Number.isFinite(item.end) ? item.end : safeStart,
+            text,
+            hasTimestamp: item.hasTimestamp
+          };
+        }
+
         if (!text) return null;
 
         const start = parseTimeToSeconds(item?.start ?? item?.time ?? item?.timestamp ?? item?.begin_time);
@@ -163,11 +190,25 @@ function transcriptToText(transcriptSegments) {
     .join('\n');
 }
 
+/**
+ * 该行是否带真实时间戳。
+ * 归一化结果以 hasTimestamp 为准；直接传入未归一化的原始行（没有该字段）时，
+ * 退回解析原始时间字段，保持旧调用方的既有行为。
+ */
+function rowHasTimestamp(row) {
+  if (!row || typeof row !== 'object') return false;
+  if (typeof row.hasTimestamp === 'boolean') return row.hasTimestamp;
+  return parseTimeToSeconds(row.start ?? row.time ?? row.timestamp) !== null;
+}
+
 /** 取 [start, end) 区间内的转录原文，只拼接截断、不改写，供 summary 兜底使用 */
 function transcriptSnippet(transcript, start, end, maxLength = 120) {
   const rows = Array.isArray(transcript) ? transcript : normalizeTranscript(transcript);
 
   const text = rows
+    // 只使用带时间戳的行：无时间戳行的 start 是数组下标（行号），一旦参与取区间，
+    // 行号会被当成秒数，把无关文本经 validator 的 summary 兜底塞进契约 description。
+    .filter(rowHasTimestamp)
     .map(row => ({
       time: parseTimeToSeconds(row?.start ?? row?.time ?? row?.timestamp),
       text: String(row?.text ?? row?.content ?? '').trim()
@@ -180,6 +221,16 @@ function transcriptSnippet(transcript, start, end, maxLength = 120) {
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
+/**
+ * 帧时间原始值是否「缺失」：null / undefined / 空字符串（含纯空白）。
+ * 必须先判空再做 Number() 转换，因为 Number(null)===0、Number('')===0，
+ * 会把缺失值伪装成第 0 秒（视频起点）的合法帧。
+ */
+function isBlankFrameTime(value) {
+  if (value === null || value === undefined) return true;
+  return typeof value === 'string' && value.trim() === '';
+}
+
 function normalizeFrameTimes(frames, frameTimes = []) {
   const source = Array.isArray(frameTimes) && frameTimes.length > 0 ? frameTimes : frames;
   if (!Array.isArray(source)) return [];
@@ -187,11 +238,13 @@ function normalizeFrameTimes(frames, frameTimes = []) {
   return [...new Set(
     source
       .map(frame => {
-        if (Number.isFinite(Number(frame)) && typeof frame !== 'object') return Number(frame);
+        if (typeof frame !== 'object' && !isBlankFrameTime(frame) && Number.isFinite(Number(frame))) {
+          return Number(frame);
+        }
         if (frame && typeof frame === 'object') {
-          if (Number.isFinite(Number(frame.time))) return Number(frame.time);
-          if (Number.isFinite(Number(frame.timestamp))) return Number(frame.timestamp);
-          if (Number.isFinite(Number(frame.timestampMs))) return Number(frame.timestampMs) / 1000;
+          if (!isBlankFrameTime(frame.time) && Number.isFinite(Number(frame.time))) return Number(frame.time);
+          if (!isBlankFrameTime(frame.timestamp) && Number.isFinite(Number(frame.timestamp))) return Number(frame.timestamp);
+          if (!isBlankFrameTime(frame.timestampMs) && Number.isFinite(Number(frame.timestampMs))) return Number(frame.timestampMs) / 1000;
         }
         return null;
       })
@@ -424,8 +477,13 @@ function buildEvidence(input = {}) {
     if (result.dropped > 0) warn(`dropped_invalid_${label}_cuts:${result.dropped}`);
   }
 
-  if (transcript.length > 0 && transcript.every(item => !item.hasTimestamp)) {
+  // 缺时间戳的行：start 是数组下标（行号），下游取区间文本必须靠 hasTimestamp 过滤。
+  // 全部缺失与部分缺失分开告警，保留旧警告文案不变，部分缺失额外带缺失行数。
+  const missingTimestampCount = transcript.filter(item => !item.hasTimestamp).length;
+  if (transcript.length > 0 && missingTimestampCount === transcript.length) {
     warn('transcript_missing_timestamps');
+  } else if (missingTimestampCount > 0) {
+    warn(`transcript_partially_missing_timestamps:${missingTimestampCount}`);
   }
 
   const mode = inferMode({

@@ -15,16 +15,39 @@ const path = require('path');
 const { Readable } = require('stream');
 const EventEmitter = require('events');
 
+// ---------------------------------------------------------------------------
+// 必须在 require bilibiliDownloader 之前把 killProcessTree 换成记录桩：
+// bilibiliDownloader 在模块加载时 require 它（同 audioCuts.test.js 的手法），
+// 晚替换拿到的是真实现，超时用例会真的执行 taskkill。
+// ---------------------------------------------------------------------------
+const KILL_PROCESS_TREE_PATH = require.resolve('../utils/killProcessTree');
+const killCalls = [];
+require.cache[KILL_PROCESS_TREE_PATH] = {
+  id: KILL_PROCESS_TREE_PATH,
+  filename: KILL_PROCESS_TREE_PATH,
+  loaded: true,
+  exports: {
+    killProcessTree: (child) => {
+      killCalls.push(child);
+    }
+  }
+};
+
 const BilibiliDownloader = require('./bilibiliDownloader');
 const {
   ERROR_CODES,
   ERROR_REASONS,
+  ERROR_STAGES,
   DownloadError,
   classifyYtDlpFailure,
   classifyBilibiliApiResponse,
   parseCookieInput,
   scrubSecrets,
-  finalizeDownloadError
+  finalizeDownloadError,
+  resolveMergeTimeoutMs,
+  MERGE_TIMEOUT_FLOOR_MS,
+  MERGE_TIMEOUT_PER_MB_MS,
+  PROBE_TIMEOUT_MS
 } = BilibiliDownloader;
 
 // ---------------------------------------------------------------------------
@@ -173,13 +196,15 @@ function createSpawnMock(options = {}) {
   return spawnImpl;
 }
 
-function makeDownloader({ http, spawnImpl, dir, ffprobePath = 'ffprobe-mock' }) {
+function makeDownloader({ http, spawnImpl, dir, ffprobePath = 'ffprobe-mock', mergeTimeoutMs, probeTimeoutMs }) {
   return new BilibiliDownloader({
     downloadDir: dir,
     http,
     spawnImpl,
     ffprobePath,
-    maxAttemptsPerStrategy: 2
+    maxAttemptsPerStrategy: 2,
+    mergeTimeoutMs,
+    probeTimeoutMs
   });
 }
 
@@ -777,6 +802,184 @@ async function main() {
     const remaining = fs.readdirSync(dir).filter(file => staleFiles.includes(file));
     equal(remaining.length, 0, `残留中间文件已清理 ${JSON.stringify(remaining)}`);
     equal(fs.statSync(outputPath).size, VIDEO_BYTES, '整片文件正常产出');
+
+    cleanupDir(dir);
+  });
+
+  // --- 23. 超时策略：按时长/体积缩放且不低于下限 ---
+  await test('超时策略按时长/体积缩放且不低于下限', () => {
+    const MB = 1024 * 1024;
+
+    check(MERGE_TIMEOUT_FLOOR_MS >= 5 * 60 * 1000, '合并超时下限不低于 5 分钟', String(MERGE_TIMEOUT_FLOOR_MS));
+    equal(MERGE_TIMEOUT_PER_MB_MS, 200, '合并超时系数为 200ms/MB');
+    equal(PROBE_TIMEOUT_MS, 60 * 1000, 'ffprobe 探测固定 60 秒');
+
+    equal(resolveMergeTimeoutMs([], { fileSize: () => 0 }), MERGE_TIMEOUT_FLOOR_MS, '无输入时取 5 分钟下限');
+    equal(
+      resolveMergeTimeoutMs([['-i', 'v.m4s']], { fileSize: () => 100 * MB }),
+      MERGE_TIMEOUT_FLOOR_MS,
+      '100MB 缩放值仍低于下限，取下限'
+    );
+    equal(
+      resolveMergeTimeoutMs([['-i', 'v.m4s'], ['-i', 'a.m4s']], { fileSize: () => 1000 * MB }),
+      2000 * MERGE_TIMEOUT_PER_MB_MS,
+      '多输入体积累加后按 200ms/MB 缩放'
+    );
+
+    // concat 列表本身只有几 KB，必须展开成真实分片体积参与缩放
+    const dir = makeTempDir('merge-timeout-policy');
+    const listPath = path.join(dir, `${BV}.concat.txt`);
+    const part1 = path.join(dir, `${BV}.durl-1.mp4`);
+    const part2 = path.join(dir, `${BV}.durl-2.mp4`);
+    fs.writeFileSync(listPath, `file '${part1}'\nfile '${part2}'\n`, 'utf8');
+    const sizes = { [part1]: 1500 * MB, [part2]: 1500 * MB };
+    equal(
+      resolveMergeTimeoutMs([['-f', 'concat'], ['-safe', '0'], ['-i', listPath]], { fileSize: p => sizes[p] || 0 }),
+      3000 * MERGE_TIMEOUT_PER_MB_MS,
+      'concat 列表展开后按分片总体积缩放'
+    );
+    cleanupDir(dir);
+  });
+
+  // --- 24. 合并超时：抛 DownloadError、删 .part、杀进程树 ---
+  await test('mergeWithFfmpeg 超时 → MERGE 失败、清理 .part、杀进程树', async () => {
+    killCalls.length = 0;
+    const dir = makeTempDir('merge-timeout');
+    const outputPath = path.join(dir, `${BV}.mp4`);
+    const partPath = `${outputPath}.part`;
+    // 模拟 ffmpeg 已经写了一半的半成品
+    fs.writeFileSync(partPath, Buffer.alloc(4096, 1));
+
+    let childRef = null;
+    const spawnImpl = () => {
+      childRef = new EventEmitter();
+      childRef.stdout = new EventEmitter();
+      childRef.stderr = new EventEmitter();
+      childRef.kill = () => {};
+      // 永不 emit close：模拟 ffmpeg 挂死
+      return childRef;
+    };
+
+    const downloader = makeDownloader({
+      http: createHttpMock(() => { throw new Error('不应发起请求'); }),
+      spawnImpl,
+      dir,
+      mergeTimeoutMs: 30
+    });
+
+    let thrown = null;
+    try {
+      await downloader.mergeWithFfmpeg([
+        ['-i', path.join(dir, `${BV}.video.m4s`)],
+        ['-i', path.join(dir, `${BV}.audio.m4s`)]
+      ], outputPath);
+    } catch (error) {
+      thrown = error;
+    }
+
+    check(thrown instanceof DownloadError, '超时抛出 DownloadError');
+    equal(thrown?.stage, ERROR_STAGES.MERGE, 'stage 为 MERGE');
+    equal(thrown?.reason, ERROR_REASONS.FFMPEG_FAILED, '复用 FFMPEG_FAILED 归类');
+    equal(thrown?.code, ERROR_CODES.DOWNLOAD_FAILED, 'code 为 DOWNLOAD_FAILED');
+    check(thrown?.message.includes('超时'), '错误信息能看出是超时', thrown?.message);
+    check(!fs.existsSync(partPath), '半成品 .part 已删除');
+    check(!fs.existsSync(outputPath), '没有生成成品文件');
+    equal(killCalls.length, 1, 'killProcessTree 被调用一次');
+    equal(killCalls[0], childRef, '杀掉的是 ffmpeg 子进程句柄');
+
+    cleanupDir(dir);
+  });
+
+  // --- 25. 合并正常路径不受超时改造影响 ---
+  await test('mergeWithFfmpeg 正常路径不受影响', async () => {
+    killCalls.length = 0;
+    const dir = makeTempDir('merge-ok');
+    const outputPath = path.join(dir, `${BV}.mp4`);
+
+    const downloader = makeDownloader({
+      http: createHttpMock(() => { throw new Error('不应发起请求'); }),
+      spawnImpl: createSpawnMock(),
+      dir,
+      mergeTimeoutMs: 5000
+    });
+
+    const returned = await downloader.mergeWithFfmpeg([['-i', `${BV}.video.m4s`], ['-i', `${BV}.audio.m4s`]], outputPath);
+
+    equal(returned, outputPath, '返回输出路径');
+    check(fs.existsSync(outputPath), '重命名后的成品存在');
+    equal(fs.statSync(outputPath).size, VIDEO_BYTES, '成品大小与 ffmpeg 写出的一致');
+    check(!fs.existsSync(`${outputPath}.part`), '.part 已重命名，不残留');
+    equal(killCalls.length, 0, '正常路径不杀进程');
+
+    cleanupDir(dir);
+  });
+
+  // --- 26. ffprobe 超时：降级返回、不抛错、有 warn ---
+  await test('probeHasVideoStream 超时降级为仅体积校验', async () => {
+    killCalls.length = 0;
+    const dir = makeTempDir('probe-timeout');
+    const filePath = path.join(dir, `${BV}.mp4`);
+    fs.writeFileSync(filePath, Buffer.alloc(VIDEO_BYTES, 1));
+
+    const spawnImpl = () => {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => {};
+      // 永不 emit close：模拟 ffprobe 挂死
+      return child;
+    };
+
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => warnings.push(args.map(String).join(' '));
+
+    let result = null;
+    let thrown = null;
+    try {
+      const downloader = makeDownloader({
+        http: createHttpMock(() => { throw new Error('不应发起请求'); }),
+        spawnImpl,
+        dir,
+        probeTimeoutMs: 30
+      });
+      result = await downloader.probeHasVideoStream(filePath);
+    } catch (error) {
+      thrown = error;
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    check(!thrown, '探测超时不抛错');
+    equal(result?.checked, false, 'checked=false（未完成探测）');
+    equal(result?.hasVideo, null, 'hasVideo=null（不当成通过）');
+    check(typeof result?.error === 'string' && result.error.includes('超时'), 'error 说明超时', String(result?.error));
+    check(
+      warnings.some(line => line.includes('ffprobe') && line.includes('30ms')),
+      'console.warn 打出 label 与 timeoutMs',
+      warnings.join(' | ')
+    );
+    equal(killCalls.length, 1, '超时的 ffprobe 进程树被终止');
+
+    cleanupDir(dir);
+  });
+
+  // --- 27. ffprobe 正常路径不受超时改造影响 ---
+  await test('probeHasVideoStream 正常路径不受影响', async () => {
+    killCalls.length = 0;
+    const dir = makeTempDir('probe-ok');
+    const downloader = makeDownloader({
+      http: createHttpMock(() => { throw new Error('不应发起请求'); }),
+      spawnImpl: createSpawnMock({ onProbe: () => ({ code: 0, stdout: 'video\n' }) }),
+      dir,
+      probeTimeoutMs: 5000
+    });
+
+    const result = await downloader.probeHasVideoStream(path.join(dir, `${BV}.mp4`));
+
+    equal(result.checked, true, '探测完成 checked=true');
+    equal(result.hasVideo, true, 'stdout 含 video → hasVideo=true');
+    equal(killCalls.length, 0, '正常路径不杀进程');
 
     cleanupDir(dir);
   });

@@ -7,9 +7,18 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const { killProcessTree } = require('../../utils/killProcessTree');
 
 const TAG = '[ASR:Whisper]';
 const SCRIPT_PATH = path.join(__dirname, '../../../scripts/whisper_transcribe.py');
+/** 超时下限 10 分钟；音频更长时按时长放大（1 倍速的保守估计） */
+const MIN_TIMEOUT_MS = 10 * 60 * 1000;
+
+function resolveWhisperTimeoutMs(audioDurationSeconds) {
+  const duration = Number(audioDurationSeconds);
+  const scaled = Number.isFinite(duration) && duration > 0 ? duration * 1000 : 0;
+  return Math.max(MIN_TIMEOUT_MS, Math.round(scaled));
+}
 
 /**
  * 使用本地 Whisper 模型进行语音识别
@@ -18,6 +27,7 @@ const SCRIPT_PATH = path.join(__dirname, '../../../scripts/whisper_transcribe.py
  * @param {string} [options.model='base'] - Whisper 模型大小 (tiny/base/small/medium/large)
  * @param {string} [options.language='zh'] - 语言提示
  * @param {string} [options.pythonPath='python'] - Python 可执行文件路径
+ * @param {number} [options.audioDuration] - 音频时长（秒），用于按比例算超时
  * @param {function} [options.onProgress] - 进度回调
  * @returns {Promise<{transcript: Array<{start: number, end: number, text: string}>}>}
  */
@@ -26,6 +36,7 @@ async function transcribeWithWhisper(audioPath, options = {}) {
     model = 'base',
     language = 'zh',
     pythonPath = 'python',
+    audioDuration = null,
     onProgress
   } = options;
 
@@ -59,6 +70,15 @@ async function transcribeWithWhisper(audioPath, options = {}) {
 
     let stdout = '';
     let stderr = '';
+    const timeoutMs = resolveWhisperTimeoutMs(audioDuration);
+    let finished = false;
+
+    const timer = setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      killProcessTree(proc);
+      reject(new Error(`Whisper 转写超时（${Math.round(timeoutMs / 1000)}s，音频时长 ${audioDuration ? `${Math.round(audioDuration)}s` : '未知'}）`));
+    }, timeoutMs);
 
     proc.stdout.on('data', (data) => {
       stdout += data.toString();
@@ -74,6 +94,10 @@ async function transcribeWithWhisper(audioPath, options = {}) {
     });
 
     proc.on('close', (code) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+
       if (code !== 0) {
         console.error(`${TAG} Whisper 进程退出码: ${code}`);
         console.error(`${TAG} stderr: ${stderr.substring(0, 500)}`);
@@ -98,14 +122,11 @@ async function transcribeWithWhisper(audioPath, options = {}) {
     });
 
     proc.on('error', (err) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
       reject(new Error(`启动 Whisper 进程失败: ${err.message}（请确保已安装 Python 和 openai-whisper）`));
     });
-
-    // 超时处理（10分钟）
-    setTimeout(() => {
-      proc.kill('SIGTERM');
-      reject(new Error('Whisper 转写超时（10分钟）'));
-    }, 10 * 60 * 1000);
   });
 }
 
@@ -127,7 +148,7 @@ async function isWhisperAvailable(pythonPath = 'python') {
     });
 
     setTimeout(() => {
-      proc.kill();
+      killProcessTree(proc);
       resolve(false);
     }, 5000);
   });
@@ -135,5 +156,6 @@ async function isWhisperAvailable(pythonPath = 'python') {
 
 module.exports = {
   transcribeWithWhisper,
-  isWhisperAvailable
+  isWhisperAvailable,
+  resolveWhisperTimeoutMs
 };

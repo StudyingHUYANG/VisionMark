@@ -16,6 +16,7 @@ const {
 const { generateCandidateCuts } = require('./candidateCutFusion');
 const { mergeSegmentsWithAI } = require('./semanticSegmentMerger');
 const { validateSegments } = require('./segmentValidator');
+const { toContractSegments } = require('./segmentContract');
 const { writeDebugArtifacts } = require('./debugArtifactWriter');
 
 const EMPTY_MERGE_DEBUG = {
@@ -92,13 +93,28 @@ async function runSegmentPipeline(input = {}, options = {}) {
   const finalSegments = Array.isArray(validated.segments) ? validated.segments : [];
   const finalCandidateCuts = Array.isArray(validated.candidateCuts) ? validated.candidateCuts : [];
 
-  // 5. 置信度：由证据模式与被采用的候选切点数量共同决定
+  // 5. 契约化：内部格式（start/end/summary + 枚举 confidence）→ 跨模块片段契约对象
+  let contractSegments = [];
+  try {
+    const contract = toContractSegments(finalSegments, {
+      bvid: evidence.bvid,
+      duration: evidence.duration,
+      transcript: evidence.transcript,
+      candidateCuts: finalCandidateCuts
+    });
+    contractSegments = contract.segments;
+    for (const message of contract.warnings || []) warn(message);
+  } catch (error) {
+    warn(`segment_contract_failed:${error.message}`);
+  }
+
+  // 6. 置信度：由证据模式与被采用的候选切点数量共同决定
   const confidence = inferConfidence(
     evidence.mode,
     finalCandidateCuts.filter(cut => cut.adopted).length
   );
 
-  // 6. 调试产物（写盘失败不影响返回结果）
+  // 7. 调试产物（写盘失败不影响返回结果）；内部原始数组以 internalSegments 保留，不混入正式字段
   let debugWrite = { artifactPaths: [], warnings: [] };
   try {
     debugWrite = writeDebugArtifacts(safeInput, {
@@ -106,7 +122,8 @@ async function runSegmentPipeline(input = {}, options = {}) {
       candidateCuts: finalCandidateCuts,
       aiPromptPreview: mergeDebug.aiPromptPreview,
       aiRawOutput: mergeDebug.aiRawOutput,
-      finalSegments,
+      internalSegments: finalSegments,
+      finalSegments: contractSegments,
       warnings: [...warnings],
       mode: evidence.mode,
       confidence
@@ -121,7 +138,7 @@ async function runSegmentPipeline(input = {}, options = {}) {
     confidence,
     duration: evidence.duration,
     candidateCuts: finalCandidateCuts,
-    segments: finalSegments,
+    segments: contractSegments,
     debug: {
       usedAI: Boolean(mergeDebug.usedAI),
       fallbackReason: mergeDebug.fallbackReason || null,

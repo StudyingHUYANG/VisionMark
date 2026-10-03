@@ -189,7 +189,13 @@ function isBoundaryMatch(time, segment) {
     || Math.abs(time - segment.end) <= ADOPTED_TOLERANCE_SECONDS;
 }
 
-/** 把落在 segment 边界附近的候选切点回填进 evidence，保证切点与片段互相可追溯 */
+/** 没有匹配到候选切点时写进 evidence.reasons 的明确原因值，供契约输出回溯 */
+const NO_CANDIDATE_CUT_REASON = 'no_candidate_cut_matched';
+
+/**
+ * 把落在 segment 边界附近的候选切点回填进 evidence，保证切点与片段互相可追溯。
+ * 没有匹配到切点时不能只留 warning：必须写入明确原因值，保证每个片段都有可追溯依据。
+ */
 function attachCandidateCutEvidence(segments, candidateCuts, fallbackReason, warn) {
   return segments.map(segment => {
     const matched = candidateCuts
@@ -205,6 +211,7 @@ function attachCandidateCutEvidence(segments, candidateCuts, fallbackReason, war
 
     if (candidateCutTimes.length === 0 && !fallbackReason) {
       warn(`segment_without_traceable_evidence:${segment.title}`);
+      reasons.push(NO_CANDIDATE_CUT_REASON);
     }
     if (fallbackReason && !reasons.includes(fallbackReason)) {
       reasons.push(fallbackReason);
@@ -296,6 +303,8 @@ function validateSegments({
 
 module.exports = {
   validateSegments,
+  formatClock,
+  NO_CANDIDATE_CUT_REASON,
   ADOPTED_TOLERANCE_SECONDS,
   VALID_TYPES,
   VALID_CONFIDENCE

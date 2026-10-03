@@ -15,6 +15,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
+const { killProcessTree } = require('../utils/killProcessTree');
 
 // ---------------------------------------------------------------------------
 // 错误模型
@@ -55,6 +56,8 @@ const ERROR_REASONS = {
   COOKIE_INVALID_OR_EXPIRED: 'COOKIE_INVALID_OR_EXPIRED',
   HTTP_ERROR: 'HTTP_ERROR',
   STREAM_INTERRUPTED: 'STREAM_INTERRUPTED',
+  /** 子进程（如 yt-dlp）长时间无任何输出，看门狗已终止进程树 —— 通常是网络黑洞而非普通失败 */
+  PROCESS_STALLED: 'PROCESS_STALLED',
   UNEXPECTED_CONTENT_TYPE: 'UNEXPECTED_CONTENT_TYPE',
   SIZE_MISMATCH: 'SIZE_MISMATCH',
   FILE_EMPTY: 'FILE_EMPTY',
@@ -506,6 +509,12 @@ function buildUserFacingMessage(error) {
     return DEFAULT_MESSAGES[ERROR_CODES.INVALID_INPUT];
   }
 
+  // 停滞必须有区别于普通"下载失败"的文案：网络黑洞时进程静默挂死，
+  // 用户看到"视频下载失败（PROCESS_STALLED）"无法判断该等还是该重试
+  if (error.reason === ERROR_REASONS.PROCESS_STALLED) {
+    return '下载进程长时间没有任何输出（可能是网络连接中断），已自动终止并清理；请检查网络后重试';
+  }
+
   const attempted = (error.attempts || [])
     .map(attempt => `${attempt.strategy}${attempt.withCookie ? '(cookie)' : '(anonymous)'}`)
     .join(' → ');
@@ -631,6 +640,20 @@ const MIN_VIDEO_BYTES = 1024;
 const PART_SUFFIX = '.part';
 const MAX_BACKUP_URL_TRIES = 2;
 
+/**
+ * ffmpeg 合并超时策略：5 分钟下限 + 按输入体积每 MB 200ms 缩放。
+ * - 200ms/MB ≈ 等效 5MB/s 的保守吞吐：`-c copy` 是纯 IO（无重编码），
+ *   正常机械盘/USB 盘也远快于此，系数留足余量只为兜住"真挂死"，
+ *   避免慢盘或杀毒扫描时把正常合并误杀。
+ * - 5 分钟下限覆盖小文件与进程冷启动（ffmpeg 首次加载、磁盘唤醒）。
+ */
+const MERGE_TIMEOUT_FLOOR_MS = 5 * 60 * 1000;
+const MERGE_TIMEOUT_PER_MB_MS = 200;
+/** ffprobe 只读本地文件头，正常毫秒级返回；60s 足够覆盖冷启动/慢盘，超时即降级 */
+const PROBE_TIMEOUT_MS = 60 * 1000;
+/** concat 列表文件体积上限：超过就不展开解析，避免把大二进制文件误当列表读进内存 */
+const CONCAT_LIST_MAX_BYTES = 64 * 1024;
+
 class BilibiliDownloader {
   /**
    * @param {object} [options]
@@ -640,6 +663,8 @@ class BilibiliDownloader {
    * @param {string} [options.ffmpegPath]
    * @param {string|null} [options.ffprobePath]
    * @param {number} [options.maxAttemptsPerStrategy] 每个策略的最大尝试次数
+   * @param {number} [options.mergeTimeoutMs] ffmpeg 合并超时覆盖值（测试/运维用；缺省按输入体积缩放）
+   * @param {number} [options.probeTimeoutMs] ffprobe 探测超时覆盖值（测试/运维用；缺省 60s）
    */
   constructor(options = {}) {
     this.downloadDir = options.downloadDir || path.join(__dirname, '../../downloads');
@@ -650,6 +675,9 @@ class BilibiliDownloader {
     this.maxAttemptsPerStrategy = Number.isFinite(options.maxAttemptsPerStrategy)
       ? Math.max(1, options.maxAttemptsPerStrategy)
       : 2;
+    // 覆盖值只用于测试/极端环境；正常运行分别走体积缩放与固定探测超时
+    this.mergeTimeoutMs = normalizeTimeoutMs(options.mergeTimeoutMs);
+    this.probeTimeoutMs = normalizeTimeoutMs(options.probeTimeoutMs);
     this.ensureDownloadDir();
   }
 
@@ -1193,36 +1221,47 @@ class BilibiliDownloader {
     throw lastError;
   }
 
-  /** ffmpeg 合并/转封装，输出到 .part 再原子重命名 */
+  /** ffmpeg 合并/转封装，输出到 .part 再原子重命名；超时杀进程树并按输入体积缩放 */
   async mergeWithFfmpeg(inputArgs, outputPath) {
     const partPath = `${outputPath}${PART_SUFFIX}`;
     const args = ['-y', ...inputArgs.flat(), '-movflags', '+faststart', partPath];
+    const timeoutMs = this.mergeTimeoutMs || resolveMergeTimeoutMs(inputArgs);
 
-    const result = await new Promise((resolve) => {
-      let stderr = '';
-      let child;
-      try {
-        child = this.spawnImpl(this.ffmpegPath, args, { windowsHide: true });
-      } catch (error) {
-        resolve({ ok: false, stderr: error?.message || '' });
-        return;
-      }
+    let stderr = '';
+    let child = null;
+    try {
+      child = this.spawnImpl(this.ffmpegPath, args, { windowsHide: true });
+    } catch (error) {
+      // spawn 自身失败（可执行文件不存在等）：沿用原失败分支，不启动超时
+      stderr = error?.message || '';
+    }
 
+    let ok = false;
+    let timedOut = false;
+    if (child) {
       child.stderr?.on('data', (chunk) => {
         stderr = `${stderr}${chunk.toString()}`.slice(-4000);
       });
-      child.on('error', (error) => resolve({ ok: false, stderr: `${stderr}\n${error.message}` }));
-      child.on('close', (code) => resolve({ ok: code === 0, stderr }));
-    });
+      const outcome = await runChildWithTimeout(child, {
+        label: `ffmpeg 合并 ${path.basename(outputPath)}`,
+        timeoutMs
+      });
+      timedOut = outcome.timedOut;
+      if (outcome.error) stderr = `${stderr}\n${outcome.error.message}`;
+      ok = !timedOut && !outcome.error && outcome.code === 0;
+    }
 
-    if (!result.ok) {
+    if (!ok) {
+      // 半成品 .part 必须删掉：既避免占盘，也避免下次被当成残留或误判为可用文件
       cleanupFiles([partPath]);
       throw new DownloadError({
         code: ERROR_CODES.DOWNLOAD_FAILED,
         reason: ERROR_REASONS.FFMPEG_FAILED,
         stage: ERROR_STAGES.MERGE,
         retryable: true,
-        message: `ffmpeg 合并失败: ${truncateForLog(result.stderr, 400)}`
+        message: timedOut
+          ? `ffmpeg 合并超时（超过 ${timeoutMs}ms 未完成），已终止进程并清理半成品`
+          : `ffmpeg 合并失败: ${truncateForLog(stderr, 400)}`
       });
     }
 
@@ -1256,7 +1295,11 @@ class BilibiliDownloader {
 
   // --- 校验 -------------------------------------------------------------
 
-  /** 用 ffprobe 检查是否存在视频流；ffprobe 不可用时降级为仅体积校验 */
+  /**
+   * 用 ffprobe 检查是否存在视频流；ffprobe 不可用或超时都降级为仅体积校验。
+   * 超时既不抛错（一次慢盘探测不该判整个下载失败），也不当成"通过"
+   * （没探测过就断言有视频流是撒谎），而是返回 checked:false 走既有降级路径。
+   */
   async probeHasVideoStream(filePath) {
     if (!this.ffprobePath) return { checked: false, hasVideo: null };
 
@@ -1268,24 +1311,29 @@ class BilibiliDownloader {
       filePath
     ];
 
-    const result = await new Promise((resolve) => {
-      let stdout = '';
-      let stderr = '';
-      let child;
-      try {
-        child = this.spawnImpl(this.ffprobePath, args, { windowsHide: true });
-      } catch (error) {
-        resolve({ checked: false, hasVideo: null, error: error?.message });
-        return;
-      }
-      child.stdout?.on('data', (chunk) => { stdout += chunk.toString(); });
-      child.stderr?.on('data', (chunk) => { stderr += chunk.toString(); });
-      child.on('error', (error) => resolve({ checked: false, hasVideo: null, error: error.message }));
-      child.on('close', (code) => resolve({ checked: true, hasVideo: code === 0 && /video/i.test(stdout), stderr }));
+    let stdout = '';
+    let stderr = '';
+    let child = null;
+    try {
+      child = this.spawnImpl(this.ffprobePath, args, { windowsHide: true });
+    } catch (error) {
+      return { checked: false, hasVideo: null, error: error?.message };
+    }
+
+    child.stdout?.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr?.on('data', (chunk) => { stderr += chunk.toString(); });
+
+    const timeoutMs = this.probeTimeoutMs || PROBE_TIMEOUT_MS;
+    const outcome = await runChildWithTimeout(child, {
+      label: `ffprobe 视频流探测 ${path.basename(filePath)}`,
+      timeoutMs
     });
 
-    if (!result.checked) return result;
-    return result;
+    if (outcome.timedOut) {
+      return { checked: false, hasVideo: null, error: `ffprobe 探测超时（>${timeoutMs}ms）` };
+    }
+    if (outcome.error) return { checked: false, hasVideo: null, error: outcome.error.message };
+    return { checked: true, hasVideo: outcome.code === 0 && /video/i.test(stdout), stderr };
   }
 
   /** 校验最终文件：非空 + 存在视频流；不通过则删除文件并抛错 */
@@ -1567,6 +1615,109 @@ function cleanupFiles(paths) {
   }
 }
 
+/** 把可选超时覆盖值归一化为正毫秒；null/undefined/'' 或非正数都视为"未提供"（与 audioCuts 同款处理） */
+function normalizeTimeoutMs(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return Math.max(1, Math.round(num));
+}
+
+/**
+ * 给子进程加超时兜底，保证 Promise 只 settle 一次。
+ *
+ * 为什么需要它：ffmpeg/ffprobe 一旦挂住 close 永远不会来，Promise 永不 settle，
+ * 整个下载任务会永久卡死。超时后必须杀进程树（见 utils/killProcessTree 注释），
+ * 否则 Windows 上只杀启动器会留下继续跑的孤儿进程。
+ *
+ * 只监听 error/close；stdout/stderr 由调用方按原逻辑自行收集。
+ * child 只要求是 EventEmitter 形状，单测注入假进程即可。
+ *
+ * @returns {Promise<{timedOut: boolean, code: number|null, error: Error|null}>}
+ */
+function runChildWithTimeout(child, { label = '子进程', timeoutMs, onTimeout = null } = {}) {
+  const effectiveTimeoutMs = normalizeTimeoutMs(timeoutMs) || MERGE_TIMEOUT_FLOOR_MS;
+  return new Promise((resolve) => {
+    let settled = false;
+    let timedOut = false;
+    let timer = null;
+
+    const settle = (payload) => {
+      if (settled) return;
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      resolve({ ...payload, timedOut });
+    };
+
+    timer = setTimeout(() => {
+      timedOut = true;
+      // label + 超时值必须打出来：下载卡死时这是定位到具体子命令的唯一线索
+      console.warn(`[BilibiliDownloader] ${label} 超时（>${effectiveTimeoutMs}ms），终止进程树`);
+      try {
+        if (onTimeout) onTimeout();
+      } catch (_) { /* 钩子异常不能影响超时收尾 */ }
+      killProcessTree(child);
+      // 进程被 taskkill 后 Windows 上 close 不一定再来，这里必须兜底 settle
+      settle({ code: null, error: null });
+    }, effectiveTimeoutMs);
+
+    child.on('error', (error) => settle({ code: null, error: error instanceof Error ? error : new Error(String(error)) }));
+    child.on('close', (code) => settle({ code, error: null }));
+  });
+}
+
+/** 文件体积；不存在/不可读按 0 计，让超时退回下限 */
+function safeFileSize(filePath) {
+  try {
+    return fs.statSync(filePath).size;
+  } catch (_) {
+    return 0;
+  }
+}
+
+/**
+ * 展开 concat 列表（`-f concat -i xxx.txt`）引用的媒体文件。
+ * 列表本身只有几 KB，若只按列表体积算超时，多分片大视频永远贴着下限，
+ * 慢盘合并有被误杀风险；这里读回真实分片体积。
+ * 只解析小体积 .txt，避免把大二进制文件整块读进内存。
+ */
+function expandConcatList(listPath) {
+  if (!/\.txt$/i.test(listPath) || safeFileSize(listPath) > CONCAT_LIST_MAX_BYTES) return [];
+  try {
+    const content = fs.readFileSync(listPath, 'utf8');
+    return [...content.matchAll(/^file\s+'(.+)'\s*$/gm)].map(match => match[1]);
+  } catch (_) {
+    return [];
+  }
+}
+
+/**
+ * 合并超时 = max(5 分钟下限, 输入总字节数 / 1MB × 200ms)。
+ * inputArgs 是 ffmpeg 参数分组（如 [['-i', v], ['-i', a], ...]），只统计 `-i` 后的输入；
+ * concat 列表会展开为其引用的分片，避免只按几 KB 的列表文件误算。
+ * @param {Array<Array<string>>} inputArgs
+ * @param {{fileSize?: Function}} [inject] 测试注入的取体积函数，避免依赖真实文件
+ */
+function resolveMergeTimeoutMs(inputArgs, { fileSize = safeFileSize } = {}) {
+  const flat = Array.isArray(inputArgs) ? inputArgs.flat() : [];
+  let totalBytes = 0;
+  for (let index = 0; index < flat.length - 1; index += 1) {
+    if (flat[index] !== '-i') continue;
+    const inputPath = String(flat[index + 1]);
+    let bytes = Number(fileSize(inputPath)) || 0;
+    const referenced = expandConcatList(inputPath);
+    if (referenced.length > 0) {
+      bytes = referenced.reduce((sum, file) => sum + (Number(fileSize(file)) || 0), 0);
+    }
+    totalBytes += bytes;
+  }
+  const scaled = (totalBytes / (1024 * 1024)) * MERGE_TIMEOUT_PER_MB_MS;
+  return Math.max(MERGE_TIMEOUT_FLOOR_MS, Math.round(scaled));
+}
+
 /** dash 流的 baseUrl / backupUrl：兼容驼峰与下划线两种字段名 */
 function pickStreamUrls(stream) {
   if (!stream) return [];
@@ -1630,3 +1781,8 @@ module.exports.scrubSecrets = scrubSecrets;
 module.exports.parseCookieInput = parseCookieInput;
 module.exports.resolveFfprobePath = resolveFfprobePath;
 module.exports.AttemptLog = AttemptLog;
+// 超时策略导出供单测校验缩放规则
+module.exports.resolveMergeTimeoutMs = resolveMergeTimeoutMs;
+module.exports.MERGE_TIMEOUT_FLOOR_MS = MERGE_TIMEOUT_FLOOR_MS;
+module.exports.MERGE_TIMEOUT_PER_MB_MS = MERGE_TIMEOUT_PER_MB_MS;
+module.exports.PROBE_TIMEOUT_MS = PROBE_TIMEOUT_MS;

@@ -14,9 +14,33 @@ const os = require('os');
 const path = require('path');
 const EventEmitter = require('events');
 
+// ---------------------------------------------------------------------------
+// 必须在 require videoAnalyzer / bilibiliDownloader 之前把 killProcessTree 换成记录桩：
+// 两个模块都在加载时解构该依赖（同 audioCuts.test.js / bilibiliDownloader.test.js 的手法），
+// 晚替换拿到的是真实现，停滞用例会真的执行 taskkill。
+// ---------------------------------------------------------------------------
+const KILL_PROCESS_TREE_PATH = require.resolve('../utils/killProcessTree');
+const killCalls = [];
+require.cache[KILL_PROCESS_TREE_PATH] = {
+  id: KILL_PROCESS_TREE_PATH,
+  filename: KILL_PROCESS_TREE_PATH,
+  loaded: true,
+  exports: {
+    killProcessTree: (child) => {
+      killCalls.push(child);
+    }
+  }
+};
+
 const VideoAnalyzer = require('./videoAnalyzer');
 const BilibiliDownloader = require('./bilibiliDownloader');
-const { ERROR_CODES, ERROR_REASONS: REASONS, DownloadError } = BilibiliDownloader;
+const {
+  ERROR_CODES,
+  ERROR_REASONS: REASONS,
+  ERROR_STAGES,
+  DownloadError,
+  buildUserFacingMessage
+} = BilibiliDownloader;
 
 // ---------------------------------------------------------------------------
 // 测试脚手架
@@ -107,6 +131,54 @@ function argValue(args, flag) {
   return index >= 0 ? args[index + 1] : null;
 }
 
+/**
+ * 只驱动 python(yt-dlp) 生命周期的 spawn mock：ffprobe/ffmpeg 快速成功，
+ * python 交给 onPython(child, call, index) 自行控制何时输出/何时结束/是否永远静默，
+ * 用于验证停滞看门狗的时间行为。
+ */
+function createLifetimeSpawnMock(onPython) {
+  const calls = [];
+  const spawnImpl = (cmd, args = [], options = {}) => {
+    const call = { cmd, args, options };
+    calls.push(call);
+
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+
+    setImmediate(() => {
+      const isProbe = String(cmd).includes('ffprobe') || args.includes('-show_entries');
+      if (isProbe) {
+        child.stdout.emit('data', Buffer.from('video\n'));
+        child.emit('close', 0);
+        return;
+      }
+      if (cmd !== 'python') {
+        child.emit('close', 0);
+        return;
+      }
+      const pythonIndex = calls.filter(item => item.cmd === 'python').length; // 1-based
+      onPython(child, call, pythonIndex);
+    });
+
+    return child;
+  };
+
+  spawnImpl.calls = calls;
+  spawnImpl.pythonCalls = () => calls.filter(call => call.cmd === 'python');
+  return spawnImpl;
+}
+
+/** 按 yt-dlp 的 -o 模板写出产出文件，模拟一次成功下载 */
+function writeYtDlpOutput(args) {
+  const outIndex = args.indexOf('-o');
+  const template = outIndex >= 0 ? args[outIndex + 1] : null;
+  if (template) {
+    fs.writeFileSync(template.replace('%(ext)s', 'mp4'), Buffer.alloc(VIDEO_BYTES, 5));
+  }
+}
+
 function describeYtDlpCall(call) {
   const extractorArg = argValue(call.args, '--extractor-args') || '';
   return {
@@ -134,13 +206,13 @@ function writeCookieFile(dir) {
   return cookiePath;
 }
 
-function makeAnalyzer(dir, spawnImpl, downloader) {
+function makeAnalyzer(dir, spawnImpl, downloader, analyzerOptions = {}) {
   const realDownloader = downloader || new BilibiliDownloader({
     downloadDir: dir,
     spawnImpl,
     ffprobePath: 'ffprobe-mock'
   });
-  const analyzer = new VideoAnalyzer(dir, null, { spawnImpl, downloader: realDownloader });
+  const analyzer = new VideoAnalyzer(dir, null, { spawnImpl, downloader: realDownloader, ...analyzerOptions });
   analyzer.realDownloader = realDownloader;
   return analyzer;
 }
@@ -259,6 +331,159 @@ async function main() {
     const first = spawnImpl.pythonCalls()[0];
     check(first.args.includes('--remux-video'), '包含 --remux-video');
     equal(argValue(first.args, '--remux-video'), 'mp4', '--remux-video mp4');
+
+    cleanupDir(dir);
+  });
+
+  // --- Y5b: yt-dlp 参数包含 --socket-timeout ---
+  await test('yt-dlp 参数包含 --socket-timeout 30', async () => {
+    const dir = makeTempDir('ytdlp-socket-timeout');
+    const spawnImpl = createSpawnMock(() => ({ code: 0, stderr: '' }));
+    const analyzer = makeAnalyzer(dir, spawnImpl);
+
+    await analyzer.downloadVideo(BV, `https://www.bilibili.com/video/${BV}`, null, null, {});
+
+    const first = spawnImpl.pythonCalls()[0];
+    check(first.args.includes('--socket-timeout'), '包含 --socket-timeout');
+    equal(argValue(first.args, '--socket-timeout'), '30', 'socket 读超时为 30 秒');
+    equal(VideoAnalyzer.YT_DLP_SOCKET_TIMEOUT_SECONDS, 30, '常量与命令行参数保持一致');
+
+    cleanupDir(dir);
+  });
+
+  // --- S1: 完全静默 → 判定停滞、杀进程树、错误可重试 ---
+  await test('yt-dlp 长时间无输出 → 判定停滞并终止进程树', async () => {
+    killCalls.length = 0;
+    const dir = makeTempDir('ytdlp-stall');
+    let ytDlpChild = null;
+
+    const spawnImpl = createLifetimeSpawnMock((child) => {
+      ytDlpChild = child;
+      // 先吐一行进度（应重置看门狗），随后永久静默：不 emit close
+      child.stdout.emit('data', Buffer.from('[download]  50.0% of 10.00MiB\n'));
+    });
+
+    const analyzer = makeAnalyzer(dir, spawnImpl, null, { stallTimeoutMs: 60 });
+
+    let thrown = null;
+    try {
+      await analyzer.downloadVideo(BV, `https://www.bilibili.com/video/${BV}`, null, null, {});
+    } catch (error) {
+      thrown = error;
+    }
+
+    check(Boolean(thrown), '停滞时抛出错误');
+    equal(thrown?.reason, REASONS.PROCESS_STALLED, '归类为 PROCESS_STALLED');
+    equal(thrown?.code, ERROR_CODES.DOWNLOAD_FAILED, 'code 为 DOWNLOAD_FAILED');
+    equal(thrown?.stage, ERROR_STAGES.YT_DLP, 'stage 为 yt_dlp');
+    check(thrown?.retryable === true, '标记为可重试，后续策略仍会被尝试');
+    check(Boolean(thrown?.message) && thrown.message.includes('无任何输出'), '错误信息能看出是停滞', thrown?.message);
+    equal(killCalls.length, 1, 'killProcessTree 被调用一次');
+    equal(killCalls[0], ytDlpChild, '杀掉的是 yt-dlp 子进程句柄');
+
+    cleanupDir(dir);
+  });
+
+  // --- S2: 持续有输出 → 不因总时长超过阈值被误杀（防"误杀正常长下载"回归） ---
+  await test('yt-dlp 持续输出时不会被停滞看门狗误杀', async () => {
+    killCalls.length = 0;
+    const dir = makeTempDir('ytdlp-alive');
+    const stallMs = 60;
+    const intervalMs = 20;
+    const ticks = 10; // 总时长约 200ms，明显超过 60ms 阈值
+
+    const spawnImpl = createLifetimeSpawnMock((child, call) => {
+      let remaining = ticks;
+      const tick = () => {
+        if (remaining > 0) {
+          remaining -= 1;
+          // 每次输出间隔都小于停滞阈值 → 看门狗应被持续重置
+          child.stderr.emit('data', Buffer.from('[download]  10.0% of 1.00MiB\n'));
+          setTimeout(tick, intervalMs);
+          return;
+        }
+        writeYtDlpOutput(call.args);
+        child.emit('close', 0);
+      };
+      tick();
+    });
+
+    const analyzer = makeAnalyzer(dir, spawnImpl, null, { stallTimeoutMs: stallMs });
+    const startedAt = Date.now();
+    const outputPath = await analyzer.downloadVideo(BV, `https://www.bilibili.com/video/${BV}`, null, null, {});
+    const elapsed = Date.now() - startedAt;
+
+    check(elapsed > stallMs, '总时长明显超过停滞阈值', `${elapsed}ms > ${stallMs}ms`);
+    check(elapsed >= intervalMs * ticks, '持续输出的总时长符合预期', `${elapsed}ms`);
+    equal(killCalls.length, 0, '持续有输出时不会被误杀');
+    check(fs.existsSync(outputPath), '正常产出视频文件');
+
+    cleanupDir(dir);
+  });
+
+  // --- S3: 首次尝试停滞 → 后续策略仍被尝试并成功 ---
+  await test('首次尝试停滞后策略降级仍然生效', async () => {
+    killCalls.length = 0;
+    const dir = makeTempDir('ytdlp-stall-fallback');
+    const cookiePath = writeCookieFile(dir);
+
+    const spawnImpl = createLifetimeSpawnMock((child, call, index) => {
+      if (index === 1) {
+        // Cookie 路径停滞：一行输出后永久静默
+        child.stderr.emit('data', Buffer.from('[download]   0.5% of 100.00MiB\n'));
+        return;
+      }
+      // 匿名策略正常完成
+      child.stdout.emit('data', Buffer.from('[download] 100.0% of 100.00MiB\n'));
+      writeYtDlpOutput(call.args);
+      child.emit('close', 0);
+    });
+
+    const analyzer = makeAnalyzer(dir, spawnImpl, null, { stallTimeoutMs: 60 });
+    const outputPath = await analyzer.downloadVideo(BV, `https://www.bilibili.com/video/${BV}`, null, cookiePath, {});
+
+    const plan = spawnImpl.pythonCalls().map(describeYtDlpCall);
+    equal(plan.length, 2, '停滞后的匿名策略仍被尝试');
+    equal(plan[0].withCookie, true, '第 1 次为 Cookie 策略');
+    equal(plan[0].useWbi, true, '第 1 次 use_wbi=true');
+    equal(plan[1].withCookie, false, '第 2 次降级为匿名策略');
+    check(fs.existsSync(outputPath), '降级后下载成功');
+    equal(killCalls.length, 1, '只有停滞的那次被终止进程树');
+
+    cleanupDir(dir);
+  });
+
+  // --- S4: 所有尝试都停滞 → finalizeDownloadError 仍归类为 PROCESS_STALLED ---
+  await test('所有尝试都停滞时最终错误分类正确且文案可读', async () => {
+    killCalls.length = 0;
+    const dir = makeTempDir('ytdlp-all-stall');
+    const cookiePath = writeCookieFile(dir);
+
+    const spawnImpl = createLifetimeSpawnMock((child) => {
+      // 每次尝试都是"一行输出后永久静默"
+      child.stderr.emit('data', Buffer.from('[download]   0.5% of 100.00MiB\n'));
+    });
+
+    const analyzer = makeAnalyzer(dir, spawnImpl, null, { stallTimeoutMs: 40 });
+
+    let thrown = null;
+    try {
+      await analyzer.downloadVideo(BV, `https://www.bilibili.com/video/${BV}`, null, cookiePath, {});
+    } catch (error) {
+      thrown = error;
+    }
+
+    equal(thrown?.reason, REASONS.PROCESS_STALLED, '最终 reason 仍为 PROCESS_STALLED');
+    equal(thrown?.code, ERROR_CODES.DOWNLOAD_FAILED, '最终 code 为 DOWNLOAD_FAILED');
+    check(thrown?.retryable === true, '最终仍标记为可重试');
+    check(thrown?.attempts.length >= 2, '记录了 Cookie 与匿名两次尝试', String(thrown?.attempts?.length));
+    check(thrown.attempts.every(entry => entry.reason === REASONS.PROCESS_STALLED), '每次尝试都归类为停滞');
+    equal(killCalls.length, 2, '两次停滞各终止一次进程树');
+    check(
+      buildUserFacingMessage(thrown).includes('没有任何输出'),
+      '用户文案不是笼统的"下载失败"',
+      buildUserFacingMessage(thrown)
+    );
 
     cleanupDir(dir);
   });

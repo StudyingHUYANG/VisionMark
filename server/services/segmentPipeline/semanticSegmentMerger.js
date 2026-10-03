@@ -28,6 +28,18 @@ const BOUNDARY_SNAP_TOLERANCE_SECONDS = 5;
 const MIN_BOUNDARY_GAP_SECONDS = 1;
 /** fallback 里判定「这个边界来自哪个候选切点」的容差 */
 const BOUNDARY_MATCH_TOLERANCE_SECONDS = 1;
+/**
+ * 模型声明原因值的命名空间前缀。
+ *
+ * 为什么必须加：契约的 reasons 是溯源字段（内部取值如 boundary_from_candidate_cut /
+ * validator_fallback / fallback_merge / snapped_to_*），下游会把它当作「流水线为什么这么切」
+ * 的证据来解读。若不加前缀，模型只要在 evidence.reasons 里写 "validator_fallback"，
+ * 就能冒充内部降级原因、把溯源信息搞脏——与「模型声明的 candidateCutTimes 必须落在真实
+ * 候选切点上」是同一类防护。加前缀后模型原文仍保留、可回溯，但不可能再冒充内部原因值。
+ */
+const MODEL_REASON_PREFIX = 'model_reason:';
+/** 模型原因原文的截断长度：防止超长文本把契约 reasons 字段撑爆（前缀不计入） */
+const MODEL_REASON_MAX_LENGTH = 60;
 function confidenceFromScore(score) {
   if (score >= 0.75) return 'high';
   if (score >= 0.45) return 'medium';
@@ -78,10 +90,63 @@ function snapBoundary(value, context = {}) {
   return { time: best.time, reason: `forced_to_${best.label}` };
 }
 
+/**
+ * 核对模型声明的候选切点：只接受真实候选切点集合里的时间。
+ *
+ * 为什么不能直接采信：契约层（segmentContract）虽然会从真实 candidateCuts 反查证据，
+ * 但内部 evidence.candidateCutTimes 会被 segmentValidator.attachCandidateCutEvidence
+ * 合并进证据数组、并出现在 debug 产物里；若放任模型随口写数字，等于在内部证据中
+ * 留下「凭空创造的时间点」，与文件头「绝不接受模型凭空创造的时间点」的约束矛盾。
+ *
+ * 判定容差与 snapBoundary 保持一致：容差内视为同一个切点，但保留真实切点的时间值
+ * （避免 45.25999 这类模型近似小数进入证据）；容差外直接丢弃并留 warning。
+ * 真实候选切点集合为空时无从核对，原样放行，避免把全部声明误判为非法。
+ */
+function normalizeDeclaredCutTimes(values, candidateCutTimes, warn) {
+  const declared = Array.isArray(values)
+    ? values
+      .map(parseTimeToSeconds)
+      .filter(time => time !== null && time >= 0)
+    : [];
+
+  const candidates = Array.isArray(candidateCutTimes) ? candidateCutTimes : [];
+  if (candidates.length === 0) return declared;
+
+  const kept = [];
+  for (const time of declared) {
+    let nearest = null;
+    for (const candidate of candidates) {
+      if (nearest === null || Math.abs(candidate - time) < Math.abs(nearest - time)) {
+        nearest = candidate;
+      }
+    }
+    if (nearest !== null && Math.abs(nearest - time) <= BOUNDARY_SNAP_TOLERANCE_SECONDS) {
+      kept.push(nearest);
+    } else {
+      warn(`dropped_ai_declared_cut_not_in_candidates:${time}`);
+    }
+  }
+  return kept;
+}
+
 function clampToDuration(time, duration) {
   if (!Number.isFinite(time)) return null;
   if (!Number.isFinite(duration) || duration <= 0) return Math.max(0, time);
   return Math.max(0, Math.min(duration, time));
+}
+
+/**
+ * 模型声明的原因值 → 带命名空间的原因值。
+ *
+ * 空字符串 / 纯空白 / 非字符串照旧丢弃；合法项 trim 后截断到 MODEL_REASON_MAX_LENGTH
+ * 再拼前缀。去重不在这里做：与 snapReasons 合并后由 uniqueSorted 统一处理，
+ * 保证「模型声明」与「内部原因」在同一集合里只出现一次。
+ */
+function normalizeModelReasons(values) {
+  if (!Array.isArray(values)) return [];
+  return values
+    .filter(reason => typeof reason === 'string' && reason.trim())
+    .map(reason => `${MODEL_REASON_PREFIX}${reason.trim().slice(0, MODEL_REASON_MAX_LENGTH)}`);
 }
 
 /**
@@ -111,14 +176,13 @@ function normalizeSegment(segment, index, context = {}) {
     return null;
   }
 
-  const reasons = Array.isArray(segment?.evidence?.reasons)
-    ? segment.evidence.reasons.filter(reason => typeof reason === 'string' && reason.trim())
-    : [];
-  const declaredCuts = Array.isArray(segment?.evidence?.candidateCutTimes)
-    ? segment.evidence.candidateCutTimes
-      .map(parseTimeToSeconds)
-      .filter(time => time !== null && time >= 0)
-    : [];
+  // 模型声明的原因值加 model_reason: 前缀（见常量注释）；下方 snapReasons 是内部溯源，保持裸值
+  const reasons = normalizeModelReasons(segment?.evidence?.reasons);
+  const declaredCuts = normalizeDeclaredCutTimes(
+    segment?.evidence?.candidateCutTimes,
+    context.candidateCutTimes,
+    warn
+  );
 
   const snapReasons = [startSnap.reason, endSnap.reason].filter(Boolean);
 
@@ -275,5 +339,7 @@ module.exports = {
   fallbackSegmentMerge,
   normalizeSegment,
   snapBoundary,
-  BOUNDARY_SNAP_TOLERANCE_SECONDS
+  BOUNDARY_SNAP_TOLERANCE_SECONDS,
+  MODEL_REASON_PREFIX,
+  MODEL_REASON_MAX_LENGTH
 };

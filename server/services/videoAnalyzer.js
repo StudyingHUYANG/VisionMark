@@ -1,12 +1,12 @@
-const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const { exec, spawn, spawnSync } = require('child_process');
-const util = require('util');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const OpenAI = require('openai');
 const { buildEffectiveModelConfig } = require('./modelConfigService');
-const { ossClient, hasOssConfig } = require('../utils/oss');
+const { hasOssConfig } = require('../utils/oss');
+const { killProcessTree } = require('../utils/killProcessTree');
+const { toPositiveNumber } = require('../utils/numberUtils');
 const EmbeddingService = require('./embeddingService');
 const vectorDb = require('./vectorDb');
 const BilibiliDownloader = require('./bilibiliDownloader');
@@ -29,8 +29,8 @@ const { analyzeVisualCuts, analyzeSceneCutsWithFfmpeg } = require('./visualCutDe
 const keywordCutService = require('./segment/keywordCuts');
 const { detectAudioCuts } = require('./segment/audioCuts');
 const { runSegmentPipeline } = require('./segmentPipeline');
-
-const execPromise = util.promisify(exec);
+const { removeArtifactsFor } = require('./segmentPipeline/debugArtifactWriter');
+const asrService = require('./asr');
 
 // 时间格式化辅助函数
 function formatTime(seconds) {
@@ -46,6 +46,30 @@ function clampPercent(percent) {
 }
 
 const YTDLP_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+/**
+ * yt-dlp 停滞看门狗阈值（默认 5 分钟，可用构造参数 stallTimeoutMs 覆盖）。
+ *
+ * 为什么不是"总时长上限"：长视频合法下载几十分钟是正常的，硬性总超时会误杀正常任务。
+ * 要防的是"完全没有输出"——网络黑洞（连接在、数据不来）时 yt-dlp 可以永远沉默地挂着。
+ *
+ * 为什么阈值要取到 5 分钟这么宽：`--remux-video mp4` 阶段 yt-dlp 内部调用 ffmpeg 转封装大文件，
+ * 期间整条进程可能安静好几分钟（增量进度不写 stdout/stderr）。阈值必须宽于这段静默期，
+ * 否则正常的大文件转封装会被当成停滞误杀。
+ */
+const YT_DLP_STALL_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * 交给 yt-dlp 自己的 socket 读超时（秒）：每个 socket 连续 30 秒无数据即放弃该连接，
+ * 并走参数里已有的 --retries / --fragment-retries 重试（可能换到备份源）。
+ *
+ * 看门狗只能发现"整条进程静默"，而单条死连接上 yt-dlp 仍可能在耐心等待；
+ * 让 yt-dlp 自己快速失败能更早恢复。取 30 秒的理由：
+ *  - 看的是静默时长而不是速率，慢速网络下"数据来得慢"仍有数据到达，不会触发；
+ *  - 转封装阶段没有 socket 活动，不受此参数影响（防误杀）；
+ *  - 30 秒远大于 B 站 CDN 分片正常的帧间/包间间隔，不会误伤正常下载。
+ */
+const YT_DLP_SOCKET_TIMEOUT_SECONDS = 30;
 
 /** 取 yt-dlp 输出末尾若干行用于诊断，先脱敏再截断 */
 function truncateTail(text, maxLength = 400) {
@@ -67,7 +91,7 @@ function resolveFfprobePath() {
   const repoSiblingPath = path.join(__dirname, '../../scripts/ffmpeg/ffprobe.exe');
   if (fs.existsSync(repoSiblingPath)) return repoSiblingPath;
 
-  const probe = spawnSync('ffprobe', ['-version'], { encoding: 'utf8' });
+  const probe = spawnSync('ffprobe', ['-version'], { encoding: 'utf8', timeout: 5000, windowsHide: true });
   if (!probe.error && probe.status === 0) return 'ffprobe';
 
   return null;
@@ -78,6 +102,107 @@ function parsePtsTimes(text) {
     .map(match => Number(match[1]))
     .filter(time => Number.isFinite(time) && time >= 0)
     .filter((time, index, list) => index === 0 || Math.abs(time - list[index - 1]) > 0.001);
+}
+
+// 16kHz / 单声道 / s16le 的 wav 每秒 32000 字节，低于 1 秒的音频没有识别价值
+const MIN_AUDIO_BYTES = 32 * 1024;
+// 音频与视频时长允许的差异下限（相对差异另取 2%）
+const AUDIO_DURATION_TOLERANCE_SECONDS = 2;
+
+// cleanup 认得的直接产物后缀；下载中间产物（.mp4.part / .durl-N.mp4 / .concat.txt …）
+// 走 `${bvid}.` 前缀命中，不用在这里逐个列举
+const CLEANUP_FILE_EXTS = Object.freeze(['.mp4', '.mp3', '.m4a', '.wav']);
+
+/**
+ * 文件名是否属于该 bvid。
+ *
+ * 判据必须落在分隔符边界（`{bvid}.` / `{bvid}_`）上：老实现用 startsWith(bvid)，
+ * cleanup('BV1aa') 会连带删掉另一个视频的 'BV1aab.mp4' 和 'BV1aab_frames/'，误删别人的缓存。
+ */
+function belongsToBvid(name, bvid, exts = CLEANUP_FILE_EXTS) {
+  if (exts.some(ext => name === `${bvid}${ext}`)) return true;
+  return name.startsWith(`${bvid}.`) || name.startsWith(`${bvid}_`);
+}
+
+// --- 媒体工具超时策略 --------------------------------------------------------
+// ffmpeg/ffprobe 不带超时会在异常输入上永久挂起，进而拖死整个分析任务。
+// perSecondMs 让超时随视频时长缩放，minMs 是短片/时长未知时的兜底下限。
+const MEDIA_TIMEOUT_POLICIES = Object.freeze({
+  /** 元数据探测：只读文件头，与时长无关 */
+  probe: Object.freeze({ minMs: 120000, perSecondMs: 0 }),
+  /** 全片解码：最坏情况要读完整个文件 */
+  decode: Object.freeze({ minMs: 300000, perSecondMs: 500 }),
+  /** 单帧抓取：-ss 定位后只取一帧 */
+  frame: Object.freeze({ minMs: 30000, perSecondMs: 50 }),
+  /** 音频提取 / 压缩副本 */
+  audio: Object.freeze({ minMs: 120000, perSecondMs: 500 }),
+  /** ffmpeg scene 扫描：同样要读完整片 */
+  scene: Object.freeze({ minMs: 120000, perSecondMs: 500 })
+});
+
+function resolveMediaTimeoutMs(durationSeconds, policy) {
+  const minMs = Number.isFinite(Number(policy?.minMs)) ? Number(policy.minMs) : 120000;
+  const perSecondMs = Number.isFinite(Number(policy?.perSecondMs)) ? Number(policy.perSecondMs) : 0;
+  const duration = Number(durationSeconds);
+  const scaled = Number.isFinite(duration) && duration > 0 ? duration * perSecondMs : 0;
+  return Math.max(minMs, Math.round(scaled));
+}
+
+/** 命令超时错误：带上 label 与 timeoutMs，便于日志区分是哪一步挂住了 */
+class MediaToolTimeoutError extends Error {
+  constructor(label, timeoutMs) {
+    super(`${label} 执行超时(${timeoutMs}ms)`);
+    this.name = 'MediaToolTimeoutError';
+    this.code = 'MEDIA_TOOL_TIMEOUT';
+    this.label = label;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+function isMediaToolTimeout(error) {
+  return error instanceof MediaToolTimeoutError || error?.code === 'MEDIA_TOOL_TIMEOUT';
+}
+
+/**
+ * 解析 ffprobe 单值输出（N/A、空行、非数字都视为无效）。
+ * 逐行找第一个有效正数：部分容器会先输出 N/A 再输出真实值。
+ */
+function parseDurationValue(text) {
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    if (/^n\/?a$/i.test(line)) continue;
+    const value = Number.parseFloat(line);
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+
+  return null;
+}
+
+/**
+ * 把 ASR 的分段结果格式化成 `[MM:SS] 文本` 的多行文本。
+ * 时间戳只取识别结果自带的 start，不做任何按比例插值。
+ */
+function formatTranscriptSegments(segments) {
+  if (!Array.isArray(segments)) return '';
+
+  return segments
+    .map((segment, index) => ({ segment, index }))
+    .filter(({ segment }) => segment && typeof segment === 'object')
+    .map(({ segment, index }) => {
+      const text = String(segment.text ?? '').trim();
+      if (!text) return null;
+      const start = Number(segment.start);
+      const safeStart = Number.isFinite(start) && start > 0 ? start : 0;
+      return { line: `[${formatTime(safeStart)}] ${text}`, start: safeStart, index };
+    })
+    .filter(Boolean)
+    .sort((a, b) => (a.start - b.start) || (a.index - b.index))
+    .map(item => item.line)
+    .join('\n');
 }
 
 function buildFallbackAnalysisResult(reason, transcript = null, visualCuts = [], visualCutStats = null) {
@@ -109,12 +234,23 @@ class VideoAnalyzer {
     this.downloadDir = downloadDir || path.join(__dirname, '../../downloads');
     this.wss = wss; // WebSocket 服务器实例
     this.spawnImpl = options.spawnImpl || spawn; // 便于测试注入
+    // ffmpeg/ffprobe 执行器与超时，均可注入，便于单测覆盖超时/失败分支
+    this.execImpl = typeof options.execImpl === 'function' ? options.execImpl : exec;
+    this.mediaTimeoutMs = Number.isFinite(Number(options.mediaTimeoutMs)) && Number(options.mediaTimeoutMs) > 0
+      ? Math.round(Number(options.mediaTimeoutMs))
+      : null;
     this.ensureDownloadDir();
     // 复用 BilibiliDownloader 的校验能力（ffprobe/体积），避免两套实现漂移
     this.downloader = options.downloader || new BilibiliDownloader({ downloadDir: this.downloadDir });
     this.maxYtDlpAttempts = Number.isFinite(options.maxYtDlpAttempts)
       ? Math.max(1, options.maxYtDlpAttempts)
       : 4;
+    // yt-dlp 停滞看门狗阈值：显式注入优先（测试/运维），缺省用 5 分钟。
+    // 用 toPositiveNumber 而不是 Number.isFinite(Number(...))：后者会把 null 判成 0。
+    const stallTimeoutOverride = toPositiveNumber(options.stallTimeoutMs);
+    this.stallTimeoutMs = stallTimeoutOverride === null
+      ? YT_DLP_STALL_TIMEOUT_MS
+      : Math.max(1, Math.round(stallTimeoutOverride));
   }
 
   getEffectiveModelConfig(userConfig = null) {
@@ -167,6 +303,83 @@ class VideoAnalyzer {
   ensureDownloadDir() {
     if (!fs.existsSync(this.downloadDir)) {
       fs.mkdirSync(this.downloadDir, { recursive: true });
+    }
+  }
+
+  /** 本次调用该给多久超时：显式注入优先，否则按视频时长缩放 */
+  resolveTimeoutMs(durationSeconds, policy) {
+    if (Number.isFinite(this.mediaTimeoutMs)) return this.mediaTimeoutMs;
+    return resolveMediaTimeoutMs(durationSeconds, policy);
+  }
+
+  /**
+   * 统一执行 ffmpeg/ffprobe：带超时，超时后杀掉整个进程树并抛 MediaToolTimeoutError。
+   * 通过 this.execImpl 注入，便于单测。
+   */
+  runMediaCommand(command, { label = 'ffmpeg', timeoutMs = null, maxBuffer = 8 * 1024 * 1024 } = {}) {
+    // 不能用 Number.isFinite(Number(timeoutMs)) 判断"是否显式传了超时"：
+    // Number(null) === 0 是有限数，会把"不传 timeoutMs"误判成 0，取整成 1ms 让命令瞬时超时，
+    // 下面按 probe 策略兜底的分支永远不可达。
+    const timeoutOverride = toPositiveNumber(timeoutMs);
+    const effectiveTimeoutMs = timeoutOverride !== null
+      ? Math.max(1, Math.round(timeoutOverride))
+      : this.resolveTimeoutMs(null, MEDIA_TIMEOUT_POLICIES.probe);
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timedOut = false;
+      let timer = null;
+
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        callback(value);
+      };
+
+      let child;
+      try {
+        child = this.execImpl(command, { shell: true, windowsHide: true, maxBuffer }, (error, stdout, stderr) => {
+          if (error) {
+            if (timedOut) {
+              finish(reject, new MediaToolTimeoutError(label, effectiveTimeoutMs));
+              return;
+            }
+            const wrapped = error instanceof Error ? error : new Error(String(error));
+            wrapped.stdout = stdout;
+            wrapped.stderr = stderr;
+            wrapped.label = label;
+            finish(reject, wrapped);
+            return;
+          }
+          finish(resolve, { stdout, stderr });
+        });
+      } catch (error) {
+        finish(reject, error);
+        return;
+      }
+
+      timer = setTimeout(() => {
+        timedOut = true;
+        killProcessTree(child);
+        // 进程被杀后回调不一定触发（Windows 上尤其如此），这里直接兜底
+        finish(reject, new MediaToolTimeoutError(label, effectiveTimeoutMs));
+      }, effectiveTimeoutMs);
+
+      // 回调有可能在定时器注册前就同步返回，这种情况下别把定时器留在事件循环里
+      if (settled) clearTimeout(timer);
+    });
+  }
+
+  /** 删除半成品文件：失败时只记日志，不掩盖真正的错误 */
+  removeFileQuietly(filePath, reason = '') {
+    try {
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+        console.warn(`[VideoAnalyzer] 已删除${reason ? `（${reason}）` : ''}: ${filePath}`);
+      }
+    } catch (error) {
+      console.warn(`[VideoAnalyzer] 删除文件失败 ${filePath}: ${error.message}`);
     }
   }
 
@@ -238,6 +451,9 @@ class VideoAnalyzer {
       '--no-check-certificate',
       '--ignore-config',
       '--no-warnings',
+      // 死连接由 yt-dlp 自己快速失败并换源重试；看门狗（进程级静默）只做最后兜底，
+      // 两者配合：socket 级先失败，进程级兜住真正的网络黑洞
+      '--socket-timeout', String(YT_DLP_SOCKET_TIMEOUT_SECONDS),
       '--extractor-args', `bilibili:use_wbi=${useWbi ? 'true' : 'false'}`
     ];
 
@@ -268,16 +484,63 @@ class VideoAnalyzer {
       });
     };
 
+    const stallTimeoutMs = this.stallTimeoutMs;
+
     const result = await new Promise((resolve) => {
-      const child = this.spawnImpl('python', args, { windowsHide: true });
+      let child;
+      try {
+        child = this.spawnImpl('python', args, { windowsHide: true });
+      } catch (error) {
+        // spawn 同步抛出（可执行文件不存在等）：走既有的非零退出码分类路径
+        resolve({ code: -1, output: error?.message || String(error), stalled: false });
+        return;
+      }
+
       let outputTail = '';
       let lastReportedPercent = -1;
+      let settled = false;
+      let stallTimer = null;
+
+      const clearStallTimer = () => {
+        if (stallTimer) {
+          clearTimeout(stallTimer);
+          stallTimer = null;
+        }
+      };
+
+      const settle = (payload) => {
+        if (settled) return;
+        settled = true;
+        // 必须清掉看门狗：settle 之后残留的定时器会拖住事件循环，
+        // 极端情况下还会对着已退出的进程重复调用 killProcessTree
+        clearStallTimer();
+        resolve(payload);
+      };
+
+      /**
+       * 停滞看门狗：只在"连续 stallTimeoutMs 无任何输出"时才判定停滞，
+       * 每次 stdout/stderr 数据到达都会重置，因此长视频持续有进度输出时不会被误杀。
+       */
+      const armStallTimer = () => {
+        if (settled) return;
+        clearStallTimer();
+        stallTimer = setTimeout(() => {
+          console.warn(`[VideoAnalyzer] yt-dlp 连续 ${stallTimeoutMs}ms 无任何输出，判定为停滞，终止进程树`);
+          killProcessTree(child);
+          // Windows 上 taskkill 之后 close 事件不一定到达，这里必须自行兜底 settle
+          settle({ code: null, output: outputTail, stalled: true });
+        }, stallTimeoutMs);
+      };
 
       const appendOutput = (text) => {
         outputTail = `${outputTail}${text}`.slice(-8000);
       };
 
       const handleOutput = (chunk) => {
+        if (settled) return;
+        // 任何输出（下载进度、ffmpeg 转封装提示、告警）都说明进程还活着，重置看门狗
+        armStallTimer();
+
         const text = chunk.toString();
         appendOutput(text);
 
@@ -297,9 +560,24 @@ class VideoAnalyzer {
 
       child.stdout?.on('data', handleOutput);
       child.stderr?.on('data', handleOutput);
-      child.on('error', (error) => resolve({ code: -1, output: `${outputTail}\n${error.message}` }));
-      child.on('close', (code) => resolve({ code, output: outputTail }));
+      child.on('error', (error) => settle({ code: -1, output: `${outputTail}\n${error.message}`, stalled: false }));
+      child.on('close', (code) => settle({ code, output: outputTail, stalled: false }));
+      // 必须在注册监听之后启动：先武装定时器再挂监听的话，
+      // 极端情况下同步到达的数据会重置一个尚未赋值的定时器句柄
+      armStallTimer();
     });
+
+    if (result.stalled) {
+      // 停滞按可重试处理：下一档策略（use_wbi 切换 / 匿名）仍值得尝试，
+      // 网络黑洞往往只在某条连接/某个参数组合上出现
+      throw new DownloadError({
+        code: ERROR_CODES.DOWNLOAD_FAILED,
+        reason: ERROR_REASONS.PROCESS_STALLED,
+        stage: ERROR_STAGES.YT_DLP,
+        retryable: true,
+        message: `yt-dlp 连续 ${stallTimeoutMs}ms 无任何输出，判定为停滞并终止进程树（${strategy}${withCookie ? '/cookie' : '/anonymous'}）: ${truncateTail(result.output)}`
+      });
+    }
 
     if (result.code !== 0) {
       const error = classifyYtDlpFailure(result.output, { stage: ERROR_STAGES.YT_DLP });
@@ -494,29 +772,85 @@ class VideoAnalyzer {
   }
 
   /**
-   * 获取视频时长（秒）
+   * 获取视频时长（秒）。
+   *
+   * 三级探测，任一环拿到有效值即返回：
+   *   1. ffprobe format=duration        → durationSource='probe'
+   *   2. ffprobe 视频流 duration        → durationSource='probe'
+   *   3. ffmpeg 全片解码取最大 pts_time → durationSource='decoded'
+   *
+   * 三级全部失败时返回 { duration: null, durationSource: 'unknown' }。
+   * 不再兜底 300 秒：错误的时长会同时污染抽帧 fps、自适应阈值和契约里的 duration。
+   * @returns {Promise<{duration: number|null, durationSource: 'probe'|'decoded'|'unknown', detail: string}>}
    */
   async getVideoDuration(videoPath) {
-    const command = `"${ffmpegPath}" -i "${videoPath}" -f null -`;
-    try {
-      const { stderr } = await execPromise(command, { shell: true });
-      // 从stderr中解析时长
-      const durationMatch = stderr.match(/Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})/);
-      if (durationMatch) {
-        const hours = parseInt(durationMatch[1]);
-        const mins = parseInt(durationMatch[2]);
-        const secs = parseFloat(durationMatch[3]);
-        const duration = hours * 3600 + mins * 60 + secs;
-        console.log(`[VideoAnalyzer] 视频时长: ${Math.floor(duration / 60)}:${Math.floor(duration % 60).toString().padStart(2, '0')} (${duration.toFixed(2)}秒)`);
-        return duration;
+    const attempts = [];
+    const ffprobePath = resolveFfprobePath();
+
+    if (ffprobePath) {
+      // 1) 容器层 duration：绝大多数 mp4/flv 都能直接读到
+      try {
+        const { stdout } = await this.runMediaCommand(
+          `"${ffprobePath}" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`,
+          { label: 'ffprobe format=duration', timeoutMs: this.resolveTimeoutMs(null, MEDIA_TIMEOUT_POLICIES.probe) }
+        );
+        const duration = parseDurationValue(stdout);
+        if (duration !== null) {
+          console.log(`[VideoAnalyzer] 视频时长: ${formatTime(duration)} (${duration.toFixed(2)}秒, 来源=ffprobe format)`);
+          return { duration, durationSource: 'probe', detail: 'format=duration' };
+        }
+        attempts.push('format=duration 无有效数值');
+      } catch (error) {
+        attempts.push(`format=duration 失败: ${error.message}`);
+        console.warn(`[VideoAnalyzer] ffprobe format=duration 失败: ${error.message}`);
       }
-      // 如果无法解析，返回默认值
-      console.warn('[VideoAnalyzer] 无法获取视频时长，使用默认值300秒');
-      return 300;
-    } catch (error) {
-      console.error('[VideoAnalyzer] 获取视频时长失败:', error.message);
-      return 300; // 默认5分钟
+
+      // 2) 视频流 duration：部分容器（如分段 flv、raw h264）只在流上带时长
+      try {
+        const { stdout } = await this.runMediaCommand(
+          `"${ffprobePath}" -v error -select_streams v:0 -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`,
+          { label: 'ffprobe stream=duration', timeoutMs: this.resolveTimeoutMs(null, MEDIA_TIMEOUT_POLICIES.probe) }
+        );
+        const duration = parseDurationValue(stdout);
+        if (duration !== null) {
+          console.log(`[VideoAnalyzer] 视频时长: ${formatTime(duration)} (${duration.toFixed(2)}秒, 来源=ffprobe stream)`);
+          return { duration, durationSource: 'probe', detail: 'stream=duration' };
+        }
+        attempts.push('stream=duration 无有效数值');
+      } catch (error) {
+        attempts.push(`stream=duration 失败: ${error.message}`);
+        console.warn(`[VideoAnalyzer] ffprobe stream=duration 失败: ${error.message}`);
+      }
+    } else {
+      attempts.push('ffprobe 不可用');
+      console.warn('[VideoAnalyzer] 未找到 ffprobe，跳过两级 ffprobe 时长探测');
     }
+
+    // 3) 最后手段：解到最后一帧，取最大 pts_time
+    try {
+      const { stderr } = await this.runMediaCommand(
+        `"${ffmpegPath}" -hide_banner -nostats -i "${videoPath}" -map 0:v:0 -an -vf showinfo -f null -`,
+        {
+          label: 'ffmpeg decode-duration',
+          timeoutMs: this.resolveTimeoutMs(null, MEDIA_TIMEOUT_POLICIES.decode),
+          maxBuffer: 32 * 1024 * 1024
+        }
+      );
+      const times = parsePtsTimes(stderr);
+      const duration = times.reduce((max, time) => (time > max ? time : max), 0);
+      if (duration > 0) {
+        console.log(`[VideoAnalyzer] 视频时长: ${formatTime(duration)} (${duration.toFixed(2)}秒, 来源=解码末帧)`);
+        return { duration, durationSource: 'decoded', detail: 'decode_max_pts' };
+      }
+      attempts.push('解码未取到 pts_time');
+    } catch (error) {
+      attempts.push(`解码探测失败: ${error.message}`);
+      console.warn(`[VideoAnalyzer] ffmpeg 解码探测时长失败: ${error.message}`);
+    }
+
+    const detail = attempts.join('; ');
+    console.warn(`[VideoAnalyzer] 无法获取视频时长，将按“时长未知”继续（不影响分析是否完成）: ${detail}`);
+    return { duration: null, durationSource: 'unknown', detail };
   }
 
   /**
@@ -529,7 +863,11 @@ class VideoAnalyzer {
       const ffprobePath = resolveFfprobePath();
       if (ffprobePath) {
         const command = `"${ffprobePath}" -v error -select_streams v -skip_frame nokey -show_entries frame=pkt_pts_time -of csv=p=0 "${videoPath}"`;
-        const { stdout } = await execPromise(command, { shell: true, maxBuffer: 8 * 1024 * 1024 });
+        const { stdout } = await this.runMediaCommand(command, {
+          label: 'ffprobe 关键帧时间戳',
+          timeoutMs: this.resolveTimeoutMs(null, MEDIA_TIMEOUT_POLICIES.probe),
+          maxBuffer: 8 * 1024 * 1024
+        });
         const timestamps = stdout
           .split(/\r?\n/)
           .map(line => line.trim())
@@ -540,7 +878,11 @@ class VideoAnalyzer {
       }
 
       const command = `"${ffmpegPath}" -skip_frame nokey -i "${videoPath}" -map 0:v:0 -an -vf showinfo -f null -`;
-      const { stderr } = await execPromise(command, { shell: true, maxBuffer: 16 * 1024 * 1024 });
+      const { stderr } = await this.runMediaCommand(command, {
+        label: 'ffmpeg 关键帧时间戳',
+        timeoutMs: this.resolveTimeoutMs(null, MEDIA_TIMEOUT_POLICIES.decode),
+        maxBuffer: 16 * 1024 * 1024
+      });
       const timestamps = parsePtsTimes(stderr);
       if (timestamps.length > 0) {
         console.log(`[VideoAnalyzer] 使用 ffmpeg showinfo 提取关键帧时间戳: ${timestamps.length} 个`);
@@ -564,12 +906,19 @@ class VideoAnalyzer {
       fs.mkdirSync(framesDir, { recursive: true });
     }
 
+    // 先清掉上一轮的帧，否则残留旧帧会被当成这一轮的证据
+    for (const file of fs.readdirSync(framesDir)) {
+      if (/\.(jpe?g|png)$/i.test(file)) {
+        fs.unlinkSync(path.join(framesDir, file));
+      }
+    }
+
     console.log(`[VideoAnalyzer] 提取视频关键帧...`);
     this.reportProgress(onProgress, 'frames', 22, '正在准备抽帧');
 
     try {
-      // 获取视频实际时长
-      const duration = await this.getVideoDuration(videoPath);
+      // 获取视频实际时长（三级探测，拿不到就是 null，不再兜底 300 秒）
+      const { duration, durationSource, detail: durationDetail } = await this.getVideoDuration(videoPath);
       this.reportProgress(onProgress, 'frames', 24, '正在定位关键帧');
 
       // 尝试使用ffprobe获取关键帧时间戳（更接近场景切换）
@@ -577,10 +926,14 @@ class VideoAnalyzer {
 
       // 如果ffprobe失败或者数据过少，退回到均匀采样
       if (!timestamps || timestamps.length < 2) {
-        const interval = 5;
-        const frameCount = Math.ceil(duration / interval);
-        timestamps = Array.from({ length: frameCount }, (_, i) => i * interval);
-        console.log(`[VideoAnalyzer] 关键帧时间点不足，退回到均匀采样，每 ${interval} 秒一帧`);
+        if (Number.isFinite(duration) && duration > 0) {
+          const interval = 5;
+          const frameCount = Math.ceil(duration / interval);
+          timestamps = Array.from({ length: frameCount }, (_, i) => i * interval);
+          console.log(`[VideoAnalyzer] 关键帧时间点不足，退回到均匀采样，每 ${interval} 秒一帧`);
+        } else {
+          throw new Error(`无法获取视频时长且没有可用的关键帧时间戳，无法抽帧（${durationDetail}）`);
+        }
       }
 
       // 限制最大帧数，避免发送给大模型太多图像
@@ -593,20 +946,47 @@ class VideoAnalyzer {
       console.log(`[VideoAnalyzer] 将提取 ${timestamps.length} 张关键帧（基于场景/关键帧，间隔可变）`);
       this.reportProgress(onProgress, 'frames', 25, `正在抽帧 0/${timestamps.length}`);
 
-      // 提取关键帧截图，文件名包含时间戳（毫秒），便于后续排序和提示
+      // 提取关键帧截图，文件名包含时间戳（毫秒），便于后续排序和提示。
+      // 单帧失败只跳过并告警（seek 到损坏区段很常见），全部失败才认为抽帧失败。
+      const frameTimeoutMs = this.resolveTimeoutMs(duration, MEDIA_TIMEOUT_POLICIES.frame);
+      const failures = [];
+      let successCount = 0;
+
       for (let i = 0; i < timestamps.length; i++) {
         const ts = timestamps[i];
         const ms = Math.round(ts * 1000);
         const outputPath = path.join(framesDir, `frame_${String(i + 1).padStart(3, '0')}_${ms}.jpg`);
         const command = `"${ffmpegPath}" -ss ${ts} -i "${videoPath}" -frames:v 1 -q:v 2 -vf "scale=640:-1" "${outputPath}" -y`;
-        await execPromise(command, { shell: true });
+        try {
+          await this.runMediaCommand(command, { label: `抽帧 t=${ts}s`, timeoutMs: frameTimeoutMs });
+          successCount += 1;
+        } catch (error) {
+          failures.push({ time: ts, message: error.message });
+          console.warn(`[VideoAnalyzer] 抽帧失败，跳过该帧 t=${ts}s: ${error.message}`);
+          this.removeFileQuietly(outputPath, '抽帧残留');
+        }
         const framePercent = 25 + ((i + 1) / Math.max(timestamps.length, 1)) * 15;
         this.reportProgress(onProgress, 'frames', framePercent, `正在抽帧 ${i + 1}/${timestamps.length}`);
       }
 
+      if (successCount === 0) {
+        throw new Error(`关键帧全部提取失败（${timestamps.length} 帧），首个失败原因: ${failures[0]?.message || '未知'}`);
+      }
+      if (failures.length > 0) {
+        console.warn(`[VideoAnalyzer] 抽帧部分失败: 成功 ${successCount}/${timestamps.length}，失败 ${failures.length} 帧`);
+      }
+
       console.log(`[VideoAnalyzer] 关键帧提取完成，保存在: ${framesDir}`);
       this.reportProgress(onProgress, 'frames', 40, '关键帧提取完成');
-      return { framesDir, duration };
+      return {
+        framesDir,
+        duration,
+        durationSource,
+        // 关键帧时间戳一并带出：时长探测全失败时，最大时间戳就是时长的下界，用完就丢太浪费
+        keyframeTimestamps: timestamps,
+        frameCount: successCount,
+        failedFrameCount: failures.length
+      };
     } catch (error) {
       console.error('[VideoAnalyzer] 关键帧提取失败:', error);
       throw new Error(`关键帧提取失败: ${error.message}`);
@@ -616,6 +996,11 @@ class VideoAnalyzer {
   /**
    * 抽取用于视觉切点检测的低分辨率连续采样帧。
    * 这组帧和发给大模型的关键帧分开，避免 30 帧上限影响切点召回。
+   *
+   * 时长未知时不再假定时长，而是按 sampleFps 抽完再按 maxFrames 均匀截断，
+   * 并在 meta 里标出 durationSource，让阈值随 fps 漂移这件事在结果里可见。
+   *
+   * @returns {Promise<{frames: Array<{framePath: string, time: number}>, meta: object}>}
    */
   async extractVisualProbeFrames(videoPath, bvid, duration, onProgress = null, options = {}) {
     const framesDir = path.join(this.downloadDir, `${bvid}_visual_frames`);
@@ -629,21 +1014,60 @@ class VideoAnalyzer {
     const scaleWidth = Number.isFinite(Number(options.scaleWidth)) && Number(options.scaleWidth) > 0
       ? Math.floor(Number(options.scaleWidth))
       : 320;
-    const safeDuration = Number.isFinite(Number(duration)) && Number(duration) > 0
-      ? Number(duration)
-      : 300;
-    const targetFrames = Math.max(2, Math.min(maxFrames, Math.ceil(safeDuration * sampleFps)));
-    const effectiveFps = targetFrames / safeDuration;
+    const hasDuration = Number.isFinite(Number(duration)) && Number(duration) > 0;
+    const safeDuration = hasDuration ? Number(duration) : null;
+    // 时长来源由调用方传入（probe / decoded / unknown），避免这里把解码得到的时长标成 probe
+    const durationSource = typeof options.durationSource === 'string'
+      ? options.durationSource
+      : (hasDuration ? 'probe' : 'unknown');
+
+    if (!hasDuration) {
+      console.warn('[VideoAnalyzer] 视频时长未知，视觉帧按 sampleFps 抽取后截断');
+    }
+
+    const targetFrames = hasDuration
+      ? Math.max(2, Math.min(maxFrames, Math.ceil(safeDuration * sampleFps)))
+      : null;
+    const effectiveFps = hasDuration ? targetFrames / safeDuration : sampleFps;
+
+    // 缓存必须绑定到具体文件：同名不同内容的视频（重下/换清晰度）不能复用旧帧
+    let sourceSize = null;
+    let sourceMtimeMs = null;
+    try {
+      const stat = fs.statSync(videoPath);
+      sourceSize = stat.size;
+      sourceMtimeMs = Math.round(stat.mtimeMs);
+    } catch (error) {
+      console.warn(`[VideoAnalyzer] 读取视频指纹失败，视觉帧缓存将不复用: ${error.message}`);
+    }
+
+    const buildMeta = (frameCount, cached) => ({
+      frameCount,
+      targetFrames,
+      effectiveFps,
+      sampleFps,
+      scaleWidth,
+      maxFrames,
+      duration: safeDuration,
+      durationSource,
+      cached
+    });
 
     if (fs.existsSync(manifestPath)) {
       try {
         const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        // 老 manifest 没有 source_size/source_mtime_ms，一律视为不匹配，重新抽帧
         const cacheMatchesOptions =
           Math.abs(Number(manifest.sample_fps) - sampleFps) < 0.0001 &&
           Number(manifest.scale_width) === scaleWidth &&
           Number(manifest.max_frames || maxFrames) === maxFrames &&
           path.resolve(String(manifest.source_video || '')) === path.resolve(videoPath) &&
-          Math.abs(Number(manifest.duration || 0) - safeDuration) < 0.5;
+          sourceSize !== null &&
+          Number(manifest.source_size) === sourceSize &&
+          Number(manifest.source_mtime_ms) === sourceMtimeMs &&
+          (hasDuration
+            ? Math.abs(Number(manifest.duration || 0) - safeDuration) < 0.5
+            : manifest.duration === null || manifest.duration === undefined);
         const cachedFrames = Array.isArray(manifest.frames)
           ? manifest.frames
             .map(frame => ({
@@ -656,7 +1080,10 @@ class VideoAnalyzer {
         if (cacheMatchesOptions && cachedFrames.length >= 2) {
           console.log(`[VideoAnalyzer] 视觉检测帧已缓存: ${cachedFrames.length} 张`);
           this.reportProgress(onProgress, 'visual', 41, '视觉检测帧已缓存');
-          return cachedFrames;
+          return { frames: cachedFrames, meta: buildMeta(cachedFrames.length, true) };
+        }
+        if (cachedFrames.length >= 2 && !cacheMatchesOptions) {
+          console.log('[VideoAnalyzer] 视觉帧缓存与当前视频指纹不匹配，重新抽帧');
         }
       } catch (error) {
         console.warn('[VideoAnalyzer] 读取视觉帧缓存失败，将重新抽帧:', error.message);
@@ -673,28 +1100,41 @@ class VideoAnalyzer {
       }
     }
 
-    console.log(`[VideoAnalyzer] 抽取视觉检测帧: target=${targetFrames}, fps=${effectiveFps.toFixed(4)}`);
+    console.log(`[VideoAnalyzer] 抽取视觉检测帧: target=${targetFrames ?? 'unknown'}, fps=${effectiveFps.toFixed(4)}`);
     this.reportProgress(onProgress, 'visual', 41, '正在抽取视觉检测帧');
 
     const outputPattern = path.join(framesDir, 'visual_%06d.jpg');
     const command = `"${ffmpegPath}" -i "${videoPath}" -vf "fps=${effectiveFps.toFixed(4)},scale=${scaleWidth}:-1" -q:v 5 "${outputPattern}" -y`;
-    await execPromise(command, { shell: true });
+    await this.runMediaCommand(command, {
+      label: '视觉检测帧抽取',
+      timeoutMs: this.resolveTimeoutMs(safeDuration, MEDIA_TIMEOUT_POLICIES.decode)
+    });
 
     const files = fs.readdirSync(framesDir)
       .filter(file => /^visual_\d+\.jpg$/i.test(file))
       .sort();
 
-    const frames = files.map((file, index) => ({
+    let frames = files.map((file, index) => ({
       framePath: path.join(framesDir, file),
       time: Number((index / effectiveFps).toFixed(3))
     }));
+
+    // 只有时长未知时才可能超上限：此时按固定步长均匀截断，保持确定性
+    if (frames.length > maxFrames) {
+      const step = Math.ceil(frames.length / maxFrames);
+      frames = frames.filter((_, index) => index % step === 0);
+      console.warn(`[VideoAnalyzer] 视觉帧数超过上限，按 step=${step} 截断到 ${frames.length} 张`);
+    }
 
     fs.writeFileSync(
       manifestPath,
       JSON.stringify({
         generated_at: new Date().toISOString(),
         source_video: videoPath,
+        source_size: sourceSize,
+        source_mtime_ms: sourceMtimeMs,
         duration: safeDuration,
+        duration_source: durationSource,
         sample_fps: sampleFps,
         max_frames: maxFrames,
         effective_fps: effectiveFps,
@@ -708,277 +1148,258 @@ class VideoAnalyzer {
     );
 
     console.log(`[VideoAnalyzer] 视觉检测帧抽取完成: ${frames.length} 张`);
-    return frames;
+    return { frames, meta: buildMeta(frames.length, false) };
+  }
+
+  /**
+   * 用 ffprobe 检查音频文件是否有音频流、时长多少。
+   * ffprobe 不可用时返回 { checked: false }，调用方降级为只校验体积。
+   */
+  async probeAudioFile(audioPath) {
+    const ffprobePath = resolveFfprobePath();
+    if (!ffprobePath) return { checked: false, hasAudio: null, duration: null };
+
+    const timeoutMs = this.resolveTimeoutMs(null, MEDIA_TIMEOUT_POLICIES.probe);
+    try {
+      const { stdout: streamOut } = await this.runMediaCommand(
+        `"${ffprobePath}" -v error -select_streams a:0 -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`,
+        { label: 'ffprobe 音频流', timeoutMs }
+      );
+      const hasAudio = /audio/i.test(String(streamOut || ''));
+
+      let duration = null;
+      try {
+        const { stdout: durationOut } = await this.runMediaCommand(
+          `"${ffprobePath}" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`,
+          { label: 'ffprobe 音频时长', timeoutMs }
+        );
+        duration = parseDurationValue(durationOut);
+      } catch (error) {
+        console.warn(`[VideoAnalyzer] 读取音频时长失败: ${error.message}`);
+      }
+
+      return { checked: true, hasAudio, duration };
+    } catch (error) {
+      return { checked: false, hasAudio: null, duration: null, error: error.message };
+    }
+  }
+
+  /**
+   * 读取视频中音轨的时长（秒）。
+   * 容器时长可能含没有声音的尾巴，校验音频缓存时音轨时长是更准确的参照。
+   * 拿不到就返回 null，由调用方退回容器时长。
+   */
+  async getVideoAudioStreamDuration(videoPath) {
+    const ffprobePath = resolveFfprobePath();
+    if (!ffprobePath) return null;
+
+    try {
+      const { stdout } = await this.runMediaCommand(
+        `"${ffprobePath}" -v error -select_streams a:0 -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`,
+        { label: 'ffprobe 音轨时长', timeoutMs: this.resolveTimeoutMs(null, MEDIA_TIMEOUT_POLICIES.probe) }
+      );
+      return parseDurationValue(stdout);
+    } catch (error) {
+      console.warn(`[VideoAnalyzer] 读取视频音轨时长失败: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * 校验音频文件是否可用：体积下限 + 能读出音频流 + 时长与视频接近。
+   * 只判断“文件存在”会把 0 字节 / 半截 wav 永久当成有效缓存。
+   */
+  async validateAudioFile(audioPath, { videoDuration = null } = {}) {
+    let stat;
+    try {
+      stat = fs.statSync(audioPath);
+    } catch (_) {
+      return { ok: false, reason: '文件不存在' };
+    }
+
+    if (stat.size < MIN_AUDIO_BYTES) {
+      return { ok: false, reason: `体积过小(${stat.size} 字节)` };
+    }
+
+    const probe = await this.probeAudioFile(audioPath);
+    if (probe.checked && probe.hasAudio === false) {
+      return { ok: false, reason: 'ffprobe 读不到音频流' };
+    }
+
+    const expectedDuration = Number.isFinite(Number(videoDuration)) && Number(videoDuration) > 0
+      ? Number(videoDuration)
+      : null;
+    if (expectedDuration && Number.isFinite(probe.duration) && probe.duration > 0) {
+      const tolerance = Math.max(AUDIO_DURATION_TOLERANCE_SECONDS, expectedDuration * 0.02);
+      if (Math.abs(probe.duration - expectedDuration) > tolerance) {
+        return {
+          ok: false,
+          reason: `时长不匹配(音频 ${probe.duration.toFixed(1)}s / 视频 ${expectedDuration.toFixed(1)}s)`
+        };
+      }
+    }
+
+    return { ok: true, probed: probe.checked, duration: probe.duration, size: stat.size };
   }
 
   /**
    * 从视频中提取音频
-   * @param {string} videoPath - 视频路径
-   * @param {string} bvid - 视频BV号
+   *
+   * 命中缓存前必须先校验（体积 / 音频流 / 时长），坏缓存删掉重提；
+   * 提取失败或超时必须删除半成品，否则一次失败会永久污染后续所有分析。
+   * @returns {Promise<string>} 实际可用的音频路径（可能是历史遗留的 .mp3）
    */
-  async extractAudio(videoPath, bvid, onProgress = null) {
+  async extractAudio(videoPath, bvid, onProgress = null, options = {}) {
     const audioPath = path.join(this.downloadDir, `${bvid}.wav`);
+    const legacyMp3Path = path.join(this.downloadDir, `${bvid}.mp3`);
 
-    // 检查是否已提取（同时检查旧的.mp3文件）
-    const oldMp3Path = path.join(this.downloadDir, `${bvid}.mp3`);
+    let resolvedVideoDuration;
+    const getVideoDurationForCheck = async () => {
+      if (resolvedVideoDuration !== undefined) return resolvedVideoDuration;
+
+      if (Number.isFinite(Number(options.duration)) && Number(options.duration) > 0) {
+        resolvedVideoDuration = Number(options.duration);
+      } else {
+        const probed = await this.getVideoDuration(videoPath);
+        resolvedVideoDuration = probed.duration;
+      }
+
+      // 音轨时长比容器时长更贴近「提取出来的音频应该有多长」（容器可能有纯画面尾巴）
+      const audioTrackDuration = await this.getVideoAudioStreamDuration(videoPath);
+      if (Number.isFinite(audioTrackDuration) && audioTrackDuration > 0) {
+        if (Number.isFinite(resolvedVideoDuration) && Math.abs(audioTrackDuration - resolvedVideoDuration) > 1) {
+          console.log(
+            `[VideoAnalyzer] 音轨时长 ${audioTrackDuration.toFixed(1)}s 与容器时长 ${resolvedVideoDuration.toFixed(1)}s 不同，按音轨时长校验音频缓存`
+          );
+        }
+        resolvedVideoDuration = audioTrackDuration;
+      }
+
+      return resolvedVideoDuration;
+    };
+
+    // 1) 已有的 wav
     if (fs.existsSync(audioPath)) {
-      console.log(`[VideoAnalyzer] 音频已存在: ${audioPath}`);
-      this.reportProgress(onProgress, 'audio', 44, '音频已缓存，准备识别');
-      return audioPath;
-    } else if (fs.existsSync(oldMp3Path)) {
-      console.log(`[VideoAnalyzer] 找到旧的MP3音频，将使用: ${oldMp3Path}`);
-      this.reportProgress(onProgress, 'audio', 44, '音频已缓存，准备识别');
-      return oldMp3Path;
+      const verdict = await this.validateAudioFile(audioPath, { videoDuration: await getVideoDurationForCheck() });
+      if (verdict.ok) {
+        console.log(`[VideoAnalyzer] 音频已存在且校验通过: ${audioPath}`);
+        this.reportProgress(onProgress, 'audio', 44, '音频已缓存，准备识别');
+        return audioPath;
+      }
+      console.warn(`[VideoAnalyzer] 音频缓存不可用(${verdict.reason})，删除后重新提取`);
+      this.removeFileQuietly(audioPath, '损坏的音频缓存');
+    }
+
+    // 2) 历史遗留的 mp3：同样要校验，通过才复用
+    if (fs.existsSync(legacyMp3Path)) {
+      const verdict = await this.validateAudioFile(legacyMp3Path, { videoDuration: await getVideoDurationForCheck() });
+      if (verdict.ok) {
+        console.log(`[VideoAnalyzer] 复用历史 mp3 音频: ${legacyMp3Path}`);
+        this.reportProgress(onProgress, 'audio', 44, '音频已缓存，准备识别');
+        return legacyMp3Path;
+      }
+      console.warn(`[VideoAnalyzer] 历史 mp3 音频不可用(${verdict.reason})，删除后重新提取`);
+      this.removeFileQuietly(legacyMp3Path, '损坏的历史音频');
     }
 
     console.log(`[VideoAnalyzer] 提取音频为WAV格式...`);
     this.reportProgress(onProgress, 'audio', 42, '正在提取音频');
 
+    // 使用ffmpeg提取音频，采样率16000Hz，单声道，使用WAV格式（更兼容paraformer-v2）
+    const command = `"${ffmpegPath}" -i "${videoPath}" -vn -acodec pcm_s16le -ar 16000 -ac 1 "${audioPath}" -y`;
     try {
-      // 使用ffmpeg提取音频，采样率16000Hz，单声道，使用WAV格式（更兼容paraformer-v2）
-      const command = `"${ffmpegPath}" -i "${videoPath}" -vn -acodec pcm_s16le -ar 16000 -ac 1 "${audioPath}" -y`;
-      await execPromise(command, { shell: true });
-
-      console.log(`[VideoAnalyzer] 音频提取完成: ${audioPath}`);
-      this.reportProgress(onProgress, 'audio', 44, '音频提取完成');
-      return audioPath;
+      await this.runMediaCommand(command, {
+        label: '音频提取',
+        timeoutMs: this.resolveTimeoutMs(options.duration, MEDIA_TIMEOUT_POLICIES.audio)
+      });
     } catch (error) {
-      console.error('[VideoAnalyzer] 音频提取失败:', error);
+      this.removeFileQuietly(audioPath, '提取失败/超时的半成品');
+      console.error('[VideoAnalyzer] 音频提取失败:', error.message);
       throw new Error(`音频提取失败: ${error.message}`);
     }
+
+    // 刚提取的文件也要过一遍体积 + 音频流校验：视频没有音轨时 ffmpeg 可能留下空壳
+    const verdict = await this.validateAudioFile(audioPath, { videoDuration: null });
+    if (!verdict.ok) {
+      this.removeFileQuietly(audioPath, `提取结果无效: ${verdict.reason}`);
+      throw new Error(`音频提取结果无效: ${verdict.reason}`);
+    }
+
+    // 时长偏差只告警不失败：截断的音频仍可用于识别，直接失败会让整条音频链路无谓降级
+    const referenceDuration = await getVideoDurationForCheck();
+    if (Number.isFinite(referenceDuration) && Number.isFinite(verdict.duration)) {
+      const tolerance = Math.max(AUDIO_DURATION_TOLERANCE_SECONDS, referenceDuration * 0.02);
+      if (Math.abs(verdict.duration - referenceDuration) > tolerance) {
+        console.warn(
+          `[VideoAnalyzer] 提取出的音频时长(${verdict.duration.toFixed(1)}s)与视频音轨(${referenceDuration.toFixed(1)}s)差异较大，可能被截断`
+        );
+      }
+    }
+
+    console.log(`[VideoAnalyzer] 音频提取完成: ${audioPath}`);
+    this.reportProgress(onProgress, 'audio', 44, '音频提取完成');
+    return audioPath;
   }
 
   /**
-   * 使用通义千问语音识别进行音频转录（paraformer-v2异步API）
+   * 使用统一 ASR 服务进行音频转录（DashScope paraformer-v2 优先，失败降级本地 Whisper）
+   *
+   * 进度区间保持 45 → 58；ASR 内部的 0-100 进度映射到该区间。
    * @param {string} audioPath - 音频文件路径
    * @param {string} bvid - 视频BV号
+   * @returns {Promise<string|null>} `[MM:SS] 文本` 多行文本；拿不到结果时返回 null
    */
   async transcribeAudio(audioPath, bvid, userConfig = null, onProgress = null) {
     console.log('[VideoAnalyzer] 开始语音识别...');
     this.reportProgress(onProgress, 'speech', 45, '正在准备语音识别');
 
-    const modelConfig = this.getEffectiveModelConfig(userConfig);
-    const asrApiKey = modelConfig.apiKey;
+    if (!audioPath || !fs.existsSync(audioPath)) {
+      console.warn(`[VideoAnalyzer] 音频文件不可用，跳过语音识别: ${audioPath || '未提供'}`);
+      this.reportProgress(onProgress, 'speech', 58, '音频不可用，跳过语音识别');
+      return null;
+    }
+
+    const reportAsrProgress = (stage, percent) => {
+      const numeric = Number(percent);
+      const ratio = Number.isFinite(numeric) ? Math.max(0, Math.min(100, numeric)) / 100 : 0;
+      this.reportProgress(onProgress, 'speech', 45 + ratio * 13, `正在识别音频(${stage || 'processing'})`);
+    };
 
     try {
-      if (!ossClient) {
-        console.warn('[VideoAnalyzer] OSS client unavailable, skip transcription.');
-        this.reportProgress(onProgress, 'speech', 58, '跳过语音识别，继续画面分析');
+      const result = await asrService.transcribe(audioPath, {
+        userConfig,
+        bvid,
+        onProgress: reportAsrProgress
+      });
+
+      // 降级原因必须留在日志里，不能静默消失
+      for (const note of result.degradations || []) {
+        console.warn(`[VideoAnalyzer] ASR 降级: ${note}`);
+      }
+      if (result.error) {
+        console.warn(`[VideoAnalyzer] ASR 未成功: ${result.error}`);
+      }
+
+      if (!result.transcript || result.transcript.length === 0) {
+        console.warn('[VideoAnalyzer] 未获得转录文本，继续画面分析');
+        this.reportProgress(onProgress, 'speech', 58, '未获得语音文本，继续画面分析');
         return null;
       }
 
-      // 检查文件大小
-      const stats = fs.statSync(audioPath);
-      const fileSizeMB = stats.size / (1024 * 1024);
-
-      // WAV文件较大，限制100MB（大约对应5-10分钟视频）
-      if (fileSizeMB > 100) {
-        console.warn(`[VideoAnalyzer] 音频文件过大(${fileSizeMB.toFixed(2)}MB)，跳过语音识别`);
-        this.reportProgress(onProgress, 'speech', 58, '音频较大，跳过语音识别');
+      const transcript = formatTranscriptSegments(result.transcript);
+      if (!transcript) {
+        console.warn('[VideoAnalyzer] 转录结果为空文本，继续画面分析');
+        this.reportProgress(onProgress, 'speech', 58, '未获得语音文本，继续画面分析');
         return null;
       }
 
-      console.log(`[VideoAnalyzer] 音频文件大小: ${fileSizeMB.toFixed(2)}MB`);
-
-      // 1. 上传音频到阿里云OSS
-      console.log('[VideoAnalyzer] 上传音频到OSS...');
-      this.reportProgress(onProgress, 'speech', 47, '正在上传音频');
-      const ossObjectName = `audio/${bvid}/${path.basename(audioPath)}`;
-
-      try {
-        const result = await ossClient.put(ossObjectName, audioPath);
-        console.log('[VideoAnalyzer] 音频已上传到OSS:', result.url);
-      } catch (error) {
-        console.error('[VideoAnalyzer] OSS上传失败:', error.message);
-        throw new Error(`音频上传OSS失败: ${error.message}`);
-      }
-
-      // 2. 使用paraformer-v2异步API进行语音识别
-      console.log('[VideoAnalyzer] 使用 paraformer-v2 异步API 进行语音识别...');
-
-      const audioUrl = `https://${process.env.OSS_BUCKET}.${process.env.OSS_REGION}.aliyuncs.com/${ossObjectName}`;
-
-      // Step 1: 提交异步任务
-      console.log('[VideoAnalyzer] 提交语音识别任务...');
-      this.reportProgress(onProgress, 'speech', 49, '正在提交语音识别任务');
-      const submitResponse = await axios.post(
-        'https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription',
-        {
-          model: modelConfig.asrModel,
-          input: {
-            file_urls: [audioUrl]
-          },
-          parameters: {
-            text_mode: 'sentence',  // 使用sentence模式以获取时间戳
-            language_hints: ['zh', 'en'],
-            disfluency_removal: false,  // 保留语气词和停顿
-            timestamp_alignment: true  // 启用时间戳对齐
-          }
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${asrApiKey}`,
-            'Content-Type': 'application/json',
-            'X-DashScope-Async': 'enable'  // 启用异步模式
-          }
-        }
-      );
-
-      if (!submitResponse.data.output || !submitResponse.data.output.task_id) {
-        throw new Error('提交任务失败，未获取到task_id');
-      }
-
-      const taskId = submitResponse.data.output.task_id;
-      console.log('[VideoAnalyzer] 任务已提交，task_id:', taskId);
-      this.reportProgress(onProgress, 'speech', 50, '正在等待语音识别结果');
-
-      // Step 2: 轮询任务结果
-      console.log('[VideoAnalyzer] 等待任务完成...');
-      const maxAttempts = 60; // 最多等待60次（每次2秒，共2分钟）
-      let attempts = 0;
-
-      while (attempts < maxAttempts) {
-        await new Promise(resolve => setTimeout(resolve, 2000)); // 等待2秒
-        attempts++;
-
-        try {
-          const resultResponse = await axios.get(
-            `https://dashscope.aliyuncs.com/api/v1/tasks/${taskId}`,
-            {
-              headers: {
-                'Authorization': `Bearer ${asrApiKey}`,
-                'Content-Type': 'application/json'
-              }
-            }
-          );
-
-          const taskStatus = resultResponse.data.output?.task_status;
-
-          console.log(`[VideoAnalyzer] 任务状态: ${taskStatus} (${attempts}/${maxAttempts})`);
-          const speechPercent = 50 + (attempts / maxAttempts) * 8;
-          this.reportProgress(onProgress, 'speech', speechPercent, `正在识别音频 ${attempts}/${maxAttempts}`);
-
-          if (taskStatus === 'SUCCEEDED') {
-            // 任务成功完成
-            console.log('[VideoAnalyzer] paraformer-v2返回完整数据结构:');
-            console.log(JSON.stringify(resultResponse.data.output, null, 2));
-
-            // 检查是否有 transcription_url 需要下载
-            if (resultResponse.data.output?.results && resultResponse.data.output.results.length > 0) {
-              const firstResult = resultResponse.data.output.results[0];
-
-              // 如果有 transcription_url，需要下载实际的转录结果
-              if (firstResult.transcription_url) {
-                console.log('[VideoAnalyzer] 检测到 transcription_url，正在下载转录结果...');
-                try {
-                  const transcriptionResponse = await axios.get(firstResult.transcription_url);
-                  const transcriptionData = transcriptionResponse.data;
-
-                  console.log('[VideoAnalyzer] 转录结果数据结构:');
-                  console.log(JSON.stringify(transcriptionData, null, 2));
-
-                  // 根据实际的数据结构提取转录文本
-                  let transcriptText = '';
-
-                  // 辅助函数：按逗号分割句子并分配时间戳
-                  function splitByCommas(sentences) {
-                    const result = [];
-                    sentences.forEach(sentence => {
-                      const beginTime = (sentence.begin_time || 0) / 1000; // 毫秒转秒
-                      const text = sentence.text || '';
-
-                      // 按逗号分割
-                      const parts = text.split('，');
-                      const endTime = (sentence.end_time || sentence.begin_time || 0) / 1000;
-                      const duration = endTime - beginTime;
-
-                      parts.forEach((part, index) => {
-                        if (part.trim()) {
-                          // 按比例分配时间戳
-                          const partTime = beginTime + (duration * index / parts.length);
-                          const minutes = Math.floor(partTime / 60);
-                          const seconds = Math.floor(partTime % 60);
-                          const timeStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
-                          result.push(`[${timeStr}] ${part.trim()}`);
-                        }
-                      });
-                    });
-                    return result.join('\n');
-                  }
-
-                  // 格式1: {transcripts: [{sentences: [{begin_time, text}, ...]}]}
-                  if (transcriptionData.transcripts && transcriptionData.transcripts.length > 0) {
-                    console.log('[VideoAnalyzer] 使用 transcripts 数据结构（逗号分割模式）');
-                    const allSentences = transcriptionData.transcripts.flatMap(t => t.sentences || []);
-                    transcriptText = splitByCommas(allSentences);
-                  }
-                  // 格式2: {transcription_lines: [{text: "...", begin_time: 1000}, ...]}
-                  else if (transcriptionData.transcription_lines) {
-                    console.log('[VideoAnalyzer] 使用 transcription_lines 数据结构（逗号分割模式）');
-                    transcriptText = splitByCommas(transcriptionData.transcription_lines);
-                  } else if (Array.isArray(transcriptionData)) {
-                    // 格式3: 直接是数组 [{text: "...", begin_time: 1000}, ...]
-                    console.log('[VideoAnalyzer] 使用数组数据结构（逗号分割模式）');
-                    transcriptText = splitByCommas(transcriptionData);
-                  } else if (typeof transcriptionData === 'string') {
-                    // 格式4: 直接是文本（无时间戳，不处理）
-                    console.log('[VideoAnalyzer] 使用字符串数据结构');
-                    transcriptText = transcriptionData;
-                  }
-
-                  if (!transcriptText) {
-                    console.warn('[VideoAnalyzer] 无法解析转录数据结构');
-                  }
-
-                  console.log('[VideoAnalyzer] 语音识别完成（从transcription_url下载）');
-                  console.log('[VideoAnalyzer] 转录内容预览:', transcriptText.substring(0, 500).replace(/\n/g, ' '));
-                  this.reportProgress(onProgress, 'speech', 58, '语音识别完成');
-                  return transcriptText;
-                } catch (error) {
-                  console.error('[VideoAnalyzer] 下载转录结果失败:', error.message);
-                  return null;
-                }
-              } else if (firstResult.transcription_text) {
-                // 直接包含转录文本
-                const transcript = resultResponse.data.output.results
-                  .map(result => {
-                    const time = (result.begin_time || result.timestamp || result.start_time || result.time || 0) / 1000;
-                    const minutes = Math.floor(time / 60);
-                    const seconds = Math.floor(time % 60);
-                    const timeStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
-                    return `[${timeStr}] ${result.transcription_text}`;
-                  })
-                  .join('\n');
-
-                console.log('[VideoAnalyzer] 语音识别完成');
-                console.log('[VideoAnalyzer] 转录内容预览:', transcript.substring(0, 500).replace(/\n/g, ' '));
-                this.reportProgress(onProgress, 'speech', 58, '语音识别完成');
-                return transcript;
-              }
-            }
-            console.warn('[VideoAnalyzer] 任务成功但没有返回转录结果');
-            this.reportProgress(onProgress, 'speech', 58, '语音识别完成，未获得转录文本');
-            return null;
-          } else if (taskStatus === 'FAILED') {
-            throw new Error('语音识别任务失败: ' + JSON.stringify(resultResponse.data.output?.message));
-          } else if (taskStatus === 'RUNNING' || taskStatus === 'PENDING') {
-            // 继续等待
-            continue;
-          } else {
-            throw new Error('未知任务状态: ' + taskStatus);
-          }
-        } catch (error) {
-          if (error.response) {
-            throw new Error(`查询任务状态失败: ${JSON.stringify(error.response.data)}`);
-          }
-          throw error;
-        }
-      }
-
-      throw new Error('语音识别任务超时');
+      console.log(`[VideoAnalyzer] 语音识别完成(provider=${result.provider})，共 ${result.transcript.length} 段`);
+      console.log('[VideoAnalyzer] 转录内容预览:', transcript.substring(0, 500).replace(/\n/g, ' '));
+      this.reportProgress(onProgress, 'speech', 58, '语音识别完成');
+      return transcript;
     } catch (error) {
       console.error('[VideoAnalyzer] 语音识别失败:', error.response?.data || error.message);
-      // 如果识别失败，返回null，继续使用画面分析
+      // 识别失败不拖垮整个分析：返回 null，继续使用画面分析
       this.reportProgress(onProgress, 'speech', 58, '语音识别失败，继续画面分析');
       return null;
     }
@@ -1471,7 +1892,28 @@ ${visualCutsText}
       const videoPath = await this.downloadVideoHybrid(bvid, url, onProgress, tempCookiesPath);
 
       // 4. 提取关键帧（用于视觉理解）
-      const { framesDir, duration } = await this.extractFrames(videoPath, bvid, onProgress);
+      const {
+        framesDir,
+        duration: probedDuration,
+        durationSource: probedDurationSource,
+        keyframeTimestamps
+      } = await this.extractFrames(videoPath, bvid, onProgress);
+
+      // 时长探测三级全失败时，用最大关键帧时间戳兜底：能走到这里说明关键帧可用（< 2 个会直接抛错），
+      // 这个值至少是时长的下界。若一路传 null，segmentValidator 会判 duration_missing_or_zero 并清空
+      // final_segments，前端拿到的东西和"分析失败"无法区分，而这段视频其实是有可用信息的。
+      // 来源必须如实标注，绝不冒充 probe：推导值只是下界，不是真实时长。
+      let duration = probedDuration;
+      let durationSource = probedDurationSource;
+      const probedDurationOk = Number.isFinite(Number(probedDuration)) && Number(probedDuration) > 0;
+      const lastKeyframeTime = Array.isArray(keyframeTimestamps) && keyframeTimestamps.length > 0
+        ? keyframeTimestamps.reduce((max, time) => (time > max ? time : max), 0)
+        : null;
+      if (!probedDurationOk && Number.isFinite(lastKeyframeTime) && lastKeyframeTime > 0) {
+        duration = lastKeyframeTime;
+        durationSource = 'derived_from_keyframes';
+        console.warn(`[VideoAnalyzer] 时长探测失败，改用最大关键帧时间戳 ${lastKeyframeTime} 秒作为下界（durationSource=derived_from_keyframes）`);
+      }
 
       // 后台异步执行向量提取
       this.storeFrameVectors(bvid, framesDir, options?.onVectorProgress).catch(err => {
@@ -1482,48 +1924,72 @@ ${visualCutsText}
       let visualCuts = [];
       let visualCutStats = null;
       try {
-        const visualFrames = await this.extractVisualProbeFrames(
+        const visualProbe = await this.extractVisualProbeFrames(
           videoPath,
           bvid,
           duration,
           onProgress,
-          options?.visualProbe
+          { ...(options?.visualProbe || {}), durationSource }
         );
-        const visualResult = await analyzeVisualCuts(visualFrames, options?.visualCuts);
+        const visualResult = await analyzeVisualCuts(visualProbe.frames, {
+          ...(options?.visualCuts || {}),
+          probe: visualProbe.meta
+        });
         visualCuts = visualResult.visualCuts || [];
-        visualCutStats = visualResult.stats || null;
-        console.log(`[VideoAnalyzer] 视觉候选切点检测完成: ${visualCuts.length} 个`);
+        visualCutStats = {
+          ...(visualResult.stats || {}),
+          durationSource,
+          probe: visualProbe.meta
+        };
+        console.log(`[VideoAnalyzer] 视觉候选切点检测完成: ${visualCuts.length} 个 (method=${visualCutStats?.method || 'unknown'})`);
         this.reportProgress(onProgress, 'visual', 42, `检测到 ${visualCuts.length} 个视觉候选切点`);
       } catch (error) {
         console.warn('[VideoAnalyzer] Python视觉候选切点检测失败，尝试 ffmpeg scene fallback:', error.message);
         try {
           const fallbackVisualResult = await analyzeSceneCutsWithFfmpeg(videoPath, {
             ...(options?.visualCuts || {}),
-            timeoutMs: 120000
+            timeoutMs: this.resolveTimeoutMs(duration, MEDIA_TIMEOUT_POLICIES.scene)
           });
           visualCuts = fallbackVisualResult.visualCuts || [];
           visualCutStats = {
             ...(fallbackVisualResult.stats || {}),
+            // 回退路径产出的是另一类切点，必须一眼可辨
+            method: 'ffmpeg_scene',
             fallbackFrom: 'python_visual_metrics',
-            fallbackReason: error.message
+            fallbackReason: error.message,
+            durationSource
           };
-          console.log(`[VideoAnalyzer] ffmpeg视觉候选切点检测完成: ${visualCuts.length} 个`);
+          console.log(`[VideoAnalyzer] ffmpeg视觉候选切点检测完成: ${visualCuts.length} 个 (method=ffmpeg_scene)`);
           this.reportProgress(onProgress, 'visual', 42, `检测到 ${visualCuts.length} 个视觉候选切点`);
         } catch (fallbackError) {
           console.warn('[VideoAnalyzer] 视觉候选切点检测失败，继续后续分析:', fallbackError.message);
+          visualCutStats = {
+            method: 'unavailable',
+            fallbackFrom: 'python_visual_metrics',
+            fallbackReason: error.message,
+            fallbackError: fallbackError.message,
+            durationSource
+          };
           this.reportProgress(onProgress, 'visual', 42, '视觉切点检测失败，继续分析');
         }
       }
 
       // 6. 提取音频并进行语音识别（可选）
       let transcript = null;
-      const shouldAnalyzeAudio = Boolean(useAudio && hasOssConfig);
+      let audioPath = null;
+      const shouldAnalyzeAudio = Boolean(useAudio);
+      // 音频支路本身不依赖 OSS：DashScope 上传不可用时还有本地 Whisper 和本地音频切点兜底，
+      // 这里显式告警，避免降级原因只有结果里音频空空、日志里却查不到。
+      if (useAudio && !hasOssConfig) {
+        console.warn('[VideoAnalyzer] 未配置 OSS（OSS_ACCESS_KEY_ID/OSS_ACCESS_KEY_SECRET/OSS_BUCKET），DashScope 上传路径不可用，将依赖本地 Whisper 与本地音频切点');
+      }
 
       if (shouldAnalyzeAudio) {
         try {
-          const audioPath = await this.extractAudio(videoPath, bvid, onProgress);
+          audioPath = await this.extractAudio(videoPath, bvid, onProgress, { duration });
           transcript = await this.transcribeAudio(audioPath, bvid, userConfig, onProgress);
         } catch (error) {
+          audioPath = null;
           console.warn('[VideoAnalyzer] 音频处理失败，继续使用画面分析:', error.message);
           this.reportProgress(onProgress, 'speech', 58, '音频处理失败，继续画面分析');
         }
@@ -1546,15 +2012,19 @@ ${visualCutsText}
       }
 
       // 6.5 音频切点检测（静音 + 音量变化）
+      // 必须用 extractAudio 的返回值：它可能是历史遗留的 .mp3，硬拼 {bvid}.wav 会让老缓存视频永远拿不到音频切点
       if (shouldAnalyzeAudio) {
-        try {
-          const audioPathForCuts = path.join(this.downloadDir, `${bvid}.wav`);
-          if (fs.existsSync(audioPathForCuts)) {
-            audioCuts = await detectAudioCuts(audioPathForCuts);
+        if (audioPath && fs.existsSync(audioPath)) {
+          try {
+            audioCuts = await detectAudioCuts(audioPath);
             console.log(`[VideoAnalyzer] 音频切点检测完成: ${audioCuts.length} 个`);
+          } catch (error) {
+            console.warn('[VideoAnalyzer] 音频切点检测失败，继续分析:', error.message);
+            this.reportProgress(onProgress, 'audio', 58, '音频切点检测失败，继续分析');
           }
-        } catch (error) {
-          console.warn('[VideoAnalyzer] 音频切点检测失败，继续分析:', error.message);
+        } else {
+          console.warn(`[VideoAnalyzer] 没有可用的音频文件，跳过音频切点检测（audioCuts 为空）: ${audioPath || '未获取到音频'}`);
+          this.reportProgress(onProgress, 'audio', 58, '音频不可用，跳过音频切点检测');
         }
       }
 
@@ -1598,6 +2068,10 @@ ${visualCutsText}
 
       const finalResult = {
         ...analysisResult,
+        // 时长与来源：duration 为 null 表示探测全失败且没有关键帧可推导（不再兜底 300 秒）；
+        // derived_from_keyframes 表示这是由最大关键帧时间戳推出来的下界，不是探测到的真实时长
+        duration,
+        duration_source: durationSource,
         // 添加音频转录文本（如果有）
         transcript: transcript,
         keyword_cuts: keywordCuts,
@@ -1650,30 +2124,96 @@ ${visualCutsText}
   }
 
   /**
-   * 清理下载的视频文件
+   * 清理某个 bvid 在磁盘上的全部产物（视频/音频/压缩副本/中间产物/两套帧目录/cookies/debug 产物）。
+   *
+   * 归属判据走 belongsToBvid，而不是 startsWith(bvid)：
+   * 后者会让 cleanup('BV1aa') 连带删掉另一个视频的 'BV1aab.mp4'。
+   * 清理失败只记日志不抛错——清理是收尾动作，不该把主流程带崩。
+   *
+   * @param {string} bvid
+   * @param {{keepVideo?: boolean, keepDebug?: boolean}} [options]
+   *   keepVideo=true 保留视频本体（重新下载代价最高），keepDebug=true 保留 debug 产物
+   * @returns {{removed: string[], failed: string[], debugArtifacts: number}} 让调用方看得出删了什么
    */
-  cleanup(bvid) {
-    try {
-      // 查找并删除视频文件（可能有不同的格式后缀）
-      const files = fs.readdirSync(this.downloadDir);
-      const videoFiles = files.filter(f => f.startsWith(bvid) && (f.endsWith('.mp4') || f.endsWith('.mp3') || f.endsWith('.m4a')));
+  cleanup(bvid, options = {}) {
+    const keepVideo = Boolean(options.keepVideo);
+    const keepDebug = Boolean(options.keepDebug);
+    const removed = [];
+    const failed = [];
 
-      videoFiles.forEach(file => {
-        const filePath = path.join(this.downloadDir, file);
+    const removeFile = (filePath) => {
+      try {
         fs.unlinkSync(filePath);
+        removed.push(filePath);
         console.log(`[VideoAnalyzer] 已删除文件: ${filePath}`);
-      });
-
-      // 删除关键帧目录
-      const framesDir = path.join(this.downloadDir, `${bvid}_frames`);
-      if (fs.existsSync(framesDir)) {
-        fs.rmSync(framesDir, { recursive: true, force: true });
-        console.log(`[VideoAnalyzer] 已删除关键帧: ${framesDir}`);
+      } catch (error) {
+        failed.push(filePath);
+        console.warn(`[VideoAnalyzer] 删除文件失败: ${filePath} — ${error.message}`);
       }
+    };
+
+    const removeDir = (dirPath) => {
+      try {
+        fs.rmSync(dirPath, { recursive: true, force: true });
+        removed.push(dirPath);
+        console.log(`[VideoAnalyzer] 已删除目录: ${dirPath}`);
+      } catch (error) {
+        failed.push(dirPath);
+        console.warn(`[VideoAnalyzer] 删除目录失败: ${dirPath} — ${error.message}`);
+      }
+    };
+
+    try {
+      if (fs.existsSync(this.downloadDir)) {
+        for (const entry of fs.readdirSync(this.downloadDir, { withFileTypes: true })) {
+          // 目录单独处理（下面按后缀精确匹配），这里只收文件，避免把 _frames 当成文件去 unlink
+          if (entry.isDirectory()) continue;
+          if (!belongsToBvid(entry.name, bvid)) continue;
+          if (keepVideo && entry.name === `${bvid}.mp4`) continue;
+          removeFile(path.join(this.downloadDir, entry.name));
+        }
+      }
+
+      // 关键帧（发大模型用，≤30 张）与视觉探针帧（含 manifest.json）两套目录
+      for (const suffix of ['_frames', '_visual_frames']) {
+        const dirPath = path.join(this.downloadDir, `${bvid}${suffix}`);
+        if (fs.existsSync(dirPath)) removeDir(dirPath);
+      }
+
+      // 下载阶段用完即删的临时 cookies；进程被中断时 finally 没跑到，会残留在这里
+      const cookiesPath = path.join(this.downloadDir, 'temp', `${bvid}_cookies.txt`);
+      if (fs.existsSync(cookiesPath)) removeFile(cookiesPath);
     } catch (error) {
       console.error('[VideoAnalyzer] 清理文件失败:', error);
     }
+
+    // debug 产物没有自动清理入口，只能靠这里显式清
+    let debugArtifacts = 0;
+    if (!keepDebug) {
+      try {
+        debugArtifacts = removeArtifactsFor(bvid);
+        if (debugArtifacts > 0) {
+          console.log(`[VideoAnalyzer] 已删除 ${debugArtifacts} 个 debug 产物: ${bvid}`);
+        }
+      } catch (error) {
+        console.warn('[VideoAnalyzer] 清理 debug 产物失败:', error.message);
+      }
+    }
+
+    return { removed, failed, debugArtifacts };
   }
 }
 
 module.exports = VideoAnalyzer;
+// 纯函数与常量挂到导出上，便于单测直接引用（保持 `new (require('./videoAnalyzer'))()` 的旧用法）
+module.exports.formatTime = formatTime;
+module.exports.formatTranscriptSegments = formatTranscriptSegments;
+module.exports.resolveMediaTimeoutMs = resolveMediaTimeoutMs;
+module.exports.parseDurationValue = parseDurationValue;
+module.exports.isMediaToolTimeout = isMediaToolTimeout;
+module.exports.MediaToolTimeoutError = MediaToolTimeoutError;
+module.exports.MEDIA_TIMEOUT_POLICIES = MEDIA_TIMEOUT_POLICIES;
+module.exports.MIN_AUDIO_BYTES = MIN_AUDIO_BYTES;
+// yt-dlp 停滞看门狗相关常量，供运维调参与单测断言
+module.exports.YT_DLP_STALL_TIMEOUT_MS = YT_DLP_STALL_TIMEOUT_MS;
+module.exports.YT_DLP_SOCKET_TIMEOUT_SECONDS = YT_DLP_SOCKET_TIMEOUT_SECONDS;

@@ -38,6 +38,9 @@ function writeDebugArtifacts(input = {}, artifact = {}) {
       candidateCuts: artifact.candidateCuts || [],
       aiPromptPreview: artifact.aiPromptPreview || null,
       aiRawOutput: artifact.aiRawOutput || null,
+      // 内部原始数组（流水线内部格式）：只用于调试，不属于契约字段
+      internalSegments: artifact.internalSegments || [],
+      // 正式产物：契约格式片段
       finalSegments: artifact.finalSegments || [],
       warnings: artifact.warnings || [],
       mode: artifact.mode || 'fallback',
@@ -66,8 +69,36 @@ function getLatestDebugArtifact(videoId) {
   };
 }
 
+/**
+ * 删除某个 videoId 的全部 debug 产物。
+ *
+ * 产物名是 `${safeId}-${时间戳}.json`，所以 `startsWith(safeId + '-')` 既不会串到
+ * 相邻 id（'BV1aa' 不会命中 'BV1aab-...'），也不会漏掉同一次分析之外的旧产物。
+ * 这里只做显式删除——debug 产物目前没有自动清理入口，调用方不主动清就会一直堆积。
+ * 单个文件删不掉（被占用等）只记日志，不影响其它文件。
+ *
+ * @returns {number} 实际删除的文件数；目录不存在返回 0
+ */
+function removeArtifactsFor(videoId) {
+  if (!fs.existsSync(DEBUG_DIR)) return 0;
+
+  const safeId = sanitizeId(videoId);
+  let removed = 0;
+  for (const file of fs.readdirSync(DEBUG_DIR)) {
+    if (!file.startsWith(`${safeId}-`) || !file.endsWith('.json')) continue;
+    try {
+      fs.unlinkSync(path.join(DEBUG_DIR, file));
+      removed += 1;
+    } catch (error) {
+      console.warn(`[SegmentPipeline] 删除 debug 产物失败: ${file} — ${error.message}`);
+    }
+  }
+  return removed;
+}
+
 module.exports = {
   writeDebugArtifacts,
   getLatestDebugArtifact,
+  removeArtifactsFor,
   DEBUG_DIR
 };
