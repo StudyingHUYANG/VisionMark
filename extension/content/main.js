@@ -132,6 +132,10 @@ import './utils.js';
             console.log("[AdSkipper] 跳过模式:", this.skipMode);
         });
         chrome.storage.onChanged.addListener((changes, area) => {
+          if (area === 'local' && changes.adskipper_token) {
+            if (!changes.adskipper_token.newValue) this.disconnectWebSocket();
+            if (this.player.currentBvid) this.loadSegments(this.player.currentBvid);
+          }
           if (area === 'local' && changes.skip_mode) {
             this.skipMode = changes.skip_mode.newValue || 'auto';
             if (this.skipMode === 'auto') this.hideSkipButton();
@@ -489,7 +493,7 @@ import './utils.js';
       });
     }
 
-    async connectWebSocket(token) {
+    async connectWebSocket(token, bvid) {
       // 断开现有连接
       this.disconnectWebSocket();
       
@@ -500,10 +504,11 @@ import './utils.js';
       
       try {
         // 构建 WebSocket URL（使用与 API 相同的 base URL）
-        const wsUrl = VIDEO_ANALYSIS_BASE.replace(/^http/, 'ws') + '/?token=' + encodeURIComponent(token);
-        console.log('[AdSkipper] WebSocket: 连接中...', wsUrl);
+        const wsUrl = VIDEO_ANALYSIS_BASE.replace(/^http/, 'ws') + '/?token=' + encodeURIComponent(token) + '&bvid=' + encodeURIComponent(bvid);
+        console.log('[AdSkipper] WebSocket: 连接中...');
         
         this.websocket = new WebSocket(wsUrl);
+        const connectedSocket = this.websocket;
         
         this.websocket.onopen = () => {
           console.log('[AdSkipper] WebSocket: 连接成功');
@@ -526,7 +531,7 @@ import './utils.js';
         
         this.websocket.onclose = (event) => {
           console.log('[AdSkipper] WebSocket: 连接关闭', event.code, event.reason);
-          this.websocket = null;
+          if (this.websocket === connectedSocket) this.websocket = null;
         };
       } catch (error) {
         console.error('[AdSkipper] WebSocket: 连接失败', error);
@@ -541,10 +546,11 @@ import './utils.js';
     }
     
     handleWebSocketProgress(progressData) {
+      if (progressData.bvid !== this.currentAnalysisBvid) return;
       // 更新进度显示
       if (sidebarState && this.currentAnalysisBvid) {
         sidebarState.analysisProgress = this.normalizeAnalysisProgress({
-          status: progressData.percent >= 100 ? 'completed' : 'running',
+          status: progressData.status || (progressData.percent >= 100 ? 'completed' : 'running'),
           stage: progressData.stage,
           percent: progressData.percent,
           message: progressData.message
@@ -552,8 +558,10 @@ import './utils.js';
       }
       
       // 如果分析完成或失败，断开 WebSocket 连接
-      if (progressData.percent >= 100 || progressData.message?.includes('失败')) {
+      if (['completed', 'failed'].includes(progressData.status)) {
+        const completedSocket = this.websocket;
         setTimeout(() => {
+          if (this.websocket !== completedSocket) return;
           this.disconnectWebSocket();
           this.currentAnalysisBvid = null;
         }, 5000);
@@ -651,7 +659,10 @@ import './utils.js';
         const skipTypes = storage.skip_types || ['hard_ad', 'soft_ad', 'product_placement'];
 
         const url = API_BASE + "/segments?bvid=" + bvid + "&page=" + this.getPage();
-        const res = await this.safeFetch(url, {}, 'load segments');
+        const token = await this.getToken();
+        if (!token) throw new Error('请先在 VisionMark 插件弹窗中登录');
+        const res = await this.safeFetch(url, {headers:{Authorization:'Bearer ' + token}}, 'load segments');
+        if (res.status === 401) throw new Error('VisionMark 登录已失效，请在插件弹窗中重新登录');
         if (!res.ok) {
           throw new Error('加载片段失败：' + res.status);
         }
@@ -1874,27 +1885,14 @@ import './utils.js';
     // WebSocket now handles real-time progress updates
 
     async requestAnalysis(bvid, token) {
-    }
-
-
-    async requestAnalysis(bvid, token) {
       const url = VIDEO_ANALYSIS_BASE + "/video-analysis/analyze";
       console.log('[AdSkipper] 请求URL:', url);
       
-      // 自动获取 Bilibili cookies（如果可用）
-      let bilibiliCookies = null;
-      try {
-        if (window.VisionMarkCookieUtils?.getBilibiliCookiesForYtDlp) {
-          bilibiliCookies = await window.VisionMarkCookieUtils.getBilibiliCookiesForYtDlp();
-          if (bilibiliCookies) {
-            console.log('[AdSkipper] 成功获取 Bilibili cookies，将用于视频下载');
-          } else {
-            console.log('[AdSkipper] 未获取到 Bilibili cookies，将使用无 cookies 模式');
-          }
-        }
-      } catch (error) {
-        console.warn('[AdSkipper] 获取 cookies 时出错:', error.message);
+      // Failure to contact the worker is actionable; do not silently download anonymously.
+      if (!window.VisionMarkCookieUtils?.getBilibiliCookiesForYtDlp) {
+        throw new Error('扩展登录模块未加载，请重新加载扩展并刷新页面');
       }
+      const bilibiliCookies = await window.VisionMarkCookieUtils.getBilibiliCookiesForYtDlp();
 
       const requestBody = { bvid };
       if (bilibiliCookies) {
@@ -2012,26 +2010,7 @@ import './utils.js';
           sidebarState.loadError = null;
         }
 
-        const url = VIDEO_ANALYSIS_BASE + "/video-analysis/analyze";
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + token
-          },
-          body: JSON.stringify({ bvid })
-        });
-
-        const result = await res.json();
-
-        if (!res.ok) {
-          console.error("[AdSkipper] 分析失败:", result.message || result.error);
-          if (sidebarState) {
-            sidebarState.isLoading = false;
-            sidebarState.loadError = result.message || result.error || '分析失败';
-          }
-          return;
-        }
+        const result = await this.requestAnalysis(bvid, token);
 
         if (result.success && result.data) {
           console.log("[AdSkipper] 分析成功");
@@ -2114,8 +2093,8 @@ import './utils.js';
         }
 
         // 连接 WebSocket 获取实时进度
-        await this.connectWebSocket(token);
         this.currentAnalysisBvid = bvid;
+        await this.connectWebSocket(token, bvid);
 
         if (sidebarState) {
           sidebarState.isLoading = true;

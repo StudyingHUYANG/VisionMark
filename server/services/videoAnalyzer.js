@@ -5,9 +5,11 @@ const { exec, spawn, spawnSync } = require('child_process');
 const util = require('util');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const OpenAI = require('openai');
+const { instrumentClient, modelCall } = require('./telemetry');
 const { buildEffectiveModelConfig } = require('./modelConfigService');
 const { ossClient, hasOssConfig } = require('../utils/oss');
 const BilibiliDownloader = require('./bilibiliDownloader');
+const { downloadError } = require('./downloadErrors');
 const { analyzeVisualCuts, analyzeSceneCutsWithFfmpeg } = require('./visualCutDetector');
 const keywordCutService = require('./segment/keywordCuts');
 const { detectAudioCuts } = require('./segment/audioCuts');
@@ -86,10 +88,12 @@ class VideoAnalyzer {
   }
 
   createOpenAIClient(modelConfig) {
-    return new OpenAI({
+    return instrumentClient(new OpenAI({
       apiKey: modelConfig.apiKey,
-      baseURL: modelConfig.baseUrl
-    });
+      baseURL: modelConfig.baseUrl,
+      timeout: 120000,
+      maxRetries: 1
+    }));
   }
 
   reportProgress(onProgress, stage, percent, message, detail = null) {
@@ -101,22 +105,7 @@ class VideoAnalyzer {
       updatedAt: new Date().toISOString()
     };
     
-    // 通过 WebSocket 推送给所有连接的客户端
-    if (this.wss) {
-      this.wss.clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
-          try {
-            client.send(JSON.stringify({
-              type: 'progress',
-              data: progressData
-            }));
-          } catch (error) {
-            console.warn('[VideoAnalyzer] WebSocket 推送失败:', error.message);
-          }
-        }
-      });
-    }
-    
+    // Scoped route callbacks own progress delivery.
     // 保持原有的回调方式兼容
     if (typeof onProgress === 'function') {
       try {
@@ -152,7 +141,7 @@ class VideoAnalyzer {
     const outputTemplate = path.join(this.downloadDir, `${bvid}.%(ext)s`);
 
     // 检查是否已下载（查找匹配的文件）
-    const existingFiles = fs.readdirSync(this.downloadDir).filter(f => f.startsWith(bvid) && f.endsWith('.mp4'));
+    const existingFiles = fs.readdirSync(this.downloadDir).filter(f => f === `${bvid}.mp4` && fs.statSync(path.join(this.downloadDir, f)).size > 0);
     if (existingFiles.length > 0) {
       const existingPath = path.join(this.downloadDir, existingFiles[0]);
       console.log(`[VideoAnalyzer] 视频已存在: ${existingPath}`);
@@ -171,35 +160,20 @@ class VideoAnalyzer {
       '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
       '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       '--referer', 'https://www.bilibili.com/',
-      '--no-check-certificate',
+      '--socket-timeout', '30',
+      '--merge-output-format', 'mp4',
       '--ignore-config',
       '--no-warnings'
     ];
 
-    const primaryArgs = [
-      ...commonArgs,
-      '--extractor-args', 'bilibili:use_wbi=true',
-      '--add-header', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      '--add-header', 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8',
-      '--extractor-retries', '2',
-      '--retries', '2',
-      '--fragment-retries', '2'
-    ];
-
-    const fallbackArgs = [
-      ...commonArgs,
-      '--extractor-args', 'bilibili:use_wbi=false',
-      '--extractor-retries', '3',
-      '--retries', '3',
-      '--fragment-retries', '3'
-    ];
+    const primaryArgs = [...commonArgs, '--extractor-retries', '0', '--retries', '1', '--fragment-retries', '1'];
 
     const hasCookies = Boolean(cookiesPath && fs.existsSync(cookiesPath));
 
     // 如果有cookies文件，添加 --cookies 参数
     if (hasCookies) {
       primaryArgs.push('--cookies', cookiesPath);
-      fallbackArgs.push('--cookies', cookiesPath);
+
       console.log('[VideoAnalyzer] 使用临时 cookies 文件进行下载');
 
       try {
@@ -217,10 +191,16 @@ class VideoAnalyzer {
     }
 
     primaryArgs.push('-o', outputTemplate, url);
-    fallbackArgs.push('-o', outputTemplate, url);
+
 
     const runYtDlp = (args, modeLabel) => new Promise((resolve, reject) => {
-      const child = spawn('python', args, { windowsHide: true });
+      const localPython = path.join(__dirname, '../../.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
+      const python = process.env.VISIONMARK_PYTHON || (fs.existsSync(localPython) ? localPython : 'python');
+      const child = spawn(python, args, { windowsHide: true });
+      const timer = setTimeout(() => {
+        child.kill();
+        reject(downloadError({code:'ETIMEDOUT'}));
+      }, 10 * 60 * 1000);
       let outputTail = '';
       let lastReportedPercent = -1;
 
@@ -249,8 +229,9 @@ class VideoAnalyzer {
 
       child.stdout.on('data', handleOutput);
       child.stderr.on('data', handleOutput);
-      child.on('error', reject);
+      child.on('error', error => { clearTimeout(timer); reject(downloadError(error)); });
       child.on('close', (code) => {
+        clearTimeout(timer);
         if (code === 0) {
           this.reportProgress(onProgress, 'download', 20, '视频下载完成');
           resolve();
@@ -261,20 +242,10 @@ class VideoAnalyzer {
     });
 
     try {
-      try {
-        await runYtDlp(primaryArgs, 'primary');
-      } catch (firstError) {
-        const firstMessage = String(firstError?.message || '');
-        const isLikely412 = /412|Precondition Failed/i.test(firstMessage);
-        if (!isLikely412) throw firstError;
-
-        console.warn('[VideoAnalyzer] 检测到 B 站风控 412，切换兼容参数重试一次');
-        this.reportProgress(onProgress, 'download', 8, '检测到风控，正在重试下载');
-        await runYtDlp(fallbackArgs, 'fallback');
-      }
+      await runYtDlp(primaryArgs, 'primary');
 
       // 查找下载的视频文件
-      const downloadedFiles = fs.readdirSync(this.downloadDir).filter(f => f.startsWith(bvid) && f.endsWith('.mp4'));
+      const downloadedFiles = fs.readdirSync(this.downloadDir).filter(f => f === `${bvid}.mp4` && fs.statSync(path.join(this.downloadDir, f)).size > 0);
       if (downloadedFiles.length === 0) {
         throw new Error('视频下载完成但找不到文件');
       }
@@ -290,17 +261,7 @@ class VideoAnalyzer {
       
       return videoPath;
     } catch (error) {
-      console.error('[VideoAnalyzer] 下载失败:', error);
-      
-      if (!hasCookies) {
-        const finalError = new Error(`视频下载失败: ${error.message}。建议：请确保已登录 Bilibili 账号以获得最佳分析体验。`);
-        console.error('[VideoAnalyzer] 下载失败详情:', finalError);
-        throw finalError;
-      } else {
-        const finalError = new Error(`视频下载失败: ${error.message}。即使使用了 cookies 仍然失败，请刷新 Bilibili 登录状态、更新 yt-dlp 后重试。`);
-        console.error('[VideoAnalyzer] 下载失败详情:', finalError);
-        throw finalError;
-      }
+      throw downloadError(error);
     }
   }
 
@@ -311,14 +272,16 @@ class VideoAnalyzer {
     // 先尝试 Bilibili 专用下载器
     try {
       console.log('[VideoAnalyzer] 尝试使用 Bilibili 专用下载器...');
-      const bilibiliDownloader = new BilibiliDownloader();
+      const bilibiliDownloader = new BilibiliDownloader({downloadDir:this.downloadDir,cookiesPath});
       const result = await bilibiliDownloader.downloadVideo(url, (progress) => {
         this.reportProgress(onProgress, progress.stage, progress.percent, progress.message);
       });
       console.log('[VideoAnalyzer] Bilibili 专用下载器成功');
       return result;
     } catch (bilibiliError) {
-      console.warn('[VideoAnalyzer] Bilibili 专用下载器失败:', bilibiliError.message);
+      const failure = downloadError(bilibiliError);
+      if (['VIDEO_ACCESS_RESTRICTED','VIDEO_LOGIN_REQUIRED','VIDEO_NOT_FOUND'].includes(failure.code)) throw failure;
+      console.warn('[VideoAnalyzer] 首选下载失败:', failure.code);
       
       // 回退到 yt-dlp
       console.log('[VideoAnalyzer] 回退到 yt-dlp 下载器...');
@@ -634,7 +597,7 @@ class VideoAnalyzer {
       // Step 1: 提交异步任务
       console.log('[VideoAnalyzer] 提交语音识别任务...');
       this.reportProgress(onProgress, 'speech', 49, '正在提交语音识别任务');
-      const submitResponse = await axios.post(
+      const submitResponse = await modelCall(modelConfig.asrModel, 'asr.submit', () => axios.post(
         'https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription',
         {
           model: modelConfig.asrModel,
@@ -655,7 +618,7 @@ class VideoAnalyzer {
             'X-DashScope-Async': 'enable'  // 启用异步模式
           }
         }
-      );
+      ));
 
       if (!submitResponse.data.output || !submitResponse.data.output.task_id) {
         throw new Error('提交任务失败，未获取到task_id');

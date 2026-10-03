@@ -124,6 +124,12 @@ const vectorProgressState = ref({ status: 'not_found', percent: 0, message: '' }
 const framesList = ref([]);
 const showFrames = ref(false);
 let progressInterval = null;
+let rejectedToken = null;
+let pollInFlight = false;
+const requireLogin = () => {
+  stopPolling();
+  searchError.value = '请先在 VisionMark 插件弹窗中登录；如果已登录，请退出后重新登录';
+};
 const indexingStatuses = new Set(['pending', 'extracting', 'embedding', 'committing']);
 const isIndexing = computed(() => indexingStatuses.has(vectorProgressState.value.status));
 
@@ -153,11 +159,13 @@ const fetchFramesList = async () => {
     const apiBase = window.API_BASE || 'http://localhost:8080/api/v1';
     const storage = await new Promise(resolve => chrome.storage.local.get(['adskipper_token'], resolve));
     const token = storage.adskipper_token || '';
+    if (!token || token === rejectedToken) { requireLogin(); return; }
     
     const response = await fetch(`${apiBase}/search/frames?bvid=${props.bvid}`, {
       headers: { 'Authorization': token ? `Bearer ${token}` : '' }
     });
     
+    if (response.status === 401) { rejectedToken = token; requireLogin(); return; }
     if (response.ok) {
       const data = await response.json();
       if (data.frames) {
@@ -174,16 +182,19 @@ const selectResult = (item) => {
 };
 
 const pollVectorProgress = async () => {
-  if (!props.bvid) return;
+  if (!props.bvid || pollInFlight) return;
+  pollInFlight = true;
   try {
     const apiBase = window.API_BASE || 'http://localhost:8080/api/v1';
     const storage = await new Promise(resolve => chrome.storage.local.get(['adskipper_token'], resolve));
     const token = storage.adskipper_token;
+    if (!token || token === rejectedToken) { requireLogin(); return; }
     
     const response = await fetch(`${apiBase}/search/status?bvid=${props.bvid}`, {
       headers: { 'Authorization': token ? `Bearer ${token}` : '' }
     });
     
+    if (response.status === 401) { rejectedToken = token; requireLogin(); return; }
     if (response.ok) {
       const data = await response.json();
       const percentByStatus = { not_found: 0, pending: 1, extracting: 20, embedding: 70, committing: 95, ready: 100, failed: 100 };
@@ -202,6 +213,8 @@ const pollVectorProgress = async () => {
     }
   } catch(e) {
     console.error('Failed to fetch vector progress', e);
+  } finally {
+    pollInFlight = false;
   }
 };
 
@@ -218,12 +231,25 @@ const stopPolling = () => {
   }
 };
 
+const onAuthChanged = (changes, area) => {
+  if (area !== 'local' || !changes.adskipper_token) return;
+  rejectedToken = null;
+  clearResultObjectUrls();
+  results.value = [];
+  framesList.value = [];
+  if (!changes.adskipper_token.newValue) { requireLogin(); return; }
+  searchError.value = '';
+  fetchFramesList();
+  startPolling();
+};
 onMounted(() => {
+  chrome.storage.onChanged.addListener(onAuthChanged);
   fetchFramesList();
   startPolling();
 });
 
 onUnmounted(() => {
+  chrome.storage.onChanged.removeListener(onAuthChanged);
   stopPolling();
   clearResultObjectUrls();
 });
@@ -254,6 +280,7 @@ const handleSearch = async () => {
     const searchUrl = `${apiBase}/search/multimodal`;
     const storage = await new Promise(resolve => chrome.storage.local.get(['adskipper_token'], resolve));
     const token = storage.adskipper_token;
+    if (!token || token === rejectedToken) { requireLogin(); return; }
     
     // In extension context, we can fetch directly
     const response = await fetch(searchUrl, {
@@ -265,6 +292,7 @@ const handleSearch = async () => {
       body: JSON.stringify({ bvid: props.bvid, query: query.value.trim(), topK: 5 })
     });
     
+    if (response.status === 401) { rejectedToken = token; requireLogin(); return; }
     const data = await response.json();
     if (!response.ok) throw new Error(data.message || '搜索失败');
     if (data.success) {

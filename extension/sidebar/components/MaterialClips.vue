@@ -106,6 +106,7 @@ async function loadFrames(clips) {
   }));
   const storage = await new Promise(resolve => chrome.storage.local.get(['adskipper_token'], resolve));
   const token = storage.adskipper_token || '';
+  if (!token) return;
   const apiBase = window.LOCAL_CONFIG?.API_BASE || 'http://localhost:8080';
 
   const resolved = await Promise.all(source.map(async clip => {
